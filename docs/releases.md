@@ -1,6 +1,6 @@
 # Release setup
 
-CI builds and tests macOS and iOS on GitHub-hosted Xcode 27 runners. Pull requests use unsigned builds with read-only permissions and no signing secrets.
+CI builds and tests macOS and iOS on GitHub-hosted Xcode 27 runners. Pull requests use unsigned builds with read-only permissions and no signing secrets. The hosted iOS simulator logs search and face-index benchmarks and checks their results. The wall-clock limits are enforced in macOS CI and local iOS tests where simulator timing is more predictable.
 
 A tag such as `v1.2.0` on a commit in `main` runs the macOS tests before signing. When TestFlight is enabled, the iOS tests gate its upload independently. The tag supplies the marketing version. The workflow run and attempt numbers supply the build number for the app and its extensions. Releasing a new version creates a new GitHub Release with a Mac ZIP and SHA-256 checksum. Existing releases are left in place.
 

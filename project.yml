@@ -256,6 +256,7 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSPrincipalClass: GPhotosKitTestsIOS.TestTemporaryDirectory
+        OTHER_SWIFT_FLAGS: "$(inherited) $(GPHOTOS_TEST_SWIFT_FLAGS)"
 
 schemes:
   GPhotosSync:

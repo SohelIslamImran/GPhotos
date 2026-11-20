@@ -45,4 +45,5 @@ jobs:
             | jq -er '[.devices | to_entries[] | select(.key | endswith("iOS-27-2")) | .value[] | select(.name == "iPhone 17")][0].udid')"
           xcodebuild test -project GPhotosSync.xcodeproj -scheme GPhotosSync \
             -destination "platform=iOS Simulator,id=$udid" -only-testing:GPhotosKitTestsIOS \
-            -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO
+            -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO \
+            GPHOTOS_TEST_SWIFT_FLAGS=-DGPHOTOS_HOSTED_IOS_TESTS

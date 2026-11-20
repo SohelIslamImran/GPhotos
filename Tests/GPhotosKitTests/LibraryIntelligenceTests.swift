@@ -235,7 +235,9 @@ struct LibraryIntelligenceTests {
     }
     let average = start.duration(to: clock.now) / 10
     print("SEARCH suggestions 100k average: \(average)")
-    #expect(average < .milliseconds(30))
+    #if !GPHOTOS_HOSTED_IOS_TESTS
+      #expect(average < .milliseconds(30))
+    #endif
   }
 
   @Test("Short words, unspaced scripts and accents match the way they're indexed")
@@ -294,7 +296,9 @@ struct LibraryIntelligenceTests {
     print("SEARCH broad 100k: \(elapsed)")
     #expect(ids.count == 5_000)
     #expect(ids.first == "99999")
-    #expect(elapsed < .seconds(1))
+    #if !GPHOTOS_HOSTED_IOS_TESTS
+      #expect(elapsed < .seconds(1))
+    #endif
   }
 
   @Test("Faces are assigned to people, named and searchable by name")
@@ -454,7 +458,9 @@ struct LibraryIntelligenceTests {
     let elapsed = start.duration(to: clock.now)
     print("PEOPLE crowded bucket: \(elapsed)")
     #expect(page.count <= 65)
-    #expect(elapsed < .milliseconds(250))
+    #if !GPHOTOS_HOSTED_IOS_TESTS
+      #expect(elapsed < .milliseconds(250))
+    #endif
   }
 
   @Test("Faces that waited for a larger image are analyzed again later")
