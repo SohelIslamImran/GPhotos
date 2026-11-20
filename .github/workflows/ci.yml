@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test ${{ matrix.platform }}
+    runs-on: xcode-27
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macOS, iOS]
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Generate project
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate
+          for script in scripts/*.sh; do bash -n "$script"; done
+      - name: Test macOS
+        if: matrix.platform == 'macOS'
+        run: |
+          xcodebuild test -project GPhotosSync.xcodeproj -scheme GPhotosSyncMac \
+            -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+      - name: Test iOS
+        if: matrix.platform == 'iOS'
+        run: |
+          udid="$(xcrun simctl list devices available -j \
+            | jq -er '[.devices | to_entries[] | select(.key | endswith("iOS-27-2")) | .value[] | select(.name == "iPhone 17")][0].udid')"
+          xcodebuild test -project GPhotosSync.xcodeproj -scheme GPhotosSync \
+            -destination "platform=iOS Simulator,id=$udid" -only-testing:GPhotosKitTestsIOS \
+            -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO

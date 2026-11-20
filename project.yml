@@ -71,6 +71,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID)"
         INFOPLIST_FILE: GPhotosSync/Info.plist
         CODE_SIGN_ENTITLEMENTS: GPhotosSync/GPhotosSync.entitlements
+        PROVISIONING_PROFILE_SPECIFIER: "$(GPHOTOS_IOS_APP_PROFILE)"
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -99,6 +100,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).mac"
         INFOPLIST_FILE: GPhotosSyncMac/Info.plist
         CODE_SIGN_ENTITLEMENTS: GPhotosSyncMac/GPhotosSyncMac.entitlements
+        PROVISIONING_PROFILE_SPECIFIER: "$(GPHOTOS_MAC_PROFILE)"
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
 
@@ -119,6 +121,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).share"
         INFOPLIST_FILE: ShareExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: ShareExtension/ShareExtension.entitlements
+        PROVISIONING_PROFILE_SPECIFIER: "$(GPHOTOS_IOS_SHARE_PROFILE)"
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         SKIP_INSTALL: YES
@@ -141,6 +144,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).uploads"
         INFOPLIST_FILE: PhotosUploadExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: PhotosUploadExtension/PhotosUploadExtension.entitlements
+        PROVISIONING_PROFILE_SPECIFIER: "$(GPHOTOS_IOS_UPLOAD_PROFILE)"
         # An ExtensionKit extension sits in the app's Extensions folder; without the app's
         # Frameworks on its runpath, dyld can't load GPhotosKit and it dies at launch.
         LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks"]
@@ -167,6 +171,7 @@ targets:
         PRODUCT_MODULE_NAME: BackupWidgets
         INFOPLIST_FILE: BackupWidgets/Info.plist
         CODE_SIGN_ENTITLEMENTS: BackupWidgets/BackupWidgets.entitlements
+        PROVISIONING_PROFILE_SPECIFIER: "$(GPHOTOS_IOS_WIDGETS_PROFILE)"
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         SKIP_INSTALL: YES
