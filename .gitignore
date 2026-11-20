@@ -1,0 +1,29 @@
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+build/
+build_mac/
+build_ios/
+.build/
+
+# macOS
+.DS_Store
+
+# Environment & Secrets
+.env*
+
+# Temporary clone directories
+.temp/
+
+
+# Signed release outputs
+dist/
+
+# Developer signing and local credentials
+*.p8
+*.p12
+*.mobileprovision
+*.provisionprofile
+client_secret*.json

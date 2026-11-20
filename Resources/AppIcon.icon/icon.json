@@ -1,0 +1,87 @@
+{
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "display-p3:1.000,1.000,1.000,1.000",
+          "display-p3:0.910,0.930,0.965,1.000"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0.5,
+            "y": 0
+          },
+          "stop": {
+            "x": 0.5,
+            "y": 1
+          }
+        }
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "display-p3:0.200,0.205,0.225,1.000",
+          "display-p3:0.050,0.052,0.060,1.000"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0.5,
+            "y": 0
+          },
+          "stop": {
+            "x": 0.5,
+            "y": 1
+          }
+        }
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "Photo",
+      "layers": [
+        {
+          "name": "Mountains",
+          "image-name": "mountains.svg",
+          "glass": true
+        },
+        {
+          "name": "Sun",
+          "image-name": "sun.svg",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.35
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.1
+      }
+    },
+    {
+      "name": "Cloud",
+      "layers": [
+        {
+          "name": "Cloud",
+          "image-name": "cloud.svg",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.4
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.25
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

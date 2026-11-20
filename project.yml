@@ -1,0 +1,282 @@
+name: GPhotosSync
+options:
+  bundleIdPrefix: org.gphotosapp
+  deploymentTarget:
+    iOS: "27.0"
+    macOS: "27.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    GPHOTOS_BUNDLE_ID: org.gphotosapp.gphotos
+
+packages: {}
+
+targets:
+  GPhotosKit:
+    type: framework
+    platform: iOS
+    sources:
+      - path: GPhotosKit
+    dependencies:
+      - sdk: Photos.framework
+    settings:
+      base:
+        PRODUCT_NAME: GPhotosKit
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).kit"
+        PRODUCT_MODULE_NAME: GPhotosKit
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+
+  GPhotosKitMac:
+    type: framework
+    platform: macOS
+    sources:
+      - path: GPhotosKit
+    dependencies:
+      - sdk: Photos.framework
+    settings:
+      base:
+        PRODUCT_NAME: GPhotosKit
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).kit.mac"
+        PRODUCT_MODULE_NAME: GPhotosKit
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+
+  GPhotosSync:
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups:
+          enabled: 1
+    type: application
+    platform: iOS
+    sources:
+      - path: GPhotosSync
+      - path: Resources/AppIcon.icon
+      - path: Resources/Shared.xcassets
+    dependencies:
+      - target: GPhotosKit
+      - target: ShareExtension
+        embed: true
+      - target: BackupWidgets
+        embed: true
+      - target: PhotosUploadExtension
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID)"
+        INFOPLIST_FILE: GPhotosSync/Info.plist
+        CODE_SIGN_ENTITLEMENTS: GPhotosSync/GPhotosSync.entitlements
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  GPhotosSyncMac:
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups:
+          enabled: 1
+    type: application
+    platform: macOS
+    sources:
+      - path: GPhotosSyncMac
+      - path: GPhotosSync/BackupIntents.swift
+      - path: Resources/AppIcon.icon
+      - path: Resources/Shared.xcassets
+    dependencies:
+      - target: GPhotosKitMac
+        embed: true
+      - target: MacShareExtension
+        embed: true
+      - target: MacWidgets
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).mac"
+        INFOPLIST_FILE: GPhotosSyncMac/Info.plist
+        CODE_SIGN_ENTITLEMENTS: GPhotosSyncMac/GPhotosSyncMac.entitlements
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+
+  ShareExtension:
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups:
+          enabled: 1
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ShareExtension
+      - path: Resources/Shared.xcassets
+    dependencies:
+      - target: GPhotosKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).share"
+        INFOPLIST_FILE: ShareExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: ShareExtension/ShareExtension.entitlements
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SKIP_INSTALL: YES
+
+  PhotosUploadExtension:
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups:
+          enabled: 1
+    type: extensionkit-extension
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: PhotosUploadExtension
+    dependencies:
+      - target: GPhotosKit
+      - sdk: Photos.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).uploads"
+        INFOPLIST_FILE: PhotosUploadExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PhotosUploadExtension/PhotosUploadExtension.entitlements
+        # An ExtensionKit extension sits in the app's Extensions folder; without the app's
+        # Frameworks on its runpath, dyld can't load GPhotosKit and it dies at launch.
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks"]
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SKIP_INSTALL: YES
+
+  BackupWidgets:
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups:
+          enabled: 1
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: BackupWidgets
+      - path: Widgets
+    dependencies:
+      - target: GPhotosKit
+    settings:
+      base:
+        PRODUCT_NAME: BackupWidgets
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).widgets"
+        PRODUCT_MODULE_NAME: BackupWidgets
+        INFOPLIST_FILE: BackupWidgets/Info.plist
+        CODE_SIGN_ENTITLEMENTS: BackupWidgets/BackupWidgets.entitlements
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SKIP_INSTALL: YES
+
+  MacWidgets:
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups:
+          enabled: 1
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: MacWidgets
+      - path: Widgets
+    dependencies:
+      - target: GPhotosKitMac
+    settings:
+      base:
+        PRODUCT_NAME: MacWidgets
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).mac.widgets"
+        PRODUCT_MODULE_NAME: MacWidgets
+        INFOPLIST_FILE: MacWidgets/Info.plist
+        CODE_SIGN_ENTITLEMENTS: MacWidgets/MacWidgets.entitlements
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SKIP_INSTALL: YES
+
+  MacShareExtension:
+    attributes:
+      SystemCapabilities:
+        com.apple.ApplicationGroups:
+          enabled: 1
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: MacShareExtension
+      - path: Resources/Shared.xcassets
+    dependencies:
+      - target: GPhotosKitMac
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(GPHOTOS_BUNDLE_ID).mac.share"
+        INFOPLIST_FILE: MacShareExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: MacShareExtension/MacShareExtension.entitlements
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SKIP_INSTALL: YES
+
+  GPhotosKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/GPhotosKitTests
+      - path: GPhotosSyncMac/NativeActivityTable.swift
+    dependencies:
+      - target: GPhotosKitMac
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSPrincipalClass: GPhotosKitTests.TestTemporaryDirectory
+
+  GPhotosSyncUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: Tests/GPhotosSyncUITests
+    dependencies:
+      - target: GPhotosSync
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: GPhotosSync
+
+  GPhotosKitTestsIOS:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/GPhotosKitTests
+    dependencies:
+      - target: GPhotosKit
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSPrincipalClass: GPhotosKitTestsIOS.TestTemporaryDirectory
+
+schemes:
+  GPhotosSync:
+    build:
+      targets:
+        GPhotosSync: all
+        ShareExtension: all
+        BackupWidgets: all
+        PhotosUploadExtension: all
+        GPhotosKitTestsIOS: [test]
+        GPhotosSyncUITests: [test]
+    test:
+      targets:
+        - GPhotosKitTestsIOS
+        - GPhotosSyncUITests
+    run:
+      config: Debug
+  GPhotosSyncMac:
+    build:
+      targets:
+        GPhotosSyncMac: all
+        MacShareExtension: all
+        MacWidgets: all
+        GPhotosKitTests: [test]
+    test:
+      targets:
+        - GPhotosKitTests
+    run:
+      config: Debug
