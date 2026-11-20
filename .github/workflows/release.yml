@@ -36,13 +36,22 @@ jobs:
           fi
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-  test:
+  test-macos:
     needs: version
     uses: ./.github/workflows/ci.yml
+    with:
+      platforms: '["macOS"]'
+
+  test-ios:
+    if: vars.ENABLE_TESTFLIGHT == 'true'
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    with:
+      platforms: '["iOS"]'
 
   macos:
     name: Sign and notarize macOS
-    needs: [version, test]
+    needs: [version, test-macos]
     runs-on: xcode-27
     timeout-minutes: 45
     environment: macos-release
@@ -102,7 +111,7 @@ jobs:
   testflight:
     name: Upload iOS to App Store Connect
     if: vars.ENABLE_TESTFLIGHT == 'true'
-    needs: [version, test]
+    needs: [version, test-ios]
     runs-on: xcode-27
     timeout-minutes: 40
     environment: ios-release
