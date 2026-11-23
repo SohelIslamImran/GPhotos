@@ -117,7 +117,11 @@ case "$mode" in
     upload="$scratch/notarization.zip"
     ditto -c -k --keepParent "$app" "$upload"
     xcrun notarytool submit "$upload" --key "$api_key" --key-id "$ASC_KEY_ID" \
-      --issuer "$ASC_ISSUER_ID" --wait --timeout 25m --output-format json > "$scratch/notary.json"
+      --issuer "$ASC_ISSUER_ID" --output-format json > "$scratch/submission.json"
+    submission_id="$(jq -er '.id' "$scratch/submission.json")"
+    echo "Apple notarization submission: $submission_id"
+    xcrun notarytool wait "$submission_id" --key "$api_key" --key-id "$ASC_KEY_ID" \
+      --issuer "$ASC_ISSUER_ID" --timeout 120m --output-format json > "$scratch/notary.json"
     if ! jq -e '.status == "Accepted"' "$scratch/notary.json" >/dev/null; then
       jq -r '"Notarization request \(.id): \(.status)"' "$scratch/notary.json"
       exit 1
