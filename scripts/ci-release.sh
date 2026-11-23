@@ -108,14 +108,17 @@ case "$mode" in
       echo "::error::The archived app does not have a Developer ID Application signature."
       exit 1
     fi
-    mkdir -p dist
-    ditto "$app" dist/GPhotos.app
+    mkdir -p dist "$scratch/image"
+    ditto "$app" "$scratch/image/GPhotos.app"
+    ln -s /Applications "$scratch/image/Applications"
+    dmg="dist/GPhotos-$RELEASE_VERSION-macOS.dmg"
+    hdiutil create -volname GPhotos -srcfolder "$scratch/image" -fs HFS+ -format UDZO "$dmg"
+    codesign --sign 'Developer ID Application' --timestamp "$dmg"
+    codesign --verify --strict "$dmg"
     ;;
   notarize)
     prepare_api_key
-    app=dist/GPhotos.app
-    upload="$scratch/notarization.zip"
-    ditto -c -k --keepParent "$app" "$upload"
+    upload="dist/GPhotos-$RELEASE_VERSION-macOS.dmg"
     xcrun notarytool submit "$upload" --key "$api_key" --key-id "$ASC_KEY_ID" \
       --issuer "$ASC_ISSUER_ID" --output-format json > "$scratch/submission.json"
     submission_id="$(jq -er '.id' "$scratch/submission.json")"
@@ -126,16 +129,31 @@ case "$mode" in
       jq -r '"Notarization request \(.id): \(.status)"' "$scratch/notary.json"
       exit 1
     fi
-    xcrun stapler staple "$app"
-    xcrun stapler validate "$app"
-    codesign --verify --deep --strict "$app"
-    spctl --assess --type execute --verbose "$app"
-    (
-      cd dist
-      zip="GPhotos-$RELEASE_VERSION-macOS.zip"
-      ditto -c -k --sequesterRsrc --keepParent GPhotos.app "$zip"
-      shasum -a 256 "$zip" > "$zip.sha256"
-    )
+    xcrun stapler staple "$upload"
+    xcrun stapler validate "$upload"
+    codesign --verify --strict "$upload"
+    spctl --assess --type open --context context:primary-signature --verbose "$upload"
+    (cd dist && shasum -a 256 "${upload##*/}" > "${upload##*/}.sha256")
+    ;;
+  ios-ipa)
+    xcodebuild archive -project "$project" -scheme GPhotosSync \
+      -configuration Release -destination 'generic/platform=iOS' -archivePath "$scratch/GPhotos.xcarchive" \
+      CODE_SIGNING_ALLOWED=NO MARKETING_VERSION="$RELEASE_VERSION" \
+      CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
+    app="$scratch/Payload/GPhotos.app"
+    mkdir -p dist "$scratch/Payload"
+    ditto "$scratch/GPhotos.xcarchive/Products/Applications/GPhotosSync.app" "$app"
+    for extension in PlugIns/BackupWidgets.appex PlugIns/ShareExtension.appex Extensions/PhotosUploadExtension.appex; do
+      test -f "$app/$extension/Info.plist"
+    done
+    xcrun lipo -verify_arch arm64 "$app/GPhotosSync"
+    if [[ -n "$(find "$app" -name embedded.mobileprovision -print)" ]]; then
+      echo "::error::The unsigned IPA contains a provisioning profile."
+      exit 1
+    fi
+    ipa="GPhotos-$RELEASE_VERSION-iOS-unsigned.ipa"
+    ditto -c -k --keepParent "$scratch/Payload" "dist/$ipa"
+    (cd dist && shasum -a 256 "$ipa" > "$ipa.sha256")
     ;;
   testflight)
     install_certificate
@@ -170,7 +188,7 @@ case "$mode" in
       -authenticationKeyIssuerID "$ASC_ISSUER_ID"
     ;;
   *)
-    echo "Usage: $0 {macos|notarize|testflight}" >&2
+    echo "Usage: $0 {macos|notarize|ios-ipa|testflight}" >&2
     exit 2
     ;;
 esac

@@ -2,7 +2,7 @@
 
 CI builds and tests macOS and iOS on GitHub-hosted Xcode 27 runners. Pull requests use unsigned builds with read-only permissions and no signing secrets. The hosted iOS simulator logs search and face-index benchmarks and checks their results. The wall-clock limits are enforced in macOS CI and local iOS tests where simulator timing is more predictable.
 
-A tag such as `v1.2.0` on a commit in `main` runs the macOS tests before signing. When TestFlight is enabled, the iOS tests gate its upload independently. The tag supplies the marketing version. The workflow run and attempt numbers supply the build number for the app and its extensions. Releasing a new version creates a new GitHub Release with a Mac ZIP and SHA-256 checksum. Existing releases are left in place.
+A tag such as `v1.2.0` on a commit in `main` runs the macOS tests before signing. Hosted iOS tests gate the public unsigned IPA and the optional TestFlight upload. The tag supplies the marketing version. The workflow run and attempt numbers supply the build number for the app and its extensions. Releasing a new version creates a new GitHub Release with a signed, notarized Mac DMG, an iOS IPA for self-signing, and SHA-256 checksums. Existing releases are left in place.
 
 ## Mac releases
 
@@ -29,7 +29,7 @@ base64 -i gphotos.provisionprofile | gh secret set MAC_PROFILE_BASE64 --env maco
 base64 -i AuthKey.p8 | gh secret set ASC_KEY_BASE64 --env macos-release
 ```
 
-Enter the certificate password in the environment's secret form or in the interactive `gh secret set` prompt. Signing uses a temporary keychain on GitHub's disposable runner. The publish job gets release write permission and receives only the tested, signed archive and its checksum.
+Enter the certificate password in the environment's secret form or in the interactive `gh secret set` prompt. Signing uses a temporary keychain on GitHub's disposable runner. The publish job gets release write permission and receives only the tested DMG, unsigned IPA, and their checksums.
 
 After configuring secrets, tag a reviewed commit on `main` and push the tag.
 

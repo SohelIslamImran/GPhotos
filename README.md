@@ -154,11 +154,11 @@ reproduce them.
 
 ### Mac
 
-Once the first signed build is available, download the versioned Mac ZIP from [GitHub Releases](https://github.com/SohelIslamImran/GPhotos/releases). Unzip it, move GPhotos to Applications, and open it. Release builds are signed with Developer ID and notarized by Apple.
+Download the Mac DMG from [GitHub Releases](https://github.com/SohelIslamImran/GPhotos/releases). Open it, drag GPhotos to Applications, and open the app from there. The disk image and app are signed with Developer ID, and Apple notarizes the disk image. The release requires an Apple silicon Mac.
 
 ### iPhone and iPad
 
-The iOS app is included in this repository. Build it in Xcode with your own Apple Developer team to install it on your devices. The release workflow also supports uploading an iOS build to App Store Connect for TestFlight when the maintainer enables it and configures signing. Public beta access requires Apple's review and a TestFlight invitation.
+The [GitHub release](https://github.com/SohelIslamImran/GPhotos/releases) includes an unsigned iOS IPA for self-signing. Use your own Apple signing identity and profiles for the app and its extensions. Features that share data across targets need a common App Group. You can also build and install from source in Xcode with your Apple Developer team. The release workflow also supports uploading an iOS build to App Store Connect for TestFlight when the maintainer enables it and configures signing. Public beta access requires Apple's review and a TestFlight invitation.
 
 ## Build from source
 
