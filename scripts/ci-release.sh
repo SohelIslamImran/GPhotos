@@ -103,7 +103,11 @@ case "$mode" in
       CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO OTHER_CODE_SIGN_FLAGS=--timestamp
     app="$scratch/GPhotos.xcarchive/Products/Applications/GPhotosSyncMac.app"
     codesign --verify --deep --strict "$app"
-    codesign -dv "$app" 2>&1 | grep -q '^Authority=Developer ID Application:'
+    codesign -dvv "$app" 2> "$scratch/signature.txt"
+    if ! grep -q '^Authority=Developer ID Application:' "$scratch/signature.txt"; then
+      echo "::error::The archived app does not have a Developer ID Application signature."
+      exit 1
+    fi
     mkdir -p dist
     ditto "$app" dist/GPhotos.app
     ;;
