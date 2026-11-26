@@ -23,8 +23,12 @@ extension LibraryIndexStore {
   }
 
   /// Stores records with the key that says when each needs indexing again.
-  func saveSiri(_ records: [(record: SiriItemRecord, key: Int64)]) throws {
-    guard !records.isEmpty else { return }
+  @discardableResult
+  func saveSiri(_ records: [(record: SiriItemRecord, key: Int64)], cloud: CloudLibrary? = nil) throws -> [String] {
+    guard cloud?.isIndexingCurrent != false else { return [] }
+    let locked = Self.lockedIDs(among: records.lazy.map { $0.record.id })
+    let records = records.filter { !locked.contains($0.record.id) }
+    guard !records.isEmpty else { return [] }
     let database = try db()
     try database.transaction {
       for (record, key) in records {
@@ -41,14 +45,12 @@ extension LibraryIndexStore {
           ])
       }
     }
+    return records.map { $0.record.id }
   }
 
   func deleteSiri(_ ids: [String]) throws {
     guard !ids.isEmpty else { return }
-    let database = try db()
-    try database.transaction {
-      for id in ids { try database.run("DELETE FROM siri_items WHERE id = ?", [.text(id)]) }
-    }
+    try db().run("DELETE FROM siri_items WHERE id IN (SELECT value FROM json_each(?))", [try .list(ids)])
   }
 
   /// Stored records for these ids, in the order given; unknown ids are skipped.

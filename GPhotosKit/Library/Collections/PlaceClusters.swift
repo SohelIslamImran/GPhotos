@@ -51,17 +51,17 @@ public enum PlaceClusters {
   /// Pins for the points inside `area` (all points without one). Above `limit` cells, the
   /// cells grow rather than dropping photos; only past a world-sized cell are the
   /// smallest left out.
-  public static func make(_ points: [PlacePoint], cellDegrees: Double, area: Area? = nil, limit: Int = 150)
-    -> [PlaceCluster]
-  {
-    guard cellDegrees > 0 else { return [] }
+  public static func make(
+    _ points: [PlacePoint], cellDegrees: Double, area: Area? = nil, limit: Int = 150
+  ) -> [PlaceCluster] {
+    guard cellDegrees > 0, limit > 0 else { return [] }
     let inside = area.map { area in points.filter(area.contains) } ?? points
+    guard !inside.isEmpty else { return [] }
     var cellDegrees = cellDegrees
-    var buckets = group(inside, cellDegrees: cellDegrees)
-    while buckets.count > limit, cellDegrees < 180 {
+    while cellDegrees < 180, exceedsLimit(inside, cellDegrees: cellDegrees, limit: limit) {
       cellDegrees *= 2
-      buckets = group(inside, cellDegrees: cellDegrees)
     }
+    let buckets = group(inside, cellDegrees: cellDegrees)
     return
       buckets
       .sorted { $0.value.ids.count > $1.value.ids.count }
@@ -106,6 +106,12 @@ public enum PlaceClusters {
     var latitude = 0.0
     var longitude = 0.0
     var ids: [String] = []
+
+    mutating func append(_ point: PlacePoint) {
+      latitude += point.latitude
+      longitude += point.longitude
+      ids.append(point.id)
+    }
   }
 
   private struct Cell: Hashable {
@@ -113,14 +119,26 @@ public enum PlaceClusters {
     let column: Int
   }
 
+  private static func exceedsLimit(_ points: [PlacePoint], cellDegrees: Double, limit: Int) -> Bool {
+    var cells = Set<Cell>()
+    cells.reserveCapacity(min(limit + 1, points.count))
+    for point in points {
+      let cell = Cell(
+        row: Int((point.latitude / cellDegrees).rounded(.down)),
+        column: Int((point.longitude / cellDegrees).rounded(.down)))
+      cells.insert(cell)
+      if cells.count > limit { return true }
+    }
+    return false
+  }
+
   private static func group(_ points: [PlacePoint], cellDegrees: Double) -> [Cell: Bucket] {
     var buckets: [Cell: Bucket] = [:]
     for point in points {
       let cell = Cell(
-        row: Int((point.latitude / cellDegrees).rounded(.down)), column: Int((point.longitude / cellDegrees).rounded(.down)))
-      buckets[cell, default: Bucket()].latitude += point.latitude
-      buckets[cell, default: Bucket()].longitude += point.longitude
-      buckets[cell, default: Bucket()].ids.append(point.id)
+        row: Int((point.latitude / cellDegrees).rounded(.down)),
+        column: Int((point.longitude / cellDegrees).rounded(.down)))
+      buckets[cell, default: Bucket()].append(point)
     }
     return buckets
   }

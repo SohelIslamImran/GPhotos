@@ -14,6 +14,10 @@ public struct DeviceItemInfo: Sendable, Equatable {
   /// PhotoKit's media subtypes, kept as one number; search words come from it only for
   /// items being indexed.
   public var subtypes: UInt = 0
+  var source: PHAssetSourceType = .typeUserLibrary
+  var isMedia = true
+  var isHidden = false
+  var version = PhotoBackupEvidence.Version(.init(modifiedAt: nil))
 
   public init(
     localIdentifier: String, date: Date, width: Int, height: Int, isVideo: Bool, isFavorite: Bool,
@@ -48,38 +52,52 @@ public enum UnifiedEntry: Hashable, Sendable {
 /// the way Immich merges local and remote assets: an item on both shows once, as the
 /// device copy (faster to load, works offline), with a "backed up" badge.
 ///
-/// Two items are the same photo when the manifest says the asset was uploaded as that
-/// media key, or, for items uploaded by other apps, when they're the only pair sharing a
-/// capture time (less than a second apart), type and pixel size. Existing manifest hashes
-/// can also identify copies without reading or hashing any library resources.
+/// Display matches use upload receipts, byte identity or a unique capture-time and
+/// dimension match. Folder files can match by receipt or bytes.
 public enum TimelineMerge {
-  /// Files in backed-up folders join too, matched to Google Photos only through their
-  /// upload records (`uploadedFileKeys`, by path): they have no pixel size to compare.
   public static func merge(
     device: [DeviceItemInfo], cloud: [RemoteItemSummary], uploadedMediaKeys: [String: Set<String>],
     uploadedSHA1s: [String: Set<Data>] = [:],
     folder: [FolderItemInfo] = [], uploadedFileKeys: [String: String] = [:],
     filter: LibraryFilter = .all, hidesScreenshots: Bool = false
   ) -> [UnifiedEntry] {
-    // Screenshots stay in their own filter when they're hidden from the rest.
-    let hidesScreenshots = hidesScreenshots && filter != .screenshots
+    project(
+      device: device, cloud: cloud, uploadedMediaKeys: uploadedMediaKeys, uploadedSHA1s: uploadedSHA1s,
+      folder: folder, uploadedFileKeys: uploadedFileKeys, filter: filter, hidesScreenshots: hidesScreenshots
+    ).entries
+  }
+
+  struct Projection: Sendable {
+    var entries: [UnifiedEntry] = []
+    var copies = LocalFirstThumbnailSource.LocalCopies()
+    var confirmedFileIDs: Set<String> = []
+  }
+
+  static func project(
+    device: [DeviceItemInfo], cloud: [RemoteItemSummary], uploadedMediaKeys: [String: Set<String>],
+    uploadedSHA1s: [String: Set<Data>], folder: [FolderItemInfo], uploadedFileKeys: [String: String],
+    filter: LibraryFilter, hidesScreenshots: Bool, backup: PhotoBackupEvidence? = nil,
+    excludedFilePaths: Set<String> = [],
+    extraFileKeys: [String: Set<String>] = [:]
+  ) -> Projection {
+    var projection = Projection()
+    // A display preference must not hide work from the backup filters.
+    let hidesScreenshots = hidesScreenshots && filter != .screenshots && !filter.dependsOnBackup
     var cloudIndexByKey: [String: Int] = [:]
     cloudIndexByKey.reserveCapacity(cloud.count)
     for (index, item) in cloud.enumerated() { cloudIndexByKey[item.mediaKey] = index }
 
     var matchOfDevice = [Int?](repeating: nil, count: device.count)
     var cloudMatched = [Bool](repeating: false, count: cloud.count)
+    // Backup filters need to show the Google row if its local copy still needs backup.
+    let separatesUnconfirmed = filter == .backedUp || filter == .cloudOnly
+    var cloudHasBackedUpLocal = Set<Int>()
     var matchOfFolder = [Int?](repeating: nil, count: folder.count)
-    for (index, item) in folder.enumerated() {
-      guard let key = uploadedFileKeys[item.path], let match = cloudIndexByKey[key], !cloudMatched[match] else { continue }
-      matchOfFolder[index] = match
-      cloudMatched[match] = true
-    }
     // Byte identity and recorded uploads do not depend on dates, dimensions or which
     // local copy already claimed the cloud item. They are display evidence only.
     var cloudByHash: [Data: Int] = [:]
     var favoriteHashes = Set<Data>()
-    var matchedHashes = Set<Data>()
+    var matchedHashes: [Data: String] = [:]
     if !uploadedSHA1s.isEmpty {
       for (index, item) in cloud.enumerated() {
         guard let hash = item.sha1, hash.count == 20 else { continue }
@@ -87,25 +105,79 @@ public enum TimelineMerge {
         if item.isFavorite { favoriteHashes.insert(hash) }
       }
     }
+
+    var filesByHash: [Data: FolderItemInfo] = [:]
+    var backedUpFileHashes = Set<Data>()
+    for (index, item) in folder.enumerated() {
+      let key = uploadedFileKeys[item.path]
+      let keys = extraFileKeys[item.path] ?? key.map { [$0] } ?? []
+      var match: Int?
+      for key in keys {
+        projection.copies.files[key] = item
+        guard let index = cloudIndexByKey[key], !cloudMatched[index] else { continue }
+        cloudMatched[index] = true
+        match = min(match ?? index, index)
+      }
+      if uploadedFileKeys[item.path] != nil, separatesUnconfirmed {
+        for key in keys { if let index = cloudIndexByKey[key] { cloudHasBackedUpLocal.insert(index) } }
+      }
+      for hash in uploadedSHA1s[item.id] ?? [] {
+        guard let candidate = cloudByHash[hash] else { continue }
+        if filesByHash[hash] == nil { filesByHash[hash] = item }
+        if match == nil, !cloudMatched[candidate] { match = candidate }
+        if !item.isLivePhoto { projection.confirmedFileIDs.insert(item.id) }
+        if separatesUnconfirmed, !item.isLivePhoto || key != nil { backedUpFileHashes.insert(hash) }
+      }
+      guard let match else { continue }
+      matchOfFolder[index] = match
+      cloudMatched[match] = true
+    }
+    if !filesByHash.isEmpty {
+      for (index, item) in cloud.enumerated() {
+        guard let hash = item.sha1, let file = filesByHash[hash] else { continue }
+        cloudMatched[index] = true
+        if backedUpFileHashes.contains(hash) { cloudHasBackedUpLocal.insert(index) }
+        if projection.copies.files[item.mediaKey] == nil { projection.copies.files[item.mediaKey] = file }
+      }
+    }
     // A copy collapsed into a device photo still makes that photo a favorite.
     var deviceHasFavoriteCopy = Set<Int>()
     // A folder file's claim doesn't count: the device copy of that photo still matches.
     var claimedByDevice = [Bool](repeating: false, count: cloud.count)
     var unmatchedDevice: [Int] = []
-    for (index, item) in device.enumerated() {
+    var backedUpDeviceHashes = Set<Data>()
+    func deviceIsBackedUp(_ item: DeviceItemInfo, confirmed: Bool) -> Bool {
+      let state = backup?.state(for: item.localIdentifier, version: item.version.assetVersion)
+      return state == .backedUp
+        || (state == nil && confirmed)
+        || (backup == nil && !(uploadedMediaKeys[item.localIdentifier]?.isEmpty ?? true))
+    }
+    for (index, item) in device.enumerated() where !item.isHidden {
       var matches = Set<Int>()
+      var receiptMatch: Int?
       for key in uploadedMediaKeys[item.localIdentifier] ?? [] {
-        if let match = cloudIndexByKey[key] { matches.insert(match) }
+        if projection.copies.assets[key] == nil { projection.copies.assets[key] = item.localIdentifier }
+        if let match = cloudIndexByKey[key] {
+          receiptMatch = min(receiptMatch ?? match, match)
+          matches.insert(match)
+        }
       }
       for hash in uploadedSHA1s[item.localIdentifier] ?? [] {
         if let match = cloudByHash[hash] {
           matches.insert(match)
-          matchedHashes.insert(hash)
+          if matchedHashes[hash] == nil { matchedHashes[hash] = item.localIdentifier }
+          if !PHAssetMediaSubtype(rawValue: item.subtypes).contains(.photoLive) {
+            projection.copies.confirmedAssetIDs.insert(item.localIdentifier)
+          }
           if favoriteHashes.contains(hash) { deviceHasFavoriteCopy.insert(index) }
         }
       }
+      if separatesUnconfirmed, deviceIsBackedUp(item, confirmed: projection.copies.confirmedAssetIDs.contains(item.localIdentifier)) {
+        cloudHasBackedUpLocal.formUnion(matches)
+        backedUpDeviceHashes.formUnion(uploadedSHA1s[item.localIdentifier] ?? [])
+      }
       if matches.contains(where: { cloud[$0].isFavorite }) { deviceHasFavoriteCopy.insert(index) }
-      if let match = matches.min() {
+      if let match = receiptMatch ?? matches.min() {
         matchOfDevice[index] = match
         for match in matches {
           cloudMatched[match] = true
@@ -119,9 +191,11 @@ public enum TimelineMerge {
     // share a hash. Expanding the whole hash group per device would be quadratic.
     if !matchedHashes.isEmpty {
       for (index, item) in cloud.enumerated() {
-        if let hash = item.sha1, matchedHashes.contains(hash) {
+        if let hash = item.sha1, let id = matchedHashes[hash] {
+          if projection.copies.assets[item.mediaKey] == nil { projection.copies.assets[item.mediaKey] = id }
           cloudMatched[index] = true
           claimedByDevice[index] = true
+          if backedUpDeviceHashes.contains(hash) { cloudHasBackedUpLocal.insert(index) }
         }
       }
     }
@@ -151,6 +225,8 @@ public enum TimelineMerge {
         else { continue }
         matchOfDevice[index] = match
         cloudMatched[match] = true
+        if separatesUnconfirmed, deviceIsBackedUp(device[index], confirmed: false) { cloudHasBackedUpLocal.insert(match) }
+        projection.copies.assets[cloud[match].mediaKey] = device[index].localIdentifier
       }
     }
 
@@ -166,14 +242,18 @@ public enum TimelineMerge {
       case .videos: return item.isVideo
       case .livePhotos: return subtypes.contains(.photoLive)
       case .screenshots: return subtypes.contains(.photoScreenshot)
-      case .notBackedUp: return match == nil && (uploadedMediaKeys[item.localIdentifier]?.isEmpty ?? true)
-      case .backedUp: return match != nil || !(uploadedMediaKeys[item.localIdentifier]?.isEmpty ?? true)
+      case .notBackedUp, .notIncludedInBackup, .backedUp:
+        let inScope =
+          backup?.scope.includes(
+            id: item.localIdentifier, source: item.source, isMedia: item.isMedia, isHidden: item.isHidden) ?? true
+        let confirmed = projection.copies.confirmedAssetIDs.contains(item.localIdentifier)
+        return filter.includesBackupItem(inScope: inScope, backedUp: deviceIsBackedUp(item, confirmed: confirmed))
       case .cloudOnly: return false
       }
     }
     func keepsCloud(_ index: Int) -> Bool {
       let item = cloud[index]
-      if hidesScreenshots, Self.isScreenshot(item) { return false }
+      if hidesScreenshots && Self.isScreenshot(item) { return false }
       switch filter {
       case .all, .backedUp, .cloudOnly: return true
       case .favorites: return item.isFavorite
@@ -181,7 +261,7 @@ public enum TimelineMerge {
       case .videos: return item.kind == .video
       case .livePhotos: return item.kind == .motionPhoto
       case .screenshots: return Self.isScreenshot(item)
-      case .notBackedUp: return false
+      case .notBackedUp, .notIncludedInBackup: return false
       }
     }
 
@@ -197,8 +277,10 @@ public enum TimelineMerge {
       case .videos: return item.isVideo
       case .livePhotos: return item.isLivePhoto
       case .screenshots: return isScreenshot
-      case .notBackedUp: return match == nil && uploadedFileKeys[item.path] == nil
-      case .backedUp: return match != nil || uploadedFileKeys[item.path] != nil
+      case .notBackedUp, .notIncludedInBackup, .backedUp:
+        return filter.includesBackupItem(
+          inScope: !excludedFilePaths.contains(item.path),
+          backedUp: uploadedFileKeys[item.path] != nil || projection.confirmedFileIDs.contains(item.id))
       case .cloudOnly: return false
       }
     }
@@ -218,7 +300,7 @@ public enum TimelineMerge {
     var d = 0
     var c = 0
     while d < device.count || c < cloud.count {
-      if c < cloud.count, cloudMatched[c] {
+      if c < cloud.count, separatesUnconfirmed ? cloudHasBackedUpLocal.contains(c) : cloudMatched[c] {
         c += 1
         continue
       }
@@ -239,7 +321,13 @@ public enum TimelineMerge {
     for rest in folderOrder[f...] { entries.append(.folder(rest.index, cloud: matchOfFolder[rest.index])) }
     // Every list comes newest first.
     entries.reverse()
-    return entries
+    if !projection.copies.assets.isEmpty {
+      let ids = Set(projection.copies.assets.values)
+      projection.copies.assetVersions = Dictionary(
+        uniqueKeysWithValues: device.lazy.filter { ids.contains($0.localIdentifier) }.map { ($0.localIdentifier, $0.version) })
+    }
+    projection.entries = entries
+    return projection
   }
 
   /// Google Photos doesn't say which items are screenshots; phones name them so.

@@ -125,11 +125,14 @@ public struct AddPhotosToAlbumIntent: AppIntent {
       added = found.count
     case .google(let mediaKey, _):
       guard let cloud = await SiriLibrary.shared.browsedCloud(),
+        !cloud.isRetired,
         let target = await cloud.albums().first(where: { $0.mediaKey == mediaKey })
       else { throw SiriLibraryError.signedOut }
       var items: [RemoteItemSummary] = []
       for id in assets.map(\.id) where id.hasPrefix("g:") {
-        if let item = await cloud.summary(mediaKey: String(id.dropFirst(2))) { items.append(item) }
+        let key = String(id.dropFirst(2))
+        guard let item = await cloud.summary(mediaKey: key) else { continue }
+        items.append(item)
       }
       if !items.isEmpty {
         // A change in the Google Photos account: asked first, with the count.

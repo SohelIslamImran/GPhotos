@@ -56,8 +56,10 @@ reproduce them.
   or drag exports as needed; folder files can be shared, never deleted from the Library.
 - **Collections.** Pinned collections, albums, media types, utilities and an interactive
   Places map across the merged library (including Google-only items). Device Hidden items
-  require authentication. Google scopes include Albums, All Photos, Favorites, Videos,
-  Archive, Trash and Uses Storage, with charged bytes reported by library sync.
+  and Google's Locked Folder (view only) require authentication. Google scopes include
+  Albums, All Photos, Favorites, Videos, Archive, Trash and Uses Storage, with charged
+  bytes reported by library sync. Not Backed Up and Not Included in Backup open the
+  Library with that filter.
 - **Google Photos.** A local mirror per account resumes interrupted full syncs and
   follows with delta updates. Browse cloud items, stream videos, save originals,
   edit captions, favorite, archive, add to albums, move to Trash or restore.

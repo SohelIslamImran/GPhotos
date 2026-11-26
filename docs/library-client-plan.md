@@ -12,7 +12,7 @@ private Google endpoint has been verified with a live account.
 | Grid | Shared layer renderer, arithmetic layout, visible cells only, cancellable/coalesced thumbnails, Years/Months/All, filters and selection; iPhone edge scrolling continues while the selecting finger rests | `PhotoGridRenderer`, `PhotoGridLayout`, `ThumbnailPipeline`, `LibraryView` |
 | Launch | Last-screen restoration and an iPhone Library snapshot displayed until the live grid appears | `Library/Unified/LibrarySnapshot.swift`, app entry points |
 | Viewer | Paged device, file and cloud media; current page and neighbors only; zoom, filmstrip, Live Photos, video, info, sharing and export | `Library/Viewer`, `Library/Folders/FileViewerPage.swift`, `Library/Remote/RemoteViewerPage.swift` |
-| Collections | Pins, device albums, media types, utilities, Places map, authenticated device Hidden scope; Google Favorites, Archive, Trash and Uses Storage | `Library/Collections`, `Library/Remote/CloudLibraryView.swift` |
+| Collections | Pins, device albums, media types, utilities, Places map, authenticated device Hidden scope; Google Favorites, Archive, Trash, Uses Storage and an authenticated, read-only Locked Folder | `Library/Collections`, `Library/Remote/CloudLibraryView.swift` |
 | Cloud mirror | SQLite per account, resumable full sync and delta sync, page/token commits, cycle and stuck-token guards | `RemoteLibraryStore`, `RemoteLibrarySync` |
 | Cloud actions | Favorite, archive, caption, add/create album, Trash/restore, original download, share and video streaming | `Network/MobileLibraryClient.swift`, `Library/Remote` |
 | Search | SQLite FTS5 metadata and OCR; Vision labels, feature prints, faces and aesthetics for device photos; word expansion | `Library/Intelligence` |
@@ -83,8 +83,9 @@ Mac launch respects Auto-Sync off.
 - Foundation Models query parsing, saved smart albums, local keyword editing,
   library widgets, memory movies, collages and Ask the Library remain roadmap ideas,
   not current capabilities. Slideshows are out of scope.
-- Shared links, partner sharing, Google's face groups/search, server-side Locked
-  Folder and total account quota are outside the current mobile-client implementation.
+- Shared links, partner sharing, Google's face groups/search and total account quota
+  are outside the current mobile-client implementation. The Locked Folder is read-only:
+  the app has no request that moves items in or out of it.
   Charged bytes from sync do not represent the account's full storage quota.
 - There is no web API integration, permanent deletion, or settings-based library
   kill switch. The original proposal's action journal and these features were plans.

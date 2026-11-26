@@ -18,15 +18,30 @@ struct MacActivityView: View {
   /// Empty until a column header is clicked: the manifest's own order, which needs no sort.
   @State private var sortOrder: [KeyPathComparator<TransferRecord>] = []
   /// The rows last shown, so a selection change doesn't filter and sort them again.
-  @State private var cache = RowsCache()
+  @State private var rows = NativeActivityTable.Rows([])
+  @State private var renderedAccount: String?
+
+  private struct RowRequest: Equatable {
+    let revision: Int
+    let account: String?
+    let filter: ActivityFilter
+    let query: String
+    let sortOrder: [KeyPathComparator<TransferRecord>]
+  }
+
+  private var rowRequest: RowRequest {
+    RowRequest(
+      revision: store.accountActivityRevision, account: store.selectedAccount?.email, filter: filter,
+      query: appliedQuery, sortOrder: sortOrder)
+  }
 
   var body: some View {
-    let records = store.accountRecords
-    let visible = rows(from: records)
+    let request = rowRequest
+    let visible = renderedAccount == request.account ? rows : .empty
     table(visible)
       .transaction { $0.animation = nil }
       .overlay {
-        if visible.isEmpty {
+        if visible.records.isEmpty {
           emptyState
         }
       }
@@ -46,20 +61,28 @@ struct MacActivityView: View {
         guard !Task.isCancelled else { return }
         appliedQuery = query
       }
-      .onChange(of: appliedQuery) { selection.formIntersection(visible.map(\.id)) }
+      .onChange(of: request.account) { selection.removeAll() }
+      .task(id: request) {
+        let records = store.activityRecords(for: request.account)
+        let work = Task.detached(priority: .userInitiated) {
+          let filtered = request.filter.apply(to: records, query: request.query)
+          guard !Task.isCancelled else { return NativeActivityTable.Rows.empty }
+          let sorted = request.sortOrder.isEmpty ? filtered : filtered.sorted(using: request.sortOrder)
+          return NativeActivityTable.Rows(sorted)
+        }
+        let next = await withTaskCancellationHandler {
+          await work.value
+        } onCancel: {
+          work.cancel()
+        }
+        guard !Task.isCancelled, request == rowRequest else { return }
+        selection = selection.filter { next.indexByID[$0] != nil }
+        renderedAccount = request.account
+        rows = next
+      }
       .navigationTitle("Activity")
       .navigationSubtitle(subtitle)
       .toolbar { toolbar }
-  }
-
-  private func rows(from records: [TransferRecord]) -> [TransferRecord] {
-    cache.rows(
-      revision: store.recordsRevision, account: store.selectedAccount?.email,
-      filter: filter, query: appliedQuery, sortOrder: sortOrder
-    ) {
-      let filtered = filter.apply(to: records, query: appliedQuery)
-      return sortOrder.isEmpty ? filtered : filtered.sorted(using: sortOrder)
-    }
   }
 
   /// Counts live in the subtitle rather than in the filter's segments, whose widths would
@@ -88,7 +111,7 @@ struct MacActivityView: View {
     ToolbarItem(placement: .primaryAction) {
       Button("Retry Failed", systemImage: "arrow.clockwise") { Task { await store.retryFailedForUser() } }
         .help("Retry every failed upload")
-        .disabled(store.isRunning || store.accountRecordCounts.failed == 0)
+        .disabled(store.isRunning || !store.hasFailedRecords)
     }
   }
 
@@ -107,10 +130,10 @@ struct MacActivityView: View {
     }
   }
 
-  private func table(_ visible: [TransferRecord]) -> some View {
+  private func table(_ visible: NativeActivityTable.Rows) -> some View {
     NativeActivityTable(
-      rows: visible, revision: cache.generation, selection: $selection,
-      cell: { record, column in AnyView(cell(record, column: column)) },
+      rows: visible, selection: $selection,
+      cell: { record, column in AnyView(cell(record, column: column).id(record.id)) },
       sortChanged: { descriptors in
         sortOrder = descriptors.compactMap { descriptor in
           let order: SortOrder = descriptor.ascending ? .forward : .reverse
@@ -130,7 +153,9 @@ struct MacActivityView: View {
       }
     )
     .onCopyCommand {
-      visible.filter { selection.contains($0.id) }.map { NSItemProvider(object: $0.filename as NSString) }
+      selection.compactMap { visible.indexByID[$0] }.sorted().map {
+        NSItemProvider(object: visible.records[$0].filename as NSString)
+      }
     }
   }
 
@@ -303,35 +328,5 @@ private struct ActivityDetailCell: View {
     let bytes = String(
       localized: "\(ByteFormat.string(worker.bytesUploaded)) of \(ByteFormat.string(worker.bytesTotal))")
     return ([bytes, worker.formattedSpeed, worker.formattedETA].filter { !$0.isEmpty }).joined(separator: " · ")
-  }
-}
-
-/// Avoid comparing a whole history when only selection or toolbar state changed.
-@MainActor
-private final class RowsCache {
-  private(set) var generation = 0
-  private var revision: Int?
-  private var account: String?
-  private var filter: ActivityFilter?
-  private var query = ""
-  private var sortOrder: [KeyPathComparator<TransferRecord>] = []
-  private var rows: [TransferRecord] = []
-
-  func rows(
-    revision: Int?, account: String?, filter: ActivityFilter, query: String, sortOrder: [KeyPathComparator<TransferRecord>],
-    make: () -> [TransferRecord]
-  ) -> [TransferRecord] {
-    if filter != self.filter || query != self.query || sortOrder != self.sortOrder || revision != self.revision
-      || account != self.account
-    {
-      self.revision = revision
-      self.account = account
-      self.filter = filter
-      self.query = query
-      self.sortOrder = sortOrder
-      rows = make()
-      generation &+= 1
-    }
-    return rows
   }
 }

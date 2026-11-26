@@ -50,6 +50,35 @@ public enum FolderMediaScanner {
     }
   }
 
+  /// Shares a walk between the Library and backup during one foreground activation.
+  /// Each caller keeps its folder access while awaiting the same read.
+  public actor ForegroundRead {
+    private struct Key: Hashable {
+      let root: URL
+      let exclusions: FolderExclusions
+    }
+
+    private var scans: [Key: Task<(media: MediaScan, completedAt: ContinuousClock.Instant), Never>] = [:]
+
+    public init() {}
+
+    public func scan(_ root: URL, excluding exclusions: FolderExclusions) async -> MediaScan {
+      let key = Key(root: root.standardizedFileURL, exclusions: exclusions)
+      while let existing = scans[key] {
+        let (media, completedAt) = await existing.value
+        if ContinuousClock.now - completedAt < .seconds(5) { return media }
+        // Only the first caller finding an expired result replaces the walk.
+        if scans[key] == existing { scans[key] = nil }
+      }
+      let read = Task.detached(priority: .userInitiated) {
+        let media = FolderMediaScanner.collectMedia(in: root, skipsUnsettledFiles: true, excluding: exclusions)
+        return (media: media, completedAt: ContinuousClock.now)
+      }
+      scans[key] = read
+      return await read.value.media
+    }
+  }
+
   /// Every supported, regular, non-hidden file under `directory`, skipping package
   /// contents and symbolic links. With `skipsUnsettledFiles`, iCloud placeholders and
   /// files still being written are left for a later scan, together with any file that
@@ -153,7 +182,10 @@ public enum FolderMediaScanner {
   /// copy of one deletes it for every participant, so silent cleanup never touches it.
   /// Fails closed: an item whose attributes can't be read counts as shared.
   public static func isSharedCloudItem(_ url: URL) -> Bool {
-    guard
+    // A URL keeps the values it read before; sharing may have changed since.
+    var url = url
+    url.removeAllCachedResourceValues()
+    guard (try? url.checkResourceIsReachable()) == true,
       let values = try? url.resourceValues(forKeys: [.ubiquitousItemIsSharedKey, .ubiquitousSharedItemCurrentUserRoleKey])
     else { return true }
     return values.ubiquitousItemIsShared == true || values.ubiquitousSharedItemCurrentUserRole != nil

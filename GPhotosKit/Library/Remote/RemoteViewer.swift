@@ -19,20 +19,40 @@ struct RemoteViewerPage: View {
   @State private var localAsset: PHAsset?
   @State private var resolvedLocalCopy = false
   @State private var image: CGImage?
-  @State private var token: ImageRequestToken?
-  @State private var detailToken: ImageRequestToken?
-  @State private var loadedSide = 0
+  @State private var isLoadingImage = false
+  @State private var didFail = false
+  @State private var token: ThumbnailTicket?
+  @State private var detailToken: ThumbnailTicket?
   @State private var player: AVPlayer?
   @State private var playerObservation: NSKeyValueObservation?
   @State private var videoFailed = false
   @State private var usesOriginal = false
   @State private var attempt = 0
 
+  private var imageID: String { RemoteThumbnailID(mediaKey: item.mediaKey, contentVersion: item.contentVersion).string }
+  private var identity: ThumbnailIdentity { library.localFirstThumbnails.thumbnailIdentity(for: imageID) }
+  private var blocked: Bool { identity.isLocked || library.isRetired }
+  private var cachedPreview: CGImage? { ThumbnailPipeline.shared.viewerPreview(for: identity) }
   private var pixelSize: CGSize { CGSize(width: item.width ?? 0, height: item.height ?? 0) }
+
+  private var imageRoute: LocalFirstThumbnailSource.Route {
+    _ = library.localCopyRevision
+    return library.localFirstThumbnails.route(for: item.mediaKey)
+  }
+
+  private struct Request: Hashable {
+    let route: LocalFirstThumbnailSource.Route
+    let blocked: Bool
+    let attempt: Int
+    let assetVersion: PhotoBackupEvidence.Version?
+    let file: FolderItemInfo?
+  }
 
   var body: some View {
     ZStack {
-      if let localAsset {
+      if blocked {
+        Color.clear
+      } else if let localAsset {
         DeviceViewerPage(
           asset: localAsset, label: item.fileName, containerSize: containerSize, displayScale: displayScale,
           isCurrent: isCurrent, playsLive: false, onTap: onTap, onDismiss: onDismiss,
@@ -43,14 +63,14 @@ struct RemoteViewerPage: View {
           isCurrent: isCurrent, onTap: onTap, onDismiss: onDismiss, onSwipeUp: onSwipeUp, playback: playback)
       } else {
         ZoomableImage(
-          image: image, pixelSize: pixelSize, liveText: isCurrent && item.kind != .video, onZoom: loadDetail, onTap: onTap,
+          image: image, pixelSize: pixelSize, previewIdentity: identity, isCurrent: isCurrent, showsProgress: !videoFailed,
+          isLoading: isLoadingImage || (!resolvedLocalCopy && item.kind != .video), didFail: didFail,
+          isBuffering: item.kind == .video && (player == nil || (playback.player === player && playback.isBuffering)),
+          liveText: isCurrent && item.kind != .video, onZoom: loadDetail, onTap: onTap,
           onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player
         )
       }
-      if localAsset == nil && localFile == nil && (image == nil || (item.kind == .video && isCurrent && player == nil && !videoFailed)) {
-        ProgressView()
-      }
-      if videoFailed, isCurrent {
+      if videoFailed, isCurrent, !blocked {
         VStack(spacing: 12) {
           Text("Couldn't Play Video").font(.headline)
           Button("Try Again", systemImage: "arrow.clockwise") {
@@ -64,43 +84,68 @@ struct RemoteViewerPage: View {
         .glassEffect(in: .rect(cornerRadius: 20))
       }
     }
-    .onDisappear {
-      token?.cancel()
-      token = nil
-      detailToken?.cancel()
-      detailToken = nil
-      localAsset = nil
-      localFile = nil
-      resolvedLocalCopy = false
-      image = nil
-      loadedSide = 0
-      player?.pause()
-      if playback.player === player { playback.attach(nil) }
-      playerObservation = nil
-      player = nil
+    .onReceive(NotificationCenter.default.publisher(for: LockedItems.didLock).receive(on: DispatchQueue.main)) { _ in
+      if blocked { clearMedia() }
     }
-    .task(id: isCurrent ? attempt : -1) {
+    .onChange(of: library.isRetired) {
+      if library.isRetired { clearMedia() }
+    }
+    .onDisappear(perform: clearMedia)
+    .task(id: request) {
+      guard !blocked else { return }
+      let source = library.localFirstThumbnails
+      let checked = source.localCopies
+      let key = item.mediaKey
+      let route = checked.route(for: key)
+      if route != .remote || localAsset != nil || localFile != nil { resolvedLocalCopy = false }
       if !resolvedLocalCopy {
-        if let id = library.localAssetIDs[item.mediaKey] {
+        switch route {
+        case .asset(let id):
           let asset = await Task.detached(priority: .userInitiated) {
-            PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject
+            guard let asset = LocalFirstThumbnailSource.visibleAsset(id),
+              LocalFirstThumbnailSource.hasCurrentVersion(asset, checked.assetVersions[id])
+            else { return nil as PHAsset? }
+            return asset
           }.value
-          guard !Task.isCancelled else { return }
+          guard !Task.isCancelled, !blocked else { return }
+          guard let asset else {
+            source.discardAlias(for: key, route: route, checked: checked)
+            return
+          }
+          localFile = nil
           localAsset = asset
-        }
-        if localAsset?.isHidden == true { localAsset = nil }
-        if localAsset == nil, let file = library.localFiles[item.mediaKey] {
-          let readable = await Task.detached(priority: .userInitiated) {
-            FileManager.default.isReadableFile(atPath: file.url.path)
+        case .file:
+          guard let file = checked.files[key] else { return }
+          let current = await Task.detached(priority: .userInitiated) {
+            LocalFirstThumbnailSource.fileAliasIsCurrent(file)
           }.value
-          guard !Task.isCancelled else { return }
-          if readable { localFile = file }
+          guard !Task.isCancelled, !blocked else { return }
+          guard current else {
+            source.discardAlias(for: key, route: route, checked: checked)
+            return
+          }
+          localAsset = nil
+          localFile = file
+        case .remote:
+          localAsset = nil
+          localFile = nil
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !blocked else { return }
         resolvedLocalCopy = true
       }
-      guard localAsset == nil, localFile == nil else { return }
-      if token == nil { load(side: screenSide) }
+      if route != .remote {
+        token?.cancel()
+        token = nil
+        detailToken?.cancel()
+        detailToken = nil
+        image = nil
+        player?.pause()
+        if playback.player === player { playback.attach(nil) }
+        playerObservation = nil
+        player = nil
+        return
+      }
+      guard source.route(for: key) == .remote else { return }
       if isCurrent {
         await startVideo()
       } else {
@@ -108,22 +153,60 @@ struct RemoteViewerPage: View {
         if playback.player === player { playback.attach(nil) }
       }
     }
+    .task(id: resolvedLocalCopy && localAsset == nil && localFile == nil ? screenSide : 0) {
+      token?.cancel()
+      token = nil
+      guard resolvedLocalCopy, imageRoute == .remote, localAsset == nil, localFile == nil, screenSide > 0,
+        !Task.isCancelled,
+        !ViewerImage.hasFittedPreview(for: identity, target: CGSize(width: CGFloat(screenSide), height: 0))
+      else { return }
+      load(side: screenSide)
+    }
   }
 
-  private var screenSide: Int { Int(max(containerSize.width, containerSize.height) * displayScale) }
+  private func clearMedia() {
+    token?.cancel()
+    token = nil
+    detailToken?.cancel()
+    detailToken = nil
+    localAsset = nil
+    localFile = nil
+    resolvedLocalCopy = false
+    isLoadingImage = false
+    image = nil
+    playerObservation = nil
+    if let player { playback.stop(player) }
+    player = nil
+  }
+
+  private var request: Request {
+    let route = imageRoute
+    let copies = library.localFirstThumbnails.localCopies
+    let key = item.mediaKey
+    return Request(
+      route: route, blocked: blocked, attempt: isCurrent ? attempt : -1,
+      assetVersion: copies.assets[key].flatMap { copies.assetVersions[$0] }, file: copies.files[key])
+  }
+
+  private var screenSide: Int {
+    let fitted = ViewerImage.fittedPixels(pixelSize, in: containerSize, scale: displayScale)
+    return Int(max(fitted.width, fitted.height))
+  }
 
   private func load(side: Int) {
-    let id = RemoteThumbnailID(mediaKey: item.mediaKey, contentVersion: item.contentVersion).string
-    let request = library.thumbnails.requestImage(
-      id: id, pixelSize: CGSize(width: side, height: side), quality: .display
-    ) { cgImage, _ in
-      Task { @MainActor in
-        let delivered = max(cgImage.width, cgImage.height)
-        guard delivered >= loadedSide else { return }
-        image = cgImage
-        loadedSide = delivered
-      }
+    guard !blocked, imageRoute == .remote else { return }
+    let isScreen = side <= screenSide
+    if isScreen {
+      isLoadingImage = item.kind != .video
+      didFail = false
     }
+    let request = ViewerImage.request(
+      library.localFirstThumbnails, identity: identity, pixels: CGSize(width: side, height: side),
+      onEnd: { if isScreen { ended() } },
+      deliver: { candidate, isFinal in
+        guard !blocked, imageRoute == .remote else { return }
+        if ViewerImage.accepts(candidate, over: image ?? cachedPreview, isFinal: isFinal) { image = candidate }
+      })
     if side > screenSide {
       detailToken?.cancel()
       detailToken = request
@@ -132,17 +215,23 @@ struct RemoteViewerPage: View {
     }
   }
 
+  private func ended() {
+    isLoadingImage = false
+    didFail = item.kind != .video && image == nil && cachedPreview == nil
+  }
+
   private func loadDetail(_ zoom: CGFloat) {
     guard zoom > 1.2 else { return }
     let full = max(item.width ?? 0, item.height ?? 0)
     var wanted = Int(CGFloat(screenSide) * zoom)
     if full > 0 { wanted = min(wanted, full) }
-    guard CGFloat(wanted) > CGFloat(loadedSide) * 1.25 else { return }
+    guard CGFloat(wanted) > CGFloat(ViewerImage.longSide(image ?? cachedPreview)) * 1.25 else { return }
     load(side: wanted)
   }
 
   /// Both HLS and the original are streamed; opening a video never stages a full copy.
   private func startVideo() async {
+    guard !blocked, imageRoute == .remote, !Task.isCancelled else { return }
     if player?.currentItem?.status == .failed {
       playerObservation = nil
       player = nil
@@ -159,23 +248,25 @@ struct RemoteViewerPage: View {
         let stream = try await library.streamingPlaylist(item)
         if try await play(url: stream.url, headers: stream.headers) { return }
       } catch {
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !blocked else { return }
       }
       usesOriginal = true
     }
+    guard !blocked, imageRoute == .remote, !Task.isCancelled else { return }
     do {
       let stream = try await library.videoURL(item)
       let started = try await play(url: stream.url, headers: stream.headers)
-      if !started, !Task.isCancelled { videoFailed = true }
+      if !started, !Task.isCancelled, !blocked { videoFailed = true }
     } catch {
-      if !Task.isCancelled { videoFailed = true }
+      if !Task.isCancelled, !blocked { videoFailed = true }
     }
   }
 
   private func play(url: URL, headers: [String: String]) async throws -> Bool {
+    try library.checkUnlocked(item.mediaKey)
     let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
     guard try await asset.load(.isPlayable) else { return false }
-    try Task.checkCancellation()
+    try library.checkUnlocked(item.mediaKey)
     guard isCurrent else { return false }
     let item = AVPlayerItem(asset: asset)
     let player = AVPlayer(playerItem: item)

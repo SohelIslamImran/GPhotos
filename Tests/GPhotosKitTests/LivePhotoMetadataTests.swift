@@ -41,6 +41,17 @@ struct LivePhotoMetadataTests {
     #expect(singles.isEmpty)
     #expect(pairs.first?.photoFilename == "renamed_vacation_photo.jpg")
     #expect(pairs.first?.videoFilename == "completely_different_movie.mov")
+    let pair = try #require(pairs.first)
+    let files = [
+      LocalMediaFile(url: photoURL, size: pair.photoSize, created: pair.creationDate, modified: pair.modificationDate),
+      LocalMediaFile(url: videoURL, size: pair.videoSize, created: pair.creationDate, modified: pair.videoModificationDate),
+    ]
+    let paired = FolderLibrary.items(from: files, pairLivePhotos: true)
+    #expect(paired.map(\.fileName) == [pair.photoFilename])
+    #expect(paired.first?.motion?.path == pair.videoURL.standardizedFileURL.path)
+    let separate = FolderLibrary.items(from: files, pairLivePhotos: false)
+    #expect(Set(separate.map(\.fileName)) == [pair.photoFilename, pair.videoFilename])
+    #expect(separate.allSatisfy { !$0.isLivePhoto })
   }
 
   @Test("Pairing is blocked when filename stems match but identifiers mismatch")

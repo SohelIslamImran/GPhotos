@@ -21,6 +21,10 @@ public struct MediaKindSummary: Identifiable, Hashable, Sendable {
 @MainActor
 @Observable
 public final class PhotoCollectionsModel: NSObject {
+  /// The model Collections uses on iPhone, loaded at launch so the screen's first frame
+  /// already has its albums and sections.
+  public static let shared = PhotoCollectionsModel()
+
   public private(set) var albums: [AlbumSummary] = []
   public private(set) var mediaKinds: [MediaKindSummary] = []
   public private(set) var photoCount = 0
@@ -30,6 +34,9 @@ public final class PhotoCollectionsModel: NSObject {
   public private(set) var isLoaded = false
   @ObservationIgnored private var isObserving = false
   @ObservationIgnored private var reloadTask: Task<Void, Never>?
+  @ObservationIgnored private var loading: Task<Void, Never>?
+  /// A reload asked for while one runs: that one may have read the library before the change.
+  @ObservationIgnored private var reloadsAgain = false
 
   public override init() {
     super.init()
@@ -39,23 +46,54 @@ public final class PhotoCollectionsModel: NSObject {
     if isObserving { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
   }
 
-  public func load() async {
+  /// Loads once; a load already running is joined, and later changes arrive through the
+  /// library's change observer.
+  public func loadIfNeeded(priority: TaskPriority = .userInitiated) async {
+    guard !isLoaded else { return }
+    if let loading { return await loading.value }
+    await load(priority: priority)
+  }
+
+  /// Reads the library again. Calls during a load are folded into one more read after it.
+  public func load(priority: TaskPriority = .userInitiated) async {
+    if let loading {
+      reloadsAgain = true
+      return await loading.value
+    }
+    let task = Task {
+      repeat {
+        reloadsAgain = false
+        await loadOnce(priority: priority)
+      } while reloadsAgain
+      loading = nil
+    }
+    loading = task
+    await task.value
+  }
+
+  private func loadOnce(priority: TaskPriority) async {
     let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     guard status == .authorized || status == .limited else { return }
-    let snapshot = await Task.detached(priority: .userInitiated) { Self.snapshot() }.value
-    albums = snapshot.albums
-    mediaKinds = snapshot.kinds
-    photoCount = snapshot.photos
-    videoCount = snapshot.videos
-    recentlyAddedKeyID = snapshot.recentlyAddedKeyID
-    isLoaded = true
+    let snapshot = await Task.detached(priority: priority) { Self.snapshot() }.value
+    apply(snapshot)
     if !isObserving {
       PHPhotoLibrary.shared().register(self)
       isObserving = true
     }
   }
 
-  private struct Snapshot: Sendable {
+  /// Observation tells every reader on each assignment, equal or not, so only what changed
+  /// is assigned: a reload that finds the same albums redraws nothing.
+  func apply(_ snapshot: Snapshot) {
+    if albums != snapshot.albums { albums = snapshot.albums }
+    if mediaKinds != snapshot.kinds { mediaKinds = snapshot.kinds }
+    if photoCount != snapshot.photos { photoCount = snapshot.photos }
+    if videoCount != snapshot.videos { videoCount = snapshot.videos }
+    if recentlyAddedKeyID != snapshot.recentlyAddedKeyID { recentlyAddedKeyID = snapshot.recentlyAddedKeyID }
+    if !isLoaded { isLoaded = true }
+  }
+
+  struct Snapshot: Sendable {
     var albums: [AlbumSummary] = []
     var kinds: [MediaKindSummary] = []
     var photos = 0

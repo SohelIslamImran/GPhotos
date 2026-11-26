@@ -19,6 +19,19 @@ public struct RemoteSharedItem: Transferable, Sendable {
   func export() async throws -> URL { try await library.download(item) }
 }
 
+/// A selection of Google Photos items, resolved once per change.
+struct CloudSelection: Sendable {
+  var items: [RemoteItemSummary] = []
+  var allFavorites = false
+
+  init() {}
+
+  init(_ indices: Set<Int>, in all: [RemoteItemSummary]) {
+    items = indices.sorted().compactMap { all.indices.contains($0) ? all[$0] : nil }
+    allFavorites = !items.isEmpty && items.allSatisfy(\.isFavorite)
+  }
+}
+
 /// Saves downloaded Google Photos items into this device's photo library.
 enum DeviceSaver {
   static func save(_ files: [(url: URL, isVideo: Bool)]) async throws {
@@ -38,8 +51,20 @@ public struct CloudLibraryView: View {
   let recordsRevision: Int?
   @State private var model: RemoteLibraryGridModel
   @State private var zoomStep: Int
-  @State private var selection: Set<Int> = []
-  @State private var selectedKeys: Set<String> = []
+  @State private var selectedPositions: Set<Int> = []
+  @State private var selectionToken = -1
+  @State private var selectedKeys = Set<String>()
+  private var selection: Set<Int> {
+    selectionToken == model.reloadToken ? selectedPositions : model.positions(for: selectedKeys)
+  }
+  /// The selection resolved to items off the main actor, a moment after it changes: with a
+  /// whole library selected, the toolbar doesn't sort and map 100,000 items each redraw.
+  @State private var picked = CloudSelection()
+  private struct SelectionRevision: Equatable {
+    let keys: Set<String>
+    let rows: Int
+    let badges: Int
+  }
   @State private var isSelecting = false
   @State private var opened: Int?
   @State private var zoom = ViewerZoom()
@@ -57,7 +82,7 @@ public struct CloudLibraryView: View {
     self.library = library
     self.records = records
     self.recordsRevision = recordsRevision
-    _model = State(initialValue: RemoteLibraryGridModel(library: library, scope: scope))
+    _model = State(initialValue: RemoteLibraryGridModel(library: library, scope: scope, buildsTimeline: true))
     #if os(iOS)
       _zoomStep = State(initialValue: PhotoGridZoom.columnSteps.firstIndex(of: PhotoGridZoom.defaultColumns) ?? 3)
     #else
@@ -82,22 +107,37 @@ public struct CloudLibraryView: View {
       #endif
       .toolbar { toolbar }
       .task {
+        await model.updateDeviceMatches(from: records)
         library.refresh()
         await model.reloadIfNeeded()
-        await model.updateDeviceMatches(from: records)
       }
       .onChange(of: library.revision) { Task { await model.reloadIfNeeded() } }
       .onChange(of: recordsRevision) { Task { await model.updateDeviceMatches(from: records) } }
       // Positions shift as the library syncs, so the selection follows its items.
-      .onChange(of: model.reloadToken) {
-        guard !selectedKeys.isEmpty else { return }
-        selection = Set(model.items.indices.filter { selectedKeys.contains(model.items[$0].mediaKey) })
+      .onChange(of: model.reloadToken) { select(model.positions(for: selectedKeys)) }
+      .task(id: SelectionRevision(keys: selectedKeys, rows: model.reloadToken, badges: model.badgeToken)) {
+        let keys = selectedKeys
+        picked = .init()
+        guard !keys.isEmpty else { return }
+        do { try await Task.sleep(for: .milliseconds(80)) } catch { return }
+        let indices = model.positions(for: keys)
+        let items = model.items
+        let resolved = await Task.detached(priority: .userInitiated) { CloudSelection(indices, in: items) }.value
+        if !Task.isCancelled, keys == selectedKeys { picked = resolved }
       }
-      .onChange(of: selection) { _, selection in selectedKeys = Set(model.items(at: selection).map(\.mediaKey)) }
-      .onChange(of: isSelecting) { _, selecting in if !selecting { selection = [] } }
-      .refreshable { library.refresh(force: true) }
+      .onChange(of: isSelecting) { _, selecting in if !selecting { select([]) } }
+      .refreshable {
+        library.refresh(force: true)
+        await model.reloadIfNeeded()
+      }
       .sheet(item: $albumTargets) { targets in
-        CloudAlbumPickerSheet(library: library, items: targets.items) {
+        CloudAlbumPickerSheet(
+          library: library, items: resolve(targets.keys),
+          resolve: {
+            await model.reloadIfNeeded()
+            return resolve(targets.keys)
+          }
+        ) {
           albumTargets = nil
           isSelecting = false
         }
@@ -110,7 +150,14 @@ public struct CloudLibraryView: View {
         Button("Move to Trash", role: .destructive) {
           let items = pendingTrash
           run(String(localized: "Moving to Trash…")) {
-            try await library.trash(items)
+            await model.reloadIfNeeded()
+            let fresh = resolve(Set(items.map(\.mediaKey)))
+            guard !fresh.isEmpty else { return }
+            guard matchesReview(items, fresh) else {
+              pendingTrash = fresh
+              return
+            }
+            try await library.trash(fresh)
             isSelecting = false
           }
         }
@@ -125,7 +172,14 @@ public struct CloudLibraryView: View {
         Button("Delete Forever", role: .destructive) {
           let items = pendingDelete
           run(String(localized: "Deleting…")) {
-            try await library.deleteForever(items)
+            await model.reloadIfNeeded()
+            let fresh = resolve(Set(items.map(\.mediaKey))).filter { $0.trashedAt != nil }
+            guard !fresh.isEmpty else { return }
+            guard matchesReview(items, fresh) else {
+              pendingDelete = fresh
+              return
+            }
+            try await library.deleteForever(fresh)
             isSelecting = false
           }
         }
@@ -161,6 +215,19 @@ public struct CloudLibraryView: View {
       #else
         .photoViewer(index: $opened, source: model, zoom: zoom)
       #endif
+      .safeAreaInset(edge: .bottom) {
+        // Earlier items stay on screen; what's new can be asked for again.
+        if model.loadFailed, model.itemCount > 0, !isSelecting {
+          HStack(spacing: 12) {
+            Text("Couldn't Load New Items")
+            Button("Try Again") { Task { await model.reloadIfNeeded() } }
+              .buttonStyle(.glass)
+          }
+          .padding(12)
+          .glassEffect()
+          .padding(.bottom, 8)
+        }
+      }
   }
 
   private var subtitle: String {
@@ -173,7 +240,7 @@ public struct CloudLibraryView: View {
         ? String(localized: "Updating…") : String(localized: "Syncing \(progress.updated.formatted()) items…")
     case .failed: return String(localized: "Couldn't sync")
     case .idle:
-      if let month = topMonth ?? model.monthTitle(at: 0) { return month }
+      if model.scope == .library, let month = topMonth ?? model.monthTitle(at: 0) { return month }
       return model.isLoaded ? ProductCopy.inflected("^[\(model.itemCount) Item](inflect: true)") : " "
     }
   }
@@ -181,19 +248,13 @@ public struct CloudLibraryView: View {
   @ViewBuilder private var content: some View {
     // The grid is there from the start (empty for the moment its items take to load): made
     // during the push, it would restart the bar's animation as it joins it.
-    if model.itemCount == 0, model.isLoaded || library.status != .idle {
+    if model.itemCount == 0, model.isLoaded || model.loadFailed || library.status != .idle {
       emptyState
     } else {
       PhotoGrid(
         dataSource: model, reloadToken: model.reloadToken, badgeToken: model.badgeToken, zoomStep: $zoomStep,
-        selection: $selection,
-        options: PhotoGridOptions(
-          isSelecting: isSelecting,
-          onTopIndexChange: { index in
-            let month = model.monthTitle(at: index)
-            if month != topMonth { topMonth = month }
-          }, menu: { menuItems(for: $0) },
-          dragItem: { model.viewerItem(at: $0)?.dragItem }, proxy: zoom.proxy)
+        selection: Binding(get: { selection }, set: select),
+        options: gridOptions
       ) { index in
         zoom.open(index, in: model) { opened = index }
       }
@@ -228,7 +289,13 @@ public struct CloudLibraryView: View {
         Button("Try Again") { library.refresh(force: true) }.buttonStyle(.glassProminent)
       }
     default:
-      if model.isLoaded {
+      if model.loadFailed {
+        ContentUnavailableView {
+          Label("Couldn't Load Library", systemImage: "photo.badge.exclamationmark")
+        } actions: {
+          Button("Try Again") { Task { await model.reloadIfNeeded() } }.buttonStyle(.glassProminent)
+        }
+      } else if model.isLoaded {
         ContentUnavailableView(emptyTitle, systemImage: model.scope.symbol, description: Text(emptyDescription))
       } else {
         ProgressView()
@@ -265,7 +332,7 @@ public struct CloudLibraryView: View {
       ToolbarItem(placement: .topBarTrailing) {
         if isSelecting {
           Button(selection.count == model.itemCount ? "Deselect All" : "Select All") {
-            selection = selection.count == model.itemCount ? [] : Set(0..<model.itemCount)
+            select(selection.count == model.itemCount ? [] : Set(0..<model.itemCount))
           }
         } else {
           syncButton
@@ -314,20 +381,62 @@ public struct CloudLibraryView: View {
     .keyboardShortcut("r", modifiers: [.command, .option])
   }
 
-  private var selected: [RemoteItemSummary] { model.items(at: selection) }
+  private var gridOptions: PhotoGridOptions {
+    var options = PhotoGridOptions(
+      isSelecting: isSelecting,
+      onTopIndexChange: { index in
+        let month = model.monthTitle(at: index)
+        if month != topMonth { topMonth = month }
+      }, menu: { menuItems(for: $0) },
+      dragItem: { index in
+        guard let item = model.item(at: index), let fresh = resolve([item.mediaKey]).first else { return nil }
+        let drag = ViewerItem.cloud(fresh, library: library, isOnDevice: false).dragItem
+        return PhotoGridDragItem(fileName: drag.fileName, isVideo: drag.isVideo) {
+          guard let current = await resolve([item.mediaKey]).first else { throw CocoaError(.fileNoSuchFile) }
+          return try await library.download(current)
+        }
+      }, proxy: zoom.proxy)
+    options.currentReloadToken = { model.reloadToken }
+    return options
+  }
+
+  private func select(_ indices: Set<Int>) {
+    selectedPositions = indices
+    selectionToken = model.reloadToken
+    selectedKeys = Set(indices.compactMap { model.item(at: $0)?.mediaKey })
+  }
+
+  private func resolve(_ keys: Set<String>) -> [RemoteItemSummary] {
+    guard model.library === library else { return [] }
+    return model.resolveSelection(keys)
+  }
+
+  private var selected: [RemoteItemSummary] { resolve(selectedKeys) }
+
+  private func matchesReview(_ reviewed: [RemoteItemSummary], _ fresh: [RemoteItemSummary]) -> Bool {
+    reviewed.count == fresh.count
+      && reviewed.map(\.dedupKey).sorted() == fresh.map(\.dedupKey).sorted()
+  }
+
+  private func share(_ keys: Set<String>) {
+    let items = resolve(keys)
+    SharePresenter.share(
+      items.map { RemoteSharedItem(library: library, item: $0) },
+      identities: items.map { library.localFirstThumbnails.thumbnailIdentity(for: $0.thumbnailID) },
+      videoCount: items.filter { $0.kind == .video }.count)
+  }
 
   @ViewBuilder private var selectionButtons: some View {
-    let items = selected
-    let allFavorites = !items.isEmpty && items.allSatisfy(\.isFavorite)
-    PhotoShareButton(
-      items: items.map { RemoteSharedItem(library: library, item: $0) }, ids: items.map(\.thumbnailID),
-      videoCount: items.filter { $0.kind == .video }.count
-    ) {
+    let empty = selection.isEmpty
+    Button {
+      share(selectedKeys)
+    } label: {
       Label("Share", systemImage: "square.and.arrow.up")
     }
-    .disabled(items.isEmpty)
+    .disabled(empty || picked.items.isEmpty)
     if model.scope == .trash {
       Button {
+        let items = selected
         run(String(localized: "Restoring…")) {
           try await library.restore(items)
           isSelecting = false
@@ -335,29 +444,31 @@ public struct CloudLibraryView: View {
       } label: {
         Label("Restore", systemImage: "arrow.uturn.backward")
       }
-      .disabled(items.isEmpty)
+      .disabled(empty)
       Button(role: .destructive) {
-        pendingDelete = items
+        pendingDelete = selected
       } label: {
         Label("Delete Forever", systemImage: "trash")
       }
       .keyboardShortcut(.delete, modifiers: .command)
-      .disabled(items.isEmpty)
+      .disabled(empty)
     } else {
       Button {
+        let items = selected
         run(nil) { try await library.toggleFavorite(items) }
       } label: {
-        Label(allFavorites ? "Unfavorite" : "Favorite", systemImage: allFavorites ? "heart.slash" : "heart")
+        Label(picked.allFavorites ? "Unfavorite" : "Favorite", systemImage: picked.allFavorites ? "heart.slash" : "heart")
       }
       .keyboardShortcut(".", modifiers: [])
-      .disabled(items.isEmpty)
+      .disabled(empty)
       Button {
-        save(items)
+        save(selected)
       } label: {
         Label("Save to Device", systemImage: "arrow.down.circle")
       }
-      .disabled(items.isEmpty)
+      .disabled(empty)
       Button {
+        let items = selected
         run(nil) {
           try await library.setArchived(items, archived: model.scope != .archive)
           isSelecting = false
@@ -365,14 +476,14 @@ public struct CloudLibraryView: View {
       } label: {
         Label(model.scope == .archive ? "Unarchive" : "Archive", systemImage: "archivebox")
       }
-      .disabled(items.isEmpty)
+      .disabled(empty)
       Button(role: .destructive) {
-        pendingTrash = items
+        pendingTrash = selected
       } label: {
         Label("Move to Trash", systemImage: "trash")
       }
       .keyboardShortcut(.delete, modifiers: .command)
-      .disabled(items.isEmpty)
+      .disabled(empty)
     }
   }
 
@@ -391,35 +502,34 @@ public struct CloudLibraryView: View {
 
   /// Laid out as in Photos; tapping the preview opens the item.
   private func menuItems(for indices: Set<Int>) -> [PhotoGridMenuItem] {
-    let items = model.items(at: indices)
+    let keys = Set(model.items(at: indices).map(\.mediaKey))
+    let items = resolve(keys)
     guard !items.isEmpty else { return [] }
     var menu: [PhotoGridMenuItem] = []
     if model.scope == .trash {
       menu.append(
         PhotoGridMenuItem(String(localized: "Restore"), systemImage: "arrow.uturn.backward") {
-          run(String(localized: "Restoring…")) { try await library.restore(items) }
+          run(String(localized: "Restoring…")) { try await library.restore(resolve(keys)) }
         })
       menu.append(
         PhotoGridMenuItem(String(localized: "Delete Forever"), systemImage: "trash", isDestructive: true) {
-          pendingDelete = items
+          pendingDelete = resolve(keys)
         })
       return menu
     }
     menu.append(
       PhotoGridMenuItem(String(localized: "Save to Device"), systemImage: "arrow.down.circle", group: .quick) {
-        save(items)
+        save(resolve(keys))
       })
     let archived = model.scope == .archive
     menu.append(
       PhotoGridMenuItem(
         archived ? String(localized: "Unarchive") : String(localized: "Archive"), systemImage: "archivebox", group: .quick
-      ) { run(nil) { try await library.setArchived(items, archived: !archived) } })
+      ) { run(nil) { try await library.setArchived(resolve(keys), archived: !archived) } })
     #if os(iOS)
       menu.append(
         PhotoGridMenuItem(String(localized: "Share"), systemImage: "square.and.arrow.up") {
-          SharePresenter.share(
-            items.map { RemoteSharedItem(library: library, item: $0) }, ids: items.map(\.thumbnailID),
-            videoCount: items.filter { $0.kind == .video }.count)
+          share(keys)
         })
     #endif
     let allFavorites = items.allSatisfy(\.isFavorite)
@@ -427,14 +537,14 @@ public struct CloudLibraryView: View {
       PhotoGridMenuItem(
         allFavorites ? String(localized: "Unfavorite") : String(localized: "Favorite"),
         systemImage: allFavorites ? "heart.slash" : "heart"
-      ) { run(nil) { try await library.toggleFavorite(items) } })
+      ) { run(nil) { try await library.toggleFavorite(resolve(keys)) } })
     menu.append(
       PhotoGridMenuItem(String(localized: "Add to Album"), systemImage: "rectangle.stack.badge.plus", group: .organize) {
-        albumTargets = CloudAlbumTargets(items: items)
+        albumTargets = CloudAlbumTargets(keys: keys)
       })
     menu.append(
       PhotoGridMenuItem(String(localized: "Move to Trash"), systemImage: "trash", isDestructive: true) {
-        pendingTrash = items
+        pendingTrash = resolve(keys)
       })
     return menu
   }
@@ -481,10 +591,16 @@ struct CloudCollectionsSection: View {
           }
         }
       }
+      if library.isStateLoaded, library.hasLockedItems {
+        NavigationLink(value: CollectionRoute.cloudLocked) {
+          Label("Locked Folder", systemImage: LockedFolderView.symbol)
+        }
+      }
     } header: {
       Text("Google Photos")
     } footer: {
-      Text(library.collectionsFooter)
+      // Read with the library's saved state, so it never shows a guess first.
+      Text(library.isStateLoaded ? library.collectionsFooter : " ")
     }
   }
 }
@@ -493,7 +609,7 @@ struct CloudCollectionsSection: View {
   /// Google Photos on the Mac's Collections page: its albums' covers, then its scopes.
   struct CloudCollectionsGallery: View {
     let library: CloudLibrary
-    @State private var albums: [RemoteAlbum] = []
+    private var albums: [RemoteAlbum] { library.albumList }
 
     var body: some View {
       GallerySection("Google Photos") {
@@ -502,7 +618,11 @@ struct CloudCollectionsSection: View {
         }
       } content: {
         VStack(alignment: .leading, spacing: 18) {
-          if !albums.isEmpty {
+          if !library.isStateLoaded {
+            LazyVGrid(columns: galleryCoverColumns) {
+              GalleryCover(title: "", count: 0, thumbnailID: nil).hidden()
+            }
+          } else if !albums.isEmpty {
             LazyVGrid(columns: galleryCoverColumns, spacing: 20) {
               ForEach(albums.prefix(Self.albumPreviewCount)) { album in
                 NavigationLink(value: CollectionRoute.cloud(.album(key: album.mediaKey, title: album.title))) {
@@ -531,14 +651,19 @@ struct CloudCollectionsSection: View {
                   count: library.collectionCount(for: scope))
               }
             }
+            if library.isStateLoaded, library.hasLockedItems {
+              NavigationLink(value: CollectionRoute.cloudLocked) {
+                GalleryRow(title: String(localized: "Locked Folder"), symbol: LockedFolderView.symbol, tint: .secondary)
+              }
+            }
           }
           .buttonStyle(.plain)
-          Text(library.collectionsFooter)
+          // Read with the library's saved state, so it never shows a guess first.
+          Text(library.isStateLoaded ? library.collectionsFooter : " ")
             .font(.callout)
             .foregroundStyle(.secondary)
         }
       }
-      .task(id: library.revision) { albums = await library.albums() }
     }
 
     private static let albumPreviewCount = 6
@@ -553,7 +678,8 @@ extension RemoteScope {
 extension CloudLibrary {
   /// The count shown beside a scope, where the mirror keeps one.
   func collectionCount(for scope: RemoteScope) -> Int? {
-    switch scope {
+    guard isStateLoaded else { return nil }
+    return switch scope {
     case .archive: stats.archived
     case .trash: stats.trashed
     case .usesStorage: stats.chargedItems
@@ -582,14 +708,13 @@ extension CloudLibrary {
 
 struct CloudAlbumTargets: Identifiable {
   let id = UUID()
-  let items: [RemoteItemSummary]
+  let keys: Set<String>
 }
 
 /// Every Google Photos album, newest activity first.
 struct GoogleAlbumsView: View {
   let library: CloudLibrary
-  @State private var albums: [RemoteAlbum] = []
-  @State private var isLoaded = false
+  private var albums: [RemoteAlbum] { library.albumList }
 
   var body: some View {
     ScrollView {
@@ -619,17 +744,13 @@ struct GoogleAlbumsView: View {
       #endif
     }
     .overlay {
-      if isLoaded, albums.isEmpty {
+      if library.isStateLoaded, albums.isEmpty {
         ContentUnavailableView(
           "No Albums", systemImage: "rectangle.stack",
           description: Text("Albums in Google Photos appear here after a sync."))
       }
     }
     .navigationTitle("Google Photos Albums")
-    .task(id: library.revision) {
-      albums = await library.albums()
-      isLoaded = true
-    }
   }
 }
 
@@ -658,8 +779,9 @@ struct GoogleAlbumCard: View {
 struct CloudAlbumPickerSheet: View {
   let library: CloudLibrary
   let items: [RemoteItemSummary]
+  var resolve: (() async -> [RemoteItemSummary])? = nil
   let onDone: () -> Void
-  @State private var albums: [RemoteAlbum] = []
+  private var albums: [RemoteAlbum] { library.albumList }
   @State private var isNaming = false
   @State private var newTitle = ""
   @State private var isWorking = false
@@ -676,7 +798,7 @@ struct CloudAlbumPickerSheet: View {
         Section("Google Photos Albums") {
           ForEach(albums) { album in
             Button {
-              finish { try await library.add(items, toAlbum: album) }
+              finish { try await library.add($0, toAlbum: album) }
             } label: {
               HStack(spacing: 12) {
                 LibraryThumbnail(
@@ -709,7 +831,7 @@ struct CloudAlbumPickerSheet: View {
         Button("Save") {
           let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
           guard !title.isEmpty else { return }
-          finish { try await library.createAlbum(titled: title, with: items) }
+          finish { try await library.createAlbum(titled: title, with: $0) }
         }
       } message: {
         Text("Enter a name for this album in Google Photos.")
@@ -721,19 +843,19 @@ struct CloudAlbumPickerSheet: View {
       } message: {
         Text(errorMessage ?? "")
       }
-      .task { albums = await library.albums() }
     }
     #if os(macOS)
       .frame(minWidth: 360, minHeight: 420)
     #endif
   }
 
-  private func finish(_ action: @escaping @MainActor () async throws -> Void) {
+  private func finish(_ action: @escaping @MainActor ([RemoteItemSummary]) async throws -> Void) {
     Task {
       isWorking = true
       defer { isWorking = false }
       do {
-        try await action()
+        let current = await resolve?() ?? items
+        if !current.isEmpty { try await action(current) }
         onDone()
       } catch {
         errorMessage = error.localizedDescription

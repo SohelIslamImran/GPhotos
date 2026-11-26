@@ -8,15 +8,15 @@ import Testing
 struct CloudLibraryRequestTests {
   @Test("The viewer only uses uncropped disk previews")
   func uncroppedDiskPreview() throws {
-    let directory = TestTemporaryDirectory.root.appendingPathComponent(UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let cache = ThumbnailDiskCache(directory: directory, byteLimit: 1 << 20)
+    let cache = ThumbnailDiskCache(accountEmail: "preview-\(UUID().uuidString)@example.com", byteLimit: 1 << 20)
+    defer { cache.removeAll() }
     let preview = Data([1, 2, 3])
-    cache.store(Data([4, 5, 6]), for: "media-0-320c")
-    #expect(cache.largestSmaller(than: 2048, prefix: "media-0-") == nil)
-    cache.store(preview, for: "media-0-2048")
-    #expect(cache.largestSmaller(than: 3072, prefix: "media-0-") == preview)
-    #expect(cache.largestSmaller(than: 2048, prefix: "media-1-") == nil)
+    let id = RemoteThumbnailID(mediaKey: "media", contentVersion: 0)
+    cache.store(Data([4, 5, 6]), for: .init(id, side: 320, crop: true))
+    #expect(cache.largestSmaller(than: 2048, of: id) == nil)
+    cache.store(preview, for: .init(id, side: 2048, crop: false))
+    #expect(cache.largestSmaller(than: 3072, of: id) == preview)
+    #expect(cache.largestSmaller(than: 2048, of: RemoteThumbnailID(mediaKey: "media", contentVersion: 1)) == nil)
   }
 
   private func fixture(_ base64: String) -> Data { Data(base64Encoded: base64.filter { !$0.isWhitespace })! }
@@ -119,6 +119,7 @@ enum SyncResponseBuilder {
     var collection: String?
     /// A shared album's own copy of a library photo.
     var sharedAlbumCopy = false
+    var locked = false
   }
 
   struct Album {
@@ -187,6 +188,7 @@ enum SyncResponseBuilder {
       info.writeInt64(fieldNumber: 26, 2)
       if item.archived { info.writeMessage(fieldNumber: 29) { $0.writeInt64(fieldNumber: 1, 1) } }
       info.writeMessage(fieldNumber: 31) { $0.writeInt64(fieldNumber: 1, item.favorite ? 1 : 2) }
+      if item.locked { info.writeMessage(fieldNumber: 39) { $0.writeInt64(fieldNumber: 1, 1) } }
       info.writeMessage(fieldNumber: 35) { quota in
         quota.writeInt64(fieldNumber: 2, item.charged)
         quota.writeInt64(fieldNumber: 3, item.charged == 0 ? 2 : 1)
@@ -345,11 +347,18 @@ struct CloudLibrarySyncTests {
     var deltaPages: [String: Data] = [:]
     var calls: [String] = []
     var failOnInitialPage: String?
+    var failOnDeltaPage: String?
+    var deltaError: any Error = URLError(.networkConnectionLost)
 
     func set(states: [String: Data] = [:], initialPages: [String: Data] = [:], deltaPages: [String: Data] = [:]) {
       self.states.merge(states) { $1 }
       self.initialPages.merge(initialPages) { $1 }
       self.deltaPages.merge(deltaPages) { $1 }
+    }
+
+    func setDeltaFailure(_ token: String?, error: any Error = URLError(.networkConnectionLost)) {
+      failOnDeltaPage = token
+      deltaError = error
     }
 
     func setFailure(_ token: String?) { failOnInitialPage = token }
@@ -367,6 +376,7 @@ struct CloudLibrarySyncTests {
 
     func libraryDeltaPage(resumeToken: String, syncToken: String) async throws -> RemoteLibraryUpdate {
       calls.append("delta:\(resumeToken):\(syncToken)")
+      if resumeToken == failOnDeltaPage { throw deltaError }
       return try LibraryMessages.decodeLibraryUpdate(deltaPages[resumeToken]!)
     }
   }
@@ -399,6 +409,106 @@ struct CloudLibrarySyncTests {
     #expect(progress.updated == 2)
     // Finish paging, ask for the state with the stored token, then request a delta.
     #expect(await fetcher.calls == ["state:", "init:R1", "init:R2", "init:R2", "state:S1", "state:S2"])
+  }
+
+  @Test("An interrupted delta resumes its failed page with the original cycle token")
+  func interruptedDeltaResumesWithLockChange() async throws {
+    let store = RemoteLibraryStore(
+      accountEmail: "delta@example.com", directory: TestTemporaryDirectory.root.appending(path: UUID().uuidString))
+    typealias Page = SyncResponseBuilder
+    try await store.apply(
+      LibraryMessages.decodeLibraryUpdate(Page.page(sync: "S1", items: [.init(key: "secret")])), syncToken: "S1")
+    try await store.markInitialSyncDone()
+    let fetcher = FakeFetcher()
+    await fetcher.set(
+      states: ["S1": Page.page(sync: "S2", resume: "D1", next: true)],
+      deltaPages: [
+        "D1": Page.page(resume: "D2", items: [.init(key: "new")]),
+        "D2": Page.page(items: [.init(key: "secret", locked: true)]),
+      ])
+    await fetcher.setDeltaFailure("D2")
+    let first = RemoteLibrarySync(store: store, fetcher: fetcher)
+    await #expect(throws: URLError.self) { _ = try await first.sync() }
+    #expect(try await store.syncState().resumeToken == "D2")
+    #expect(try await store.lockedKeys().isEmpty)
+
+    await fetcher.setDeltaFailure(nil)
+    let resumed = RemoteLibrarySync(store: store, fetcher: fetcher)
+    let progress = try await resumed.sync()
+    #expect(progress.changes.hidden == 1)
+    #expect(await fetcher.calls == ["state:S1", "delta:D1:S1", "delta:D2:S1", "delta:D2:S1", "state:S2"])
+    #expect(try await store.lockedKeys() == ["secret"])
+    #expect(try await store.summaries(.library).map(\.mediaKey) == ["new"])
+    #expect(try await store.syncState().deltaToken == nil)
+  }
+
+  @Test("A repeated media key keeps the final lock state when a delta page commits")
+  func duplicatePageItemsKeepFinalLockState() async throws {
+    let email = "duplicate-\(UUID().uuidString)@example.com"
+    defer { LockedItems.forget(accountEmail: email) }
+    let store = makeStore()
+    typealias Page = SyncResponseBuilder
+    try await store.markInitialSyncDone()
+    let fetcher = FakeFetcher()
+    await fetcher.set(states: [
+      "": Page.page(
+        sync: "S2",
+        items: [
+          .init(key: "ends-locked"), .init(key: "ends-locked", locked: true),
+          .init(key: "ends-unlocked", locked: true), .init(key: "ends-unlocked"),
+        ])
+    ])
+    let sync = RemoteLibrarySync(
+      store: store, fetcher: fetcher, willLock: { LockedItems.insert($0, accountEmail: email) },
+      didRelease: { LockedItems.release($0, accountEmail: email) })
+    _ = try await sync.sync()
+    #expect(try await store.lockedKeys() == ["ends-locked"])
+    #expect(LockedItems.keys(accountEmail: email) == ["ends-locked"])
+  }
+
+  @Test("Only a definite refusal rewinds a resumed delta and replays its lock changes")
+  func refusesExpiredResume() async throws {
+    let store = makeStore()
+    typealias Page = SyncResponseBuilder
+    try await store.apply(
+      LibraryMessages.decodeLibraryUpdate(Page.page(items: [.init(key: "secret"), .init(key: "deleted")])),
+      syncToken: "S1")
+    try await store.markInitialSyncDone()
+    try await store.apply(LibraryMessages.decodeLibraryUpdate(Page.page(resume: "expired")), syncToken: "S2", deltaToken: "S1")
+    let fetcher = FakeFetcher()
+    await fetcher.set(
+      states: ["S1": Page.page(sync: "S2", resume: "new-page")],
+      deltaPages: ["new-page": Page.page(items: [.init(key: "secret", locked: true)], deleted: ["deleted"])])
+    let sync = RemoteLibrarySync(store: store, fetcher: fetcher)
+
+    for status in [401, 403, 408, 429, 503] {
+      let error = GPhotosError.httpError(status: status, body: "")
+      await fetcher.setDeltaFailure("expired", error: error)
+      await #expect(throws: error) { _ = try await sync.sync() }
+      #expect(try await store.syncState().resumeToken == "expired")
+    }
+    await fetcher.setDeltaFailure("expired", error: GPhotosError.httpError(status: 410, body: ""))
+    _ = try await sync.sync()
+    #expect(await fetcher.calls == Array(repeating: "delta:expired:S1", count: 6) + ["state:S1", "delta:new-page:S1"])
+    #expect(try await store.syncState().syncToken == "S2")
+    #expect(try await store.syncState().deltaToken == nil)
+    #expect(try await store.lockedKeys() == ["secret"])
+    #expect(try await store.summaries(.library).isEmpty)
+  }
+
+  @Test("A refused resumed delta makes at most one replay per sync")
+  func refusesReplayOnce() async throws {
+    let store = makeStore()
+    typealias Page = SyncResponseBuilder
+    try await store.markInitialSyncDone()
+    try await store.apply(LibraryMessages.decodeLibraryUpdate(Page.page(resume: "expired")), syncToken: "S2", deltaToken: "S1")
+    let fetcher = FakeFetcher()
+    await fetcher.set(states: ["S1": Page.page(sync: "S2", resume: "expired")])
+    let error = GPhotosError.httpError(status: 400, body: "")
+    await fetcher.setDeltaFailure("expired", error: error)
+    await #expect(throws: error) { _ = try await RemoteLibrarySync(store: store, fetcher: fetcher).sync() }
+    #expect(await fetcher.calls == ["delta:expired:S1", "state:S1", "delta:expired:S1"])
+    #expect(try await store.syncState().deltaToken == "S1")
   }
 
   @Test("Delta syncs page with both tokens and stop when the token stops moving")
@@ -478,9 +588,20 @@ struct OptimizedStorageTests {
   @Test("A removed file leaves a small thumbnail under its media key, pruned with the item")
   func keepsAndPrunes() async throws {
     let email = "kept-\(UUID().uuidString)@example.com"
-    defer { KeptThumbnails.removeAll(accountEmail: email) }
+    defer {
+      KeptThumbnails.removeAll(accountEmail: email)
+      LockedItems.forget(accountEmail: email)
+    }
     var record = TransferRecord(id: "\(email)|1", filename: "a.jpg", mediaType: "Photo", status: .sent)
     record.mediaKeysByAccount = [email: "KEY"]
+    // Until the mirror says what's in the Locked Folder, nothing is kept.
+    await KeptThumbnails.keep(record, fileURL: try jpeg(width: 20, height: 10))
+    #expect(KeptThumbnails.data(mediaKey: "KEY", accountEmail: email) == nil)
+    LockedItems.load(["LOCKED"], accountEmail: email)
+    var locked = record
+    locked.mediaKeysByAccount = [email: "LOCKED"]
+    await KeptThumbnails.keep(locked, fileURL: try jpeg(width: 20, height: 10))
+    #expect(!FileManager.default.fileExists(atPath: KeptThumbnails.url(mediaKey: "LOCKED", accountEmail: email).path))
     await KeptThumbnails.keep(record, fileURL: try jpeg(width: 2000, height: 1000))
     let data = try #require(KeptThumbnails.data(mediaKey: "KEY", accountEmail: email))
     let image = try #require(GoogleThumbnailSource.decode(data, maxPixel: 1000))

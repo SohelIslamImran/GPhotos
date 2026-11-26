@@ -11,6 +11,7 @@ struct GPhotosSyncMacApp: App {
   @State private var router = MacRouter()
 
   init() {
+    _ = realHomeDirectory
     LibrarySnapshot.prefetch()
     let store = MacSyncStore()
     AppDependencyManager.shared.add(dependency: store)
@@ -37,10 +38,15 @@ struct GPhotosSyncMacApp: App {
         switch screen {
         case "gallery": StateGallery()
         case "widgets": WidgetGallery().onAppear { MacWindowSnapshot.scheduleIfRequested() }
-        case "menubar": MacMenuBarView(store: store, router: router).fixedSize()
+        case "menubar":
+          MacMenuBarView(store: store, router: router).fixedSize()
+            .onAppear { MacWindowSnapshot.scheduleIfRequested() }
         case "menubarUploading":
           MacMenuBarView(store: store, router: router).fixedSize()
-            .onAppear { store.workerPool.startPreviewSimulation() }
+            .onAppear {
+              store.workerPool.startPreviewSimulation()
+              MacWindowSnapshot.scheduleIfRequested()
+            }
         default:
           MacContentView(store: store, router: router)
             .onAppear {
@@ -70,7 +76,7 @@ struct GPhotosSyncMacApp: App {
     }
 
     MenuBarExtra {
-      MacMenuBarView(store: store, router: router)
+      MacMenuBarView(store: store, router: router, tracksPopoverVisibility: true)
     } label: {
       MacMenuBarIcon(store: store)
     }
@@ -316,7 +322,7 @@ private struct MacCommands: Commands {
       Divider()
       Button("Retry Failed Uploads") { Task { await store.retryFailedForUser() } }
         .keyboardShortcut("r", modifiers: [.command, .shift])
-        .disabled(store.accountRecordCounts.failed == 0)
+        .disabled(!store.hasFailedRecords)
     }
   }
 

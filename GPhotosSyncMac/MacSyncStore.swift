@@ -15,7 +15,7 @@ public struct MacCleanupPlan: Sendable, Equatable {
   public var isEmpty: Bool { records.isEmpty }
 }
 
-public struct AccountRecordCounts: Equatable {
+public struct AccountRecordCounts: Equatable, Sendable {
   public var uploading = 0
   public var queued = 0
   public var sent = 0
@@ -27,7 +27,13 @@ public struct AccountRecordCounts: Equatable {
 @Observable
 public final class MacSyncStore: SyncEngine {
   @ObservationIgnored private var retriesFailedItemsNow = false
-  public private(set) var folders: [MacWatchedFolder] = []
+  public private(set) var folders: [MacWatchedFolder] = [] {
+    didSet {
+      if folders.map(\.id) != oldValue.map(\.id) || folders.map(\.isEnabled) != oldValue.map(\.isEnabled) {
+        cleanupPolicy.invalidate()
+      }
+    }
+  }
   public private(set) var launchAtLoginEnabled = false
   public private(set) var isScanning = false
   /// Sidebar section the menu bar or a menu command asked the window to show.
@@ -47,6 +53,8 @@ public final class MacSyncStore: SyncEngine {
   public private(set) var missingProtectedFolderIDs: Set<String> = []
   /// Recomputed in `refreshRecords` so body evaluations never re-filter the record list.
   public private(set) var accountRecordCounts = AccountRecordCounts()
+  public private(set) var failedRecordCount = 0
+  public private(set) var hasFailedRecords = false
 
   private var watchers: [String: MacFolderWatcher] = [:]
   private var needsRescan = false
@@ -99,21 +107,13 @@ public final class MacSyncStore: SyncEngine {
   private nonisolated static let maxDeferredRescanDelay: TimeInterval = 5 * 60
   private var deferredRescanDelay = FolderMediaScanner.writeSettleInterval
 
-  public override init() {
+  public init() {
     super.init()
     self.refreshLaunchAtLoginStatus()
     self.loadFolders()
     self.refreshFolderUsability()
     self.refreshProtectedFolderStatus()
-    MediaThumbnailLoader.shared.fileAccess = { [weak self] url in
-      guard let self else { return nil }
-      guard let folder = self.folders.first(where: { $0.contains(url) }) else { return nil }
-      return {
-        let access = folder.beginAccess()
-        guard access.started else { return nil }
-        return { folder.endAccess(access.url) }
-      }
-    }
+    MediaThumbnailLoader.shared.fileAccess = { [weak self] in self?.thumbnailAccess(for: $0) }
     workerPool.onBatchCompleted = { [weak self] in
       await self?.handleBatchCompleted()
       await self?.primaryBatchDidComplete()
@@ -152,9 +152,13 @@ public final class MacSyncStore: SyncEngine {
     Task { @MainActor [weak self] in
       guard let self else { return }
       await self.workerPool.waitForCurrentBatch()
-      await self.cleanupCompletedStagedDrops()
-      await self.ingestSharedQueueItems()
-      await self.resumeRequestedScan()
+      await self.backUpDuringStagedCleanup {
+        await self.ingestSharedQueueItems()
+        await self.resumeRequestedScan()
+      }
+      // One cleanup after the other: neither may take the other's tombstone for an
+      // interrupted deletion's.
+      await self.waitForStagedCleanup()
       await self.runCleanupMaintenance()
     }
   }
@@ -187,11 +191,13 @@ public final class MacSyncStore: SyncEngine {
     await loadAccounts()
     await refreshRecords()
     await ingestSharedQueueItems()
-    await cleanupCompletedStagedDrops()
-    rebuildWatchers()
-    await awaitFolderUsability()
-    // With Auto-Sync off, anything left pending (stopped, say) waits for the user to ask.
-    if settings.autoSyncEnabled, selectedAccount != nil { await resumePendingWork() }
+    await withAccountWork { await self.recoverTombstonesIfNeeded() }
+    await backUpDuringStagedCleanup {
+      rebuildWatchers()
+      await awaitFolderUsability()
+      // With Auto-Sync off, anything left pending (stopped, say) waits for the user to ask.
+      if settings.autoSyncEnabled, selectedAccount != nil { await resumePendingWork() }
+    }
   }
 
   /// A watched folder's scan re-queues its own files with the folder's scope held and
@@ -380,14 +386,20 @@ public final class MacSyncStore: SyncEngine {
     }
   }
 
-  private func cleanupCompletedStagedDrops() async {
-    // Watched-folder tombstones only come from a cleanup pass, which recovers them itself
-    // first, so every record's directory is listed only at launch or after a failed removal.
-    if needsTombstoneRecovery {
-      needsTombstoneRecovery = false
-      await recoverDeletionTombstones()
-    }
-    guard activeStagingOperations == 0 else { return }
+  /// Watched-folder tombstones only come from a cleanup pass, which recovers them itself
+  /// first, so every record's directory is listed only at launch or after a failed removal.
+  /// One a cleanup is just checking isn't left behind.
+  private func recoverTombstonesIfNeeded() async {
+    guard needsTombstoneRecovery, !isRunningCleanupMaintenance, !isCleaningUp else { return }
+    needsTombstoneRecovery = false
+    await recoverDeletionTombstones()
+  }
+
+  override public func removeCompletedStagedCopies() async {
+    await recoverTombstonesIfNeeded()
+    guard !Task.isCancelled, allowsAccountWork, let accountEmail = selectedAccount?.email,
+      activeStagingOperations == 0
+    else { return }
     let root = Self.dropRoot
     let rootPath = root.standardizedFileURL.path
     let terminalStatuses: [TransferStatus] = [.sent, .deleted]
@@ -432,10 +444,7 @@ public final class MacSyncStore: SyncEngine {
         return path == sourcePath || path.caseInsensitiveCompare(sourcePath) == .orderedSame
       }
       guard matching.allSatisfy({ terminalStatuses.contains($0.status) }) else { return false }
-      // Every staged drop belongs to one account (DroppedUploads/<hex(account)>/…), and
-      // another account that wants the same file stages its own copy. Only the owner's
-      // upload has to be confirmed, or one extra signed-in account would strand every
-      // drop forever.
+      // Every staged drop belongs to one account (DroppedUploads/<hex(account)>/…).
       guard
         let owner = Self.stagingAccountEmail(for: URL(fileURLWithPath: sourcePath), root: root)
           ?? TransferRecord.accountEmail(fromScopedID: record.id)
@@ -449,15 +458,31 @@ public final class MacSyncStore: SyncEngine {
     // Standardizing a path cannot move it under the drop root unless it already names
     // the drop root's folder, so this string test spares every other record the URL work.
     let dropFolderComponent = "/\(root.lastPathComponent)/"
-    for record in records
-    where terminalStatuses.contains(record.status) && record.sourcePath?.contains(dropFolderComponent) == true {
-      guard canCleanup(record, in: records),
-        let sourcePath = record.sourcePath,
+    let staged = records.filter {
+      terminalStatuses.contains($0.status) && $0.sourcePath?.contains(dropFolderComponent) == true
+        && TransferRecord.accountEmail(fromScopedID: $0.id) == accountEmail && canCleanup($0, in: records)
+    }
+    guard !Task.isCancelled, allowsAccountWork else { return }
+    func eligibleIDs(_ ids: Set<String>) async -> Set<String> {
+      await manifestStore.eligibleStagedCopies(
+        among: ids, accountEmail: accountEmail, accounts: accounts,
+        includesFoundItems: settings.removesItemsAlreadyInGooglePhotos)
+    }
+    let eligible = await eligibleIDs(Set(staged.map(\.id)))
+    guard !Task.isCancelled, allowsAccountWork else { return }
+    let confirmed = await remoteCopyVerifier.confirmed(staged.filter { eligible.contains($0.id) }, accountEmail: accountEmail)
+    var deletedRecords: [TransferRecord] = []
+    for record in confirmed {
+      // Drops can be staged while Google Photos is asked; they're looked at on a later pass.
+      guard !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail, activeStagingOperations == 0
+      else { break }
+      guard let sourcePath = record.sourcePath,
         let fileURL = Self.validatedSourceFileURL(atPath: sourcePath, roots: roots),
         await manifestStore.claimForDeletion(id: record.id)
       else { continue }
       let latest = await manifestStore.allRecords()
       guard canCleanup(record, in: latest),
+        await eligibleIDs([record.id]).contains(record.id),
         await manifestStore.deletionClaimIsValid(id: record.id)
       else {
         await manifestStore.releaseDeletionClaim(id: record.id)
@@ -474,12 +499,19 @@ public final class MacSyncStore: SyncEngine {
         pairedFileURL = nil
       }
       await KeptThumbnails.keep(record, fileURL: fileURL)
-      _ = await manifestStore.deleteSourceFiles(
+      guard !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail else {
+        await manifestStore.releaseDeletionClaim(id: record.id)
+        break
+      }
+      if await manifestStore.deleteSourceFiles(
         id: record.id,
         fileURL: fileURL,
         pairedFileURL: pairedFileURL
-      )
+      ) {
+        deletedRecords.append(record)
+      }
     }
+    scheduleCleanupRekey(deletedRecords, accountEmail: accountEmail)
   }
 
   public func discardPendingDropURLs() {
@@ -578,47 +610,95 @@ public final class MacSyncStore: SyncEngine {
 
   public var accountCompletedByteCount: Int64 { accountRecordCounts.completedBytes }
 
-  /// The account's records being sent, by ID. Upload rows redraw on every progress tick
-  /// and look their record up here instead of searching every record.
-  public private(set) var sendingAccountRecords: [String: TransferRecord] = [:]
+  public private(set) var accountActivityRevision = 0
 
-  /// What `accountRecords` was last filtered from, so an unchanged refresh skips the pass.
-  @ObservationIgnored private var accountRecordsSource: (revision: Int?, email: String?)?
+  private struct AccountRecordSource: Equatable {
+    let revision: Int?
+    let email: String?
+  }
+
+  private struct AccountRecordSnapshot: Sendable {
+    var records: [TransferRecord] = []
+    var indexByID: [String: Int] = [:]
+    var sendingByFilename: [String: Int] = [:]
+    var counts = AccountRecordCounts()
+
+    nonisolated init(records: [TransferRecord], email: String?) {
+      guard let email else { return }
+      let prefix = "\(email)|"
+      for record in records where record.id.hasPrefix(prefix) && !record.isSkipped {
+        let index = self.records.count
+        self.records.append(record)
+        indexByID[record.id] = index
+        switch record.status {
+        case .sending:
+          counts.uploading += 1
+          if sendingByFilename[record.filename] == nil { sendingByFilename[record.filename] = index }
+        case .pending:
+          counts.queued += 1
+        case .sent, .deleted:
+          counts.sent += 1
+          counts.completedBytes += record.byteCount ?? 0
+        case .failed:
+          counts.failed += 1
+        }
+      }
+    }
+  }
+
+  @ObservationIgnored private var accountRecordsSource: AccountRecordSource?
+  @ObservationIgnored private var accountProjectionSource: AccountRecordSource?
+  @ObservationIgnored private var accountProjectionTask: Task<AccountRecordSnapshot?, Never>?
+  private var accountIndexByID: [String: Int] = [:]
+  private var sendingByFilename: [String: Int] = [:]
+
+  private var currentAccountRecordSource: AccountRecordSource {
+    AccountRecordSource(revision: recordsRevision, email: selectedAccount?.email)
+  }
 
   public override func refreshRecords() async {
     await super.refreshRecords()
-    let source = (revision: recordsRevision, email: selectedAccount?.email)
-    if let accountRecordsSource, accountRecordsSource == source { return }
-    accountRecordsSource = source
-    let filtered: [TransferRecord]
-    if let email = selectedAccount?.email {
-      let prefix = "\(email)|"
-      filtered = records.filter { $0.id.hasPrefix(prefix) && !$0.isSkipped }
-    } else {
-      filtered = []
-    }
-    // Every assignment invalidates all activity rows, even when nothing changed.
-    if filtered != accountRecords { accountRecords = filtered }
-    let counts = Self.counts(for: filtered)
-    if counts != accountRecordCounts { accountRecordCounts = counts }
-    var sending: [String: TransferRecord] = [:]
-    for record in filtered where record.status == .sending { sending[record.id] = record }
-    if sending != sendingAccountRecords { sendingAccountRecords = sending }
-  }
-
-  private static func counts(for records: [TransferRecord]) -> AccountRecordCounts {
-    var counts = AccountRecordCounts()
-    for record in records {
-      switch record.status {
-      case .sending: counts.uploading += 1
-      case .pending: counts.queued += 1
-      case .sent, .deleted:
-        counts.sent += 1
-        counts.completedBytes += record.byteCount ?? 0
-      case .failed: counts.failed += 1
+    let source = currentAccountRecordSource
+    if source == accountRecordsSource { return }
+    if source != accountProjectionSource {
+      accountProjectionTask?.cancel()
+      accountProjectionSource = source
+      let records = self.records
+      let previous = accountRecords
+      accountProjectionTask = Task.detached(priority: .utility) {
+        guard !Task.isCancelled else { return nil }
+        let snapshot = AccountRecordSnapshot(records: records, email: source.email)
+        return snapshot.records == previous ? nil : snapshot
       }
     }
-    return counts
+    guard let task = accountProjectionTask else { return }
+    let snapshot = await task.value
+    guard source == currentAccountRecordSource, task == accountProjectionTask, source != accountRecordsSource else {
+      return
+    }
+    accountProjectionSource = nil
+    accountProjectionTask = nil
+    accountRecordsSource = source
+    guard let snapshot else { return }
+    accountIndexByID = snapshot.indexByID
+    sendingByFilename = snapshot.sendingByFilename
+    accountRecords = snapshot.records
+    accountActivityRevision &+= 1
+    if snapshot.counts != accountRecordCounts { accountRecordCounts = snapshot.counts }
+    if snapshot.counts.failed != failedRecordCount { failedRecordCount = snapshot.counts.failed }
+    let hasFailed = snapshot.counts.failed > 0
+    if hasFailed != hasFailedRecords { hasFailedRecords = hasFailed }
+  }
+
+  func activityRecords(for email: String?) -> [TransferRecord] {
+    accountRecordsSource?.email == email ? accountRecords : []
+  }
+
+  func uploadingRecord(for worker: WorkerState) -> TransferRecord? {
+    guard !worker.itemID.isEmpty else { return nil }
+    let exact = accountIndexByID[worker.itemID].map { accountRecords[$0] }
+    if exact?.status == .sending { return exact }
+    return sendingByFilename[worker.filename].map { accountRecords[$0] } ?? exact
   }
 
   /// Resolving a security-scoped bookmark is an XPC round trip and probing readability
@@ -678,6 +758,21 @@ public final class MacSyncStore: SyncEngine {
     if changed { persistFolders() }
   }
 
+  private let thumbnailFolders = ThumbnailFolderScopes()
+
+  private func thumbnailAccess(for fileURL: URL) -> MediaThumbnailLoader.FileAccessOpener? {
+    let folders = self.folders
+    guard !folders.isEmpty else { return nil }
+    let scopes = thumbnailFolders
+    let generation = usabilityGeneration
+    return {
+      guard let url = await scopes.root(for: fileURL, folders: folders, generation: generation),
+        !Task.isCancelled, url.startAccessingSecurityScopedResource()
+      else { return nil }
+      return { url.stopAccessingSecurityScopedResource() }
+    }
+  }
+
   /// Bookmark resolution and the `opendir` probes run off the main actor; the newest
   /// request's answers are applied when they arrive. `awaitFolderUsability()` waits
   /// for them.
@@ -685,11 +780,15 @@ public final class MacSyncStore: SyncEngine {
     usabilityGeneration &+= 1
     let generation = usabilityGeneration
     let snapshot = folders.filter(\.isEnabled)
+    usabilityTask?.cancel()
     usabilityTask = Task { @MainActor [weak self] in
-      let usability = await Task.detached(priority: .userInitiated) {
-        Self.probeUsability(of: snapshot)
-      }.value
-      guard let self, generation == self.usabilityGeneration else { return }
+      let work = Task.detached(priority: .userInitiated) { Self.probeUsability(of: snapshot) }
+      let usability = await withTaskCancellationHandler {
+        await work.value
+      } onCancel: {
+        work.cancel()
+      }
+      guard !Task.isCancelled, let self, generation == self.usabilityGeneration else { return }
       self.storeRefreshedBookmarks(usability.refreshedBookmarks)
       self.folderReadability = usability.readability
       self.watchedRootPaths = usability.rootPaths
@@ -710,6 +809,7 @@ public final class MacSyncStore: SyncEngine {
   private nonisolated static func probeUsability(of folders: [MacWatchedFolder]) -> FolderUsability {
     var usability = FolderUsability()
     for folder in folders {
+      guard !Task.isCancelled else { break }
       let access = folder.beginAccess()
       defer {
         if access.started { folder.endAccess(access.url) }
@@ -732,17 +832,9 @@ public final class MacSyncStore: SyncEngine {
     return usability
   }
 
-  /// Read from SwiftUI `body`, so it must not resolve a bookmark on each read.
+  /// The real usability gate still waits for the background probe.
   public func isFolderReadable(_ folder: MacWatchedFolder) -> Bool {
-    folderReadability[folder.id] ?? Self.checkFolderReadability(folder)
-  }
-
-  private nonisolated static func checkFolderReadability(_ folder: MacWatchedFolder) -> Bool {
-    let access = folder.beginAccess()
-    defer {
-      if access.started { folder.endAccess(access.url) }
-    }
-    return isReadableDirectory(access.url)
+    folderReadability[folder.id] ?? true
   }
 
   /// A sandboxed process can stat a folder it was never granted and still be unable to
@@ -811,7 +903,7 @@ public final class MacSyncStore: SyncEngine {
       // Default: ~/Pictures
       let picturesURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures", isDirectory: true)
       self.folders = [MacWatchedFolder(url: picturesURL, title: "Pictures", isEnabled: false)]
-      saveFolders()
+      persistFolders()
     }
   }
 
@@ -992,7 +1084,8 @@ public final class MacSyncStore: SyncEngine {
   private func scanChanges() async {
     // A folder just added, enabled or remounted is only usable once its probe lands.
     await awaitFolderUsability()
-    guard !stopRequested, let account = selectedAccount else { return }
+    guard !replaysAfterAccountChange(("folderScan", { [weak self] in await self?.scanChanges() })) else { return }
+    guard canUseSelectedAccount, !stopRequested, let account = selectedAccount else { return }
     guard !isRunning, !isScanning else {
       needsRescan = true
       return
@@ -1457,6 +1550,20 @@ public final class MacSyncStore: SyncEngine {
       return true
     }
     if workerPool.start(items: claimedItems, quality: 3, accountEmail: accountEmail) == .rejected {
+      if scanGeneration != nil {
+        _ = replaysAfterAccountChange(("folderScan", { [weak self] in await self?.scanChanges() }))
+      } else {
+        let dropRoot = Self.dropRoot.standardizedFileURL.path
+        _ = replaysAfterAccountChange(
+          (
+            "drops",
+            { [weak self] in
+              await self?.requeuePendingRecords(named: "drops") { record in
+                record.sourcePath.map { WatchedFolderPaths.isPath($0, inside: dropRoot) } ?? false
+              }
+            }
+          ))
+      }
       for item in claimedItems { await manifestStore.releaseUploadClaim(id: item.id) }
     }
     return true
@@ -1648,7 +1755,7 @@ public final class MacSyncStore: SyncEngine {
   }
 
   override public func retryFailed() async {
-    guard !stopRequested, !isRunning, let account = selectedAccount else { return }
+    guard canUseSelectedAccount, !stopRequested, !isRunning, let account = selectedAccount else { return }
     let retriesNow = retriesFailedItemsNow
     retriesFailedItemsNow = false
     let generation = accountGeneration
@@ -1686,7 +1793,7 @@ public final class MacSyncStore: SyncEngine {
   }
 
   public override func requeueRecord(_ record: TransferRecord) async {
-    guard let account = selectedAccount else { return }
+    guard canUseSelectedAccount, let account = selectedAccount else { return }
     stopRequested = false
     let generation = accountGeneration
     guard record.id.hasPrefix("\(account.email)|") else { return }
@@ -1798,14 +1905,18 @@ public final class MacSyncStore: SyncEngine {
 
   /// Whether a manual Clean Up can start now.
   public var canCleanUp: Bool {
-    selectedAccount != nil && settings.autoDeleteDelay != .never && !isRunning && !isCleaningUp && !isPreparingCleanup
+    canUseSelectedAccount && settings.autoDeleteDelay != .never && !isRunning && !isCleaningUp && !isPreparingCleanup
   }
 
   /// Lists what Clean Up would remove, through every check the removal itself makes.
   /// Nil while a cleanup is already being prepared or run. An empty plan has already
   /// said why in `cleanupNotice`.
   public func prepareCleanup() async -> MacCleanupPlan? {
-    guard !isPreparingCleanup, !isCleaningUp else { return nil }
+    await withAccountWork { await self.planCleanup() } ?? nil
+  }
+
+  private func planCleanup() async -> MacCleanupPlan? {
+    guard !Task.isCancelled, !isPreparingCleanup, !isCleaningUp else { return nil }
     isPreparingCleanup = true
     defer { isPreparingCleanup = false }
     cleanupMessage = nil
@@ -1813,7 +1924,7 @@ public final class MacSyncStore: SyncEngine {
     await recoverDeletionTombstones()
     guard settings.autoDeleteDelay != .never, let accountEmail = selectedAccount?.email else { return nil }
     let eligible = await eligibleCleanupRecords(accountEmail: accountEmail)
-    let pass = await cleanupPass(.plan, eligible: eligible)
+    let pass = await cleanupPass(.plan, eligible: eligible, accountEmail: accountEmail)
     let plan = MacCleanupPlan(records: pass.planned)
     if plan.isEmpty { reportNothingRemoved(pass) }
     return plan
@@ -1822,7 +1933,11 @@ public final class MacSyncStore: SyncEngine {
   /// Removes what `plan` lists that is still due now. The plan may be minutes old, so
   /// every file goes through the full check, claim and verification again.
   public func performCleanup(plan: MacCleanupPlan) async {
-    guard !isCleaningUp, !isPreparingCleanup, !plan.isEmpty else { return }
+    await withAccountWork { await self.applyCleanup(plan: plan) }
+  }
+
+  private func applyCleanup(plan: MacCleanupPlan) async {
+    guard !Task.isCancelled, !isCleaningUp, !isPreparingCleanup, !plan.isEmpty else { return }
     isCleaningUp = true
     defer { isCleaningUp = false }
     cleanupMessage = nil
@@ -1830,7 +1945,7 @@ public final class MacSyncStore: SyncEngine {
     await recoverDeletionTombstones()
     guard settings.autoDeleteDelay != .never, let accountEmail = selectedAccount?.email else { return }
     let eligible = await eligibleCleanupRecords(accountEmail: accountEmail)
-    let pass = await cleanupPass(.remove(limitedTo: Set(plan.records.map(\.id))), eligible: eligible)
+    let pass = await cleanupPass(.remove(limitedTo: Set(plan.records.map(\.id))), eligible: eligible, accountEmail: accountEmail)
     await refreshRecords()
     if pass.removed > 0 {
       cleanupMessage =
@@ -1841,12 +1956,19 @@ public final class MacSyncStore: SyncEngine {
     } else {
       reportNothingRemoved(pass)
     }
+    scheduleCleanupRekey(pass.deletedRecords, accountEmail: accountEmail)
   }
 
   /// After a batch or a watched-folder scan, Delete After Backup removes what is due
   /// without asking, through the same pass as Clean Up. That pass re-reads and hashes
   /// files, so an unchanged due set is looked at again at most hourly.
   public func runCleanupMaintenance() async {
+    await withAccountWork(wake: ("cleanup", { [weak self] in await self?.runCleanupMaintenance() })) {
+      await self.applyCleanupMaintenance()
+    }
+  }
+
+  private func applyCleanupMaintenance() async {
     guard !isRunningCleanupMaintenance, !isCleaningUp, !isPreparingCleanup, !isRunning, !isScanning,
       !Task.isCancelled, settings.autoDeleteDelay != .never, let accountEmail = selectedAccount?.email
     else { return }
@@ -1871,13 +1993,22 @@ public final class MacSyncStore: SyncEngine {
     guard !isRunning, !isScanning, !isCleaningUp, !Task.isCancelled, settings.autoDeleteDelay != .never,
       selectedAccount?.email == accountEmail
     else { return }
-    let pass = await cleanupPass(.remove(limitedTo: nil), eligible: eligible)
+    let pass = await cleanupPass(.remove(limitedTo: nil), eligible: eligible, accountEmail: accountEmail)
     if pass.removed > 0 || pass.failed > 0 { await refreshRecords() }
+    scheduleCleanupRekey(pass.deletedRecords, accountEmail: accountEmail)
+  }
+
+  private func scheduleCleanupRekey(_ records: [TransferRecord], accountEmail: String) {
+    guard !records.isEmpty, canUseSelectedAccount,
+      let cloudLibrary, cloudLibrary.accountEmail == accountEmail
+    else { return }
+    LibraryIndexer.scheduleRekeyDeleted(records, cloud: cloudLibrary)
   }
 
   private static let cleanupMaintenanceInterval: TimeInterval = 60 * 60
 
   private func eligibleCleanupRecords(accountEmail: String) async -> [TransferRecord] {
+    guard !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail else { return [] }
     await manifestStore.setRetention(settings.autoDeleteDelay)
     // Free space is judged per volume in the pass, not on the home volume the store measures.
     let candidates = await manifestStore.eligibleForDeletion(
@@ -1888,6 +2019,7 @@ public final class MacSyncStore: SyncEngine {
       excludingAccounts: Set(accounts.filter { !$0.mirrorEnabled && $0.email != accountEmail }.map(\.email)),
       includesFoundItems: settings.removesItemsAlreadyInGooglePhotos
     )
+    guard !Task.isCancelled, allowsAccountWork else { return [] }
     return await remoteCopyVerifier.confirmed(candidates, accountEmail: accountEmail)
   }
 
@@ -1901,7 +2033,8 @@ public final class MacSyncStore: SyncEngine {
   private struct CleanupPass {
     var protectedFolderMissing = false
     var planned: [TransferRecord] = []
-    var removed = 0
+    var deletedRecords: [TransferRecord] = []
+    var removed: Int { deletedRecords.count }
     var failed = 0
     var checkedSpace = false
     var anyVolumeLow = false
@@ -1913,10 +2046,12 @@ public final class MacSyncStore: SyncEngine {
   /// not a shared iCloud item, has its Live Photo motion, and (with Only When Low on
   /// Space) sits on a volume that is still short; then it is claimed, re-checked and
   /// deleted through the manifest's verified tombstone path.
-  private func cleanupPass(_ mode: CleanupMode, eligible: [TransferRecord]) async -> CleanupPass {
+  private func cleanupPass(_ mode: CleanupMode, eligible: [TransferRecord], accountEmail: String) async -> CleanupPass {
     var pass = CleanupPass()
     let smartDelete = settings.smartDeleteEnabled
     let ignored = settings.ignoredFolders
+    let watchedIDs = folders.map(\.id)
+    let watchedEnabled = folders.map(\.isEnabled)
     // A protected folder that can be found neither through its bookmark nor at its path
     // could hold any of these files, so nothing goes until it can be.
     let protectedPaths = await Task.detached(priority: .utility) { IgnoredFolderLocation.protectedPaths(ignored) }.value
@@ -1934,6 +2069,7 @@ public final class MacSyncStore: SyncEngine {
     let roots = await allowedSourceRootsAsync()
     let folderRoots = folders.compactMap { folder in folder.resolvedURL.map { (folder, $0.path) } }
     for rec in eligible where !backingOff.contains(rec.id) {
+      guard !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail else { break }
       if case .remove(let ids?) = mode, !ids.contains(rec.id) { continue }
       guard rec.sharedEntryID == nil,
         let sourcePath = rec.sourcePath,
@@ -1987,6 +2123,7 @@ public final class MacSyncStore: SyncEngine {
       case .plan:
         pass.planned.append(rec)
       case .remove:
+        guard !Task.isCancelled, allowsAccountWork else { break }
         guard await manifestStore.claimForDeletion(id: rec.id) else { continue }
         guard await manifestStore.deletionClaimIsValid(id: rec.id),
           settings.ignoredFolders == ignored,
@@ -1997,20 +2134,43 @@ public final class MacSyncStore: SyncEngine {
           continue
         }
         await KeptThumbnails.keep(rec, fileURL: fileURL)
+        let current = settings
+        guard
+          await manifestStore.isStillDue(id: rec.id, settings: current, accountEmail: accountEmail, accounts: accounts)
+        else {
+          await manifestStore.releaseDeletionClaim(id: rec.id)
+          continue
+        }
+        // Nothing suspends from here to the store's own checks: a folder may have been
+        // protected or removed, or cleanup turned down, while the thumbnail was saved.
+        guard !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail, settings == current,
+          settings.ignoredFolders == ignored, settings.smartDeleteEnabled == smartDelete,
+          folders.map(\.id) == watchedIDs, folders.map(\.isEnabled) == watchedEnabled,
+          Self.validatedSourceFileURL(atPath: sourcePath, roots: roots) != nil,
+          !FolderMediaScanner.isSharedCloudItem(fileURL),
+          pairedVideoURL.map({ !FolderMediaScanner.isSharedCloudItem($0) }) ?? true
+        else {
+          await manifestStore.releaseDeletionClaim(id: rec.id)
+          continue
+        }
+        let policy = cleanupPolicy.current
         guard
           await manifestStore.deleteSourceFiles(
             id: rec.id,
             fileURL: fileURL,
-            pairedFileURL: pairedVideoURL
+            pairedFileURL: pairedVideoURL,
+            mayRemove: cleanupPolicy.check(root: folder?.resolvedURL)
           )
         else {
+          // Called off by a change made meanwhile, it isn't a failure.
+          guard cleanupPolicy.current == policy else { continue }
           pass.failed += 1
           DeletionFailureBackoff.recordFailure(rec.id)
           needsTombstoneRecovery = true
           continue
         }
-        pass.removed += 1
         DeletionFailureBackoff.clear(rec.id)
+        pass.deletedRecords.append(rec)
       }
       if let volume {
         var freed = rec.sourceFileSize ?? rec.byteCount ?? 0
@@ -2100,6 +2260,42 @@ private struct BookmarkRefresh: Sendable {
   var folderID: String
   var previous: Data?
   var refreshed: Data
+}
+
+/// Cache the resolved URLs, leaving each thumbnail job responsible for its own scope.
+private actor ThumbnailFolderScopes {
+  private struct Entry {
+    let bookmark: Data
+    let url: URL?
+    let path: String?
+  }
+
+  private var generation = 0
+  private var entries: [String: Entry] = [:]
+
+  func root(for fileURL: URL, folders: [MacWatchedFolder], generation: Int) -> URL? {
+    guard !Task.isCancelled, generation >= self.generation else { return nil }
+    if generation != self.generation {
+      self.generation = generation
+      entries.removeAll()
+    }
+    let path = WatchedFolderPaths.privatePrefixed(fileURL.standardizedFileURL.path)
+    for folder in folders {
+      guard !Task.isCancelled else { return nil }
+      guard let bookmark = folder.bookmarkData else { continue }
+      let entry: Entry
+      if let cached = entries[folder.id], cached.bookmark == bookmark {
+        entry = cached
+      } else {
+        let url = folder.resolveBookmark()?.url
+        let root = url.map { WatchedFolderPaths.privatePrefixed($0.standardizedFileURL.path) }
+        entry = Entry(bookmark: bookmark, url: url, path: root)
+        entries[folder.id] = entry
+      }
+      if let root = entry.path, WatchedFolderPaths.isPath(path, inside: root) { return entry.url }
+    }
+    return nil
+  }
 }
 
 private struct FolderUsability: Sendable {

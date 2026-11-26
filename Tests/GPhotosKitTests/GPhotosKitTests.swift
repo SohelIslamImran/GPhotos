@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 
 @testable import GPhotosKit
 
@@ -795,6 +796,71 @@ struct GPhotosKitTests {
     #expect(await store.claimForDeletion(id: replacementID))
     #expect(await store.deleteSourceFiles(id: replacementID, fileURL: replacement))
     #expect(!FileManager.default.fileExists(atPath: replacement.path))
+  }
+
+  @Test("A removal its check refuses, before a move or after hashing, puts both files back", arguments: [1, 2, 3])
+  func testCleanupCheckRollsBack(refusedCall: Int) async throws {
+    let directory = TestTemporaryDirectory.root
+      .appendingPathComponent("GPhotosKitTests-check-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    func file(_ name: String) throws -> (url: URL, size: Int64, modified: Date, sha1: String) {
+      let url = directory.appendingPathComponent(name)
+      try Data(name.utf8).write(to: url)
+      let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+      return (
+        url, (attributes[.size] as? NSNumber)?.int64Value ?? 0, attributes[.modificationDate] as? Date ?? Date(),
+        try GooglePhotosMobileClient.streamSHA1(fileURL: url).base64EncodedString()
+      )
+    }
+    let still = try file("still.heic")
+    let motion = try file("motion.mov")
+    let account = "check-\(UUID().uuidString)@example.com"
+    let id = TransferRecord.accountScopedID(UUID().uuidString, accountEmail: account)
+    let store = makeTestManifestStore()
+    var record = TransferRecord(
+      id: id, filename: still.url.lastPathComponent, mediaType: "Live Photo", status: .pending, sourcePath: still.url.path,
+      sourceFileSize: still.size, sourceModifiedAt: still.modified, sourceSHA1: still.sha1)
+    record.pairedSourcePath = motion.url.path
+    record.pairedSourceFileSize = motion.size
+    record.pairedSourceModifiedAt = motion.modified
+    record.pairedSourceSHA1 = motion.sha1
+    await store.upsert(record)
+    await store.updateStatus(id: id, status: .sent, mediaKey: "key", accountEmail: account)
+    #expect(await store.claimForDeletion(id: id))
+    let calls = OSAllocatedUnfairLock(initialState: 0)
+    let removed = await store.deleteSourceFiles(id: id, fileURL: still.url, pairedFileURL: motion.url) { files in
+      // Wherever each file is at that moment, it's the file that's asked about.
+      let exist = files.count == 2 && files.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
+      return exist
+        && calls.withLock { count in
+          count += 1
+          return count != refusedCall
+        }
+    }
+    #expect(!removed)
+    #expect(calls.withLock { $0 } == refusedCall)
+    #expect(try Data(contentsOf: still.url) == Data("still.heic".utf8))
+    #expect(try Data(contentsOf: motion.url) == Data("motion.mov".utf8))
+    #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 2)
+    #expect(await store.allRecords().first { $0.id == id }?.status == .sent)
+    // Allowed, the same claim's record goes.
+    #expect(await store.claimForDeletion(id: id))
+    #expect(await store.deleteSourceFiles(id: id, fileURL: still.url, pairedFileURL: motion.url) { _ in true })
+    #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+  }
+
+  @Test("A cleanup check fails once what it was planned under changes")
+  func testCleanupPolicy() {
+    let policy = CleanupPolicy()
+    let url = TestTemporaryDirectory.root
+    let check = policy.check(root: nil)
+    #expect(check([url]))
+    policy.invalidate()
+    #expect(!check([url]))
+    #expect(policy.check(root: url)([url]))
+    // Unreadable counts as shared.
+    #expect(!policy.check(root: nil)([url.appendingPathComponent("missing-\(UUID().uuidString)")]))
   }
 
   @Test("TransferManifestStore merges duplicate records for the same file")

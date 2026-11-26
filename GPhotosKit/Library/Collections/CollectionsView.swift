@@ -3,13 +3,39 @@ import Photos
 import SwiftUI
 
 /// Where Collections navigates.
-public enum CollectionRoute: Hashable {
+public enum CollectionRoute: Hashable, Sendable {
   case scope(LibraryScope, LibraryFilter)
+  case libraryFilter(LibraryFilter)
   case albums
   case places
   case place(ids: ItemIDs, latitude: Double, longitude: Double)
   case cloud(RemoteScope)
   case cloudAlbums
+  /// The Google Photos Locked Folder, listed only when the account has items in it.
+  case cloudLocked
+
+  public var mergedLibraryFilter: LibraryFilter? {
+    guard case .libraryFilter(let filter) = self else { return nil }
+    return filter
+  }
+
+  static let backupUtilities: [Self] = [.libraryFilter(.notBackedUp), .libraryFilter(.backedUp), .libraryFilter(.notIncludedInBackup)]
+}
+
+extension EnvironmentValues {
+  @Entry public var showLibraryFilter: ShowLibraryFilterAction?
+}
+
+public struct ShowLibraryFilterAction {
+  private let action: @MainActor (LibraryFilter) -> Void
+
+  public init(_ action: @escaping @MainActor (LibraryFilter) -> Void) {
+    self.action = action
+  }
+
+  @MainActor public func callAsFunction(_ filter: LibraryFilter) {
+    action(filter)
+  }
 }
 
 /// Collections, as in Photos: pinned collections, albums, media types and utilities.
@@ -18,62 +44,78 @@ public struct CollectionsView: View {
   let records: [TransferRecord]
   let recordsRevision: Int?
   let cloud: CloudLibrary?
+  let accountsLoaded: Bool
   @State private var collections: PhotoCollectionsModel
   @State private var status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+  @State private var canShowSections = false
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   /// `collections` lets a host that lists albums elsewhere (the Mac's sidebar) share one
-  /// model with this screen.
+  /// model with this screen; otherwise it's `PhotoCollectionsModel.shared`, which the app
+  /// loads at launch so the screen's first frame is already complete.
   public init(
     records: [TransferRecord], recordsRevision: Int?, cloud: CloudLibrary? = nil,
-    collections: PhotoCollectionsModel? = nil
+    accountsLoaded: Bool, collections: PhotoCollectionsModel? = nil
   ) {
     self.records = records
     self.recordsRevision = recordsRevision
     self.cloud = cloud
-    _collections = State(initialValue: collections ?? PhotoCollectionsModel())
+    self.accountsLoaded = accountsLoaded
+    _collections = State(initialValue: collections ?? .shared)
   }
 
   public var body: some View {
     Group {
-      if hasPhotoAccess || showsGalleryWithoutAccess {
+      if showsSections {
         #if os(macOS)
           gallery
         #else
           list
         #endif
       } else {
-        ContentUnavailableView {
-          Label("Allow Photo Access", systemImage: "photo.badge.exclamationmark")
-        } description: {
-          Text("Allow access to see your albums here.")
-        } actions: {
-          Button("Allow Access") {
-            Task {
-              status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-              await collections.load()
-            }
-          }
-          .buttonStyle(.glassProminent)
-        }
+        #if os(macOS)
+          Color.clear
+        #else
+          List {}.listStyle(.insetGrouped)
+        #endif
       }
     }
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: showsSections)
     .navigationTitle("Collections")
     .collectionDestinations(records: records, recordsRevision: recordsRevision, cloud: cloud, collections: collections)
+    .task(id: cloud?.accountEmail) { cloud?.refresh() }
     .task {
-      cloud?.refresh()
-      await collections.load()
+      // Its change observer keeps a loaded model current.
+      await collections.loadIfNeeded()
+    }
+    .task(id: sectionsAreReady) {
+      guard let delay = Self.sectionRevealDelay(ready: sectionsAreReady, hasShown: canShowSections) else { return }
+      // Give cached sections one short chance to arrive together, without waiting on a slow read.
+      if delay > .zero {
+        do { try await Task.sleep(for: delay) } catch { return }
+      }
+      guard !Task.isCancelled else { return }
+      canShowSections = true
     }
   }
 
-  private var hasPhotoAccess: Bool { status == .authorized || status == .limited }
+  nonisolated static func sectionRevealDelay(ready: Bool, hasShown: Bool) -> Duration? {
+    if hasShown { return nil }
+    return ready ? .zero : .milliseconds(250)
+  }
 
-  /// On the Mac, Google Photos still shows without access to this Mac's library.
-  private var showsGalleryWithoutAccess: Bool {
-    #if os(macOS)
-      cloud != nil
-    #else
-      false
-    #endif
+  private var hasPhotoAccess: Bool { status == .authorized || status == .limited }
+  private var showsSections: Bool { canShowSections || sectionsAreReady }
+
+  private var sectionsAreReady: Bool {
+    accountsLoaded && (!hasPhotoAccess || collections.isLoaded) && cloud?.isStateLoaded != false
+  }
+
+  private func requestPhotoAccess() {
+    Task {
+      status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+      await collections.load()
+    }
   }
 
   #if os(macOS)
@@ -87,12 +129,7 @@ public struct CollectionsView: View {
           Text("Allow access to see this Mac’s albums here.").foregroundStyle(.secondary)
         }
         Spacer()
-        Button("Allow Access") {
-          Task {
-            status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-            await collections.load()
-          }
-        }
+        Button("Allow Access", action: requestPhotoAccess)
       }
       .padding(16)
       .background(.fill.quaternary, in: .rect(cornerRadius: 12, style: .continuous))
@@ -106,7 +143,7 @@ public struct CollectionsView: View {
           if !hasPhotoAccess { accessBanner }
           if hasPhotoAccess { deviceSections }
           if let cloud { CloudCollectionsGallery(library: cloud) }
-          if hasPhotoAccess { utilitySections }
+          utilitySections
         }
         .galleryPage()
       }
@@ -127,8 +164,12 @@ public struct CollectionsView: View {
           NavigationLink("Show All", value: CollectionRoute.albums)
         }
       } content: {
-        if collections.albums.isEmpty {
-          Text(collections.isLoaded ? "No albums yet." : "Loading…")
+        if !collections.isLoaded {
+          LazyVGrid(columns: galleryCoverColumns) {
+            GalleryCover(title: "", count: 0, thumbnailID: nil).hidden()
+          }
+        } else if collections.albums.isEmpty {
+          Text("No albums yet.")
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, minHeight: 80)
         } else {
@@ -146,7 +187,7 @@ public struct CollectionsView: View {
     }
 
     @ViewBuilder private var utilitySections: some View {
-      if !mediaKinds.isEmpty {
+      if hasPhotoAccess, !mediaKinds.isEmpty {
         GallerySection("Media Types") {
           LazyVGrid(columns: galleryRowColumns, spacing: 10) {
             ForEach(mediaKinds) { summary in
@@ -160,28 +201,39 @@ public struct CollectionsView: View {
       }
 
       GallerySection("Utilities") {
-        LazyVGrid(columns: galleryRowColumns, spacing: 10) {
-          NavigationLink(value: CollectionRoute.scope(.all, .notBackedUp)) {
-            GalleryRow(title: String(localized: "Not Backed Up"), symbol: "icloud.slash", tint: .orange)
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 260, maximum: 360), spacing: 10)], spacing: 10) {
+          ForEach(CollectionRoute.backupUtilities, id: \.self) { route in
+            if let filter = route.mergedLibraryFilter {
+              CollectionLink(route: route) {
+                GalleryRow(title: filter.title, symbol: filter.symbol, tint: backupTint(for: filter))
+              }
+            }
           }
-          NavigationLink(value: CollectionRoute.scope(.all, .backedUp)) {
-            GalleryRow(title: String(localized: "Backed Up"), symbol: "checkmark.icloud", tint: .green)
-          }
-          NavigationLink(value: CollectionRoute.scope(.recentlyAdded, .all)) {
-            GalleryRow(title: String(localized: "Recently Added"), symbol: "clock")
-          }
-          NavigationLink(value: CollectionRoute.scope(.hidden, .all)) {
-            GalleryRow(title: String(localized: "Hidden"), symbol: "eye.slash", tint: .secondary)
+          if hasPhotoAccess {
+            NavigationLink(value: CollectionRoute.scope(.recentlyAdded, .all)) {
+              GalleryRow(title: String(localized: "Recently Added"), symbol: "clock")
+            }
+            NavigationLink(value: CollectionRoute.scope(.hidden, .all)) {
+              GalleryRow(title: String(localized: "Hidden"), symbol: "eye.slash", tint: .secondary)
+            }
           }
         }
         .buttonStyle(.plain)
       }
 
-      if collections.isLoaded {
+      if hasPhotoAccess, collections.isLoaded {
         Text("\(collections.photoCount.formatted()) Photos, \(collections.videoCount.formatted()) Videos")
           .font(.callout)
           .foregroundStyle(.secondary)
           .frame(maxWidth: .infinity)
+      }
+    }
+
+    private func backupTint(for filter: LibraryFilter) -> Color {
+      switch filter {
+      case .notBackedUp: .orange
+      case .backedUp: .green
+      default: .secondary
       }
     }
 
@@ -202,7 +254,7 @@ public struct CollectionsView: View {
           .scope(.mediaKind(.videos), .all)
         ),
         (String(localized: "Places"), "map.fill", nil, .places),
-        (String(localized: "Not Backed Up"), "icloud.slash.fill", nil, .scope(.all, .notBackedUp)),
+        (String(localized: "Not Backed Up"), "icloud.slash.fill", nil, .libraryFilter(.notBackedUp)),
         (String(localized: "Hidden"), "eye.slash.fill", nil, .scope(.hidden, .all)),
       ]
     }
@@ -210,47 +262,25 @@ public struct CollectionsView: View {
 
   private var list: some View {
     List {
-      // As in Photos: pinned collections as a row of square tiles.
-      Section {
-        ScrollView(.horizontal) {
-          LazyHStack(spacing: 10) {
-            PinnedTile(
-              title: Text("Favorites"), symbol: "heart.fill",
-              keyAssetID: collections.summary(for: .favorites)?.keyAssetID,
-              route: .scope(.mediaKind(.favorites), .all))
-            PinnedTile(
-              title: Text("Recently Added"), symbol: "clock.fill", keyAssetID: collections.recentlyAddedKeyID,
-              route: .scope(.recentlyAdded, .all))
-            PinnedTile(
-              title: Text("Videos"), symbol: "video.fill", keyAssetID: collections.summary(for: .videos)?.keyAssetID,
-              route: .scope(.mediaKind(.videos), .all))
-            PinnedTile(title: Text("Places"), symbol: "map.fill", keyAssetID: nil, route: .places)
-            PinnedTile(
-              title: Text("Not Backed Up"), symbol: "icloud.slash.fill", keyAssetID: nil, route: .scope(.all, .notBackedUp))
-            PinnedTile(title: Text("Hidden"), symbol: "eye.slash.fill", keyAssetID: nil, route: .scope(.hidden, .all))
-          }
-          .scrollTargetLayout()
-        }
-        .scrollIndicators(.hidden)
-        .scrollTargetBehavior(.viewAligned)
-        .contentMargins(.horizontal, 20, for: .scrollContent)
-        .listRowInsets(EdgeInsets())
-        .listRowBackground(Color.clear)
-      } header: {
-        Text("Pinned")
-      }
-
-      Section {
-        if collections.albums.isEmpty {
-          Text(collections.isLoaded ? "No albums yet." : "Loading…").foregroundStyle(.secondary)
-        } else {
+      if hasPhotoAccess {
+        // As in Photos: pinned collections as a row of square tiles.
+        Section {
           ScrollView(.horizontal) {
-            LazyHStack(alignment: .top, spacing: 12) {
-              ForEach(collections.albums.prefix(20)) { album in
-                PinnedTile(
-                  title: Text(album.title), keyAssetID: album.keyAssetID,
-                  route: .scope(.album(id: album.id, title: album.title), .all))
-              }
+            LazyHStack(spacing: 10) {
+              PinnedTile(
+                title: Text("Favorites"), symbol: "heart.fill",
+                keyAssetID: collections.summary(for: .favorites)?.keyAssetID,
+                route: .scope(.mediaKind(.favorites), .all))
+              PinnedTile(
+                title: Text("Recently Added"), symbol: "clock.fill", keyAssetID: collections.recentlyAddedKeyID,
+                route: .scope(.recentlyAdded, .all))
+              PinnedTile(
+                title: Text("Videos"), symbol: "video.fill", keyAssetID: collections.summary(for: .videos)?.keyAssetID,
+                route: .scope(.mediaKind(.videos), .all))
+              PinnedTile(title: Text("Places"), symbol: "map.fill", keyAssetID: nil, route: .places)
+              PinnedTile(
+                title: Text("Not Backed Up"), symbol: "icloud.slash.fill", keyAssetID: nil, route: .libraryFilter(.notBackedUp))
+              PinnedTile(title: Text("Hidden"), symbol: "eye.slash.fill", keyAssetID: nil, route: .scope(.hidden, .all))
             }
             .scrollTargetLayout()
           }
@@ -259,18 +289,57 @@ public struct CollectionsView: View {
           .contentMargins(.horizontal, 20, for: .scrollContent)
           .listRowInsets(EdgeInsets())
           .listRowBackground(Color.clear)
+        } header: {
+          Text("Pinned")
         }
-      } header: {
-        HStack {
-          Text("Albums")
-          Spacer()
-          NavigationLink("See All", value: CollectionRoute.albums).font(.subheadline)
+
+        Section {
+          if collections.albums.isEmpty {
+            Text(collections.isLoaded ? "No albums yet." : "Loading…")
+              .foregroundStyle(.secondary)
+              .padding(.horizontal, 20)
+              .frame(height: PinnedTile.shelfHeight)
+              .listRowInsets(EdgeInsets())
+              .listRowBackground(Color.clear)
+          } else {
+            ScrollView(.horizontal) {
+              LazyHStack(alignment: .top, spacing: 12) {
+                ForEach(collections.albums.prefix(20)) { album in
+                  PinnedTile(
+                    title: Text(album.title), keyAssetID: album.keyAssetID,
+                    route: .scope(.album(id: album.id, title: album.title), .all))
+                }
+              }
+              .scrollTargetLayout()
+            }
+            .scrollIndicators(.hidden)
+            .scrollTargetBehavior(.viewAligned)
+            .contentMargins(.horizontal, 20, for: .scrollContent)
+            .listRowInsets(EdgeInsets())
+            .listRowBackground(Color.clear)
+          }
+        } header: {
+          HStack {
+            Text("Albums")
+            Spacer()
+            NavigationLink("See All", value: CollectionRoute.albums).font(.subheadline)
+          }
+        }
+      } else {
+        Section {
+          ContentUnavailableView {
+            Label("Allow Photo Access", systemImage: "photo.badge.exclamationmark")
+          } description: {
+            Text("Allow access to see your albums here.")
+          } actions: {
+            Button("Allow Access", action: requestPhotoAccess).buttonStyle(.glassProminent)
+          }
         }
       }
 
       if let cloud { CloudCollectionsSection(library: cloud) }
 
-      if !mediaKinds.isEmpty {
+      if hasPhotoAccess, !mediaKinds.isEmpty {
         Section("Media Types") {
           ForEach(mediaKinds) { summary in
             NavigationLink(value: CollectionRoute.scope(.mediaKind(summary.kind), .all)) {
@@ -281,21 +350,24 @@ public struct CollectionsView: View {
       }
 
       Section("Utilities") {
-        NavigationLink(value: CollectionRoute.scope(.all, .notBackedUp)) {
-          Label("Not Backed Up", systemImage: "icloud.slash")
+        ForEach(CollectionRoute.backupUtilities, id: \.self) { route in
+          if let filter = route.mergedLibraryFilter {
+            CollectionLink(route: route) {
+              Label(filter.title, systemImage: filter.symbol)
+            }
+          }
         }
-        NavigationLink(value: CollectionRoute.scope(.all, .backedUp)) {
-          Label("Backed Up", systemImage: "checkmark.icloud")
-        }
-        NavigationLink(value: CollectionRoute.scope(.recentlyAdded, .all)) {
-          Label("Recently Added", systemImage: "clock")
-        }
-        NavigationLink(value: CollectionRoute.scope(.hidden, .all)) {
-          Label("Hidden", systemImage: "eye.slash")
+        if hasPhotoAccess {
+          NavigationLink(value: CollectionRoute.scope(.recentlyAdded, .all)) {
+            Label("Recently Added", systemImage: "clock")
+          }
+          NavigationLink(value: CollectionRoute.scope(.hidden, .all)) {
+            Label("Hidden", systemImage: "eye.slash")
+          }
         }
       }
 
-      if collections.isLoaded {
+      if hasPhotoAccess, collections.isLoaded {
         Section {
         } footer: {
           Text("\(collections.photoCount.formatted()) Photos, \(collections.videoCount.formatted()) Videos")
@@ -318,6 +390,24 @@ public struct CollectionsView: View {
   }
 }
 
+private struct CollectionLink<Label: View>: View {
+  @Environment(\.showLibraryFilter) private var showLibraryFilter
+  let route: CollectionRoute
+  @ViewBuilder let label: () -> Label
+
+  var body: some View {
+    if let filter = route.mergedLibraryFilter {
+      Button {
+        showLibraryFilter?(filter)
+      } label: {
+        label()
+      }
+    } else {
+      NavigationLink(value: route, label: label)
+    }
+  }
+}
+
 /// A square tile, as in Photos' Pinned row: the collection's photo (or a neutral fill)
 /// with its name in the corner. With no `side` it fills its grid cell (Mac).
 private struct PinnedTile: View {
@@ -325,10 +415,11 @@ private struct PinnedTile: View {
   var symbol: String?
   let keyAssetID: String?
   let route: CollectionRoute
-  var side: CGFloat? = 127
+  static let shelfHeight: CGFloat = 127
+  var side: CGFloat? = Self.shelfHeight
 
   var body: some View {
-    NavigationLink(value: route) {
+    CollectionLink(route: route) {
       Color.clear
         .aspectRatio(1, contentMode: .fit)
         .frame(width: side, height: side)
@@ -394,9 +485,12 @@ public struct CollectionRouteView: View {
     switch route {
     case .scope(let scope, let filter):
       LibraryCollectionScreen(scope: scope, filter: filter, records: records, recordsRevision: recordsRevision, cloud: cloud)
+    case .libraryFilter:
+      // CollectionLink and the sidebar handle this action without pushing a destination.
+      EmptyView()
     case .albums:
       AlbumsGridView(collections: collections)
-        .task { if !collections.isLoaded { await collections.load() } }
+        .task { await collections.loadIfNeeded() }
     case .places:
       PlacesView(cloud: cloud, records: records)
     case .place(let ids, let latitude, let longitude):
@@ -407,6 +501,8 @@ public struct CollectionRouteView: View {
       }
     case .cloudAlbums:
       if let cloud { GoogleAlbumsView(library: cloud) }
+    case .cloudLocked:
+      if let cloud { LockedFolderView(library: cloud) }
     }
   }
 }

@@ -149,6 +149,10 @@
         else {
           return ledger.jobs.isEmpty ? .finished : .moreToDo
         }
+        if ledger.appIsBusy() {
+          BackgroundUploadLog.write("run: the app is open and uploads itself")
+          return .moreToDo
+        }
         let limit = Self.maxJobs - ledger.jobs.count
         var candidates: [Candidate] = []
         if limit > 0 {
@@ -161,11 +165,6 @@
           }
         }
         if Task.isCancelled { return .moreToDo }
-        if ledger.appIsBusy() {
-          BackgroundUploadLog.write("run: the app is open and uploads itself")
-          return candidates.isEmpty && ledger.jobs.isEmpty && !hasHeldFailures(ledger, context: context)
-            ? .finished : .moreToDo
-        }
         if candidates.isEmpty && ledger.jobs.isEmpty {
           BackgroundUploadLog.write("run: everything is backed up")
           return needsRetry || hasHeldFailures(ledger, context: context) ? .moreToDo : .finished

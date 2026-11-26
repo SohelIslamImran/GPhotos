@@ -126,7 +126,8 @@ public struct PhotoEntityQuery: EntityStringQuery, IndexedEntityQuery {
   public init() {}
 
   public func entities(for identifiers: [String]) async throws -> [PhotoEntity] {
-    try await SiriLibrary.shared.store.siriRecords(ids: identifiers).map(PhotoEntity.init)
+    let records = try await SiriLibrary.shared.store.siriRecords(ids: identifiers)
+    return await SiriLibrary.shared.excludingLocked(records).map(PhotoEntity.init)
   }
 
   /// Siri's words, matched against what the index found in each item.
@@ -136,7 +137,8 @@ public struct PhotoEntityQuery: EntityStringQuery, IndexedEntityQuery {
   }
 
   public func suggestedEntities() async throws -> [PhotoEntity] {
-    try await SiriLibrary.shared.store.recentSiriRecords(limit: 30).map(PhotoEntity.init)
+    let records = try await SiriLibrary.shared.store.recentSiriRecords(limit: 30)
+    return await SiriLibrary.shared.excludingLocked(records).map(PhotoEntity.init)
   }
 
   /// Thumbnails, asked for only when Siri or Shortcuts shows the results.

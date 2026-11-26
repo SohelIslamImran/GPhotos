@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 import QuickLookThumbnailing
 import SwiftUI
+
 #if os(iOS)
   import Photos
   import UIKit
@@ -13,7 +14,9 @@ import SwiftUI
 public actor AsyncSemaphore {
   public let maxPermits: Int
   public private(set) var availablePermits: Int
-  private var waiters: [CheckedContinuation<Void, Never>] = []
+  private var waiters: [(id: UInt64, continuation: CheckedContinuation<Bool, Never>)] = []
+  private var nextID: UInt64 = 0
+  var waitingCount: Int { waiters.count }
 
   public init(maxPermits: Int) {
     let limit = max(1, maxPermits)
@@ -21,28 +24,43 @@ public actor AsyncSemaphore {
     self.availablePermits = limit
   }
 
-  public func wait() async {
+  /// Returns true when the caller owns a permit and must signal it.
+  @discardableResult
+  public func wait() async -> Bool {
+    guard !Task.isCancelled else { return false }
     if availablePermits > 0 {
       availablePermits -= 1
-      return
+      return true
     }
-    await withCheckedContinuation { continuation in
-      waiters.append(continuation)
+    nextID &+= 1
+    let id = nextID
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        waiters.append((id, continuation))
+      }
+    } onCancel: {
+      Task { await self.cancelWaiter(id) }
     }
+  }
+
+  private func cancelWaiter(_ id: UInt64) {
+    guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+    waiters.remove(at: index).continuation.resume(returning: false)
   }
 
   public func signal() {
     if !waiters.isEmpty {
       let next = waiters.removeFirst()
-      next.resume()
+      next.continuation.resume(returning: true)
     } else if availablePermits < maxPermits {
       availablePermits += 1
     }
   }
 
-  public func withPermit<T: Sendable>(_ operation: @Sendable () async throws -> T) async rethrows -> T {
-    await wait()
+  public func withPermit<T: Sendable>(_ operation: @Sendable () async throws -> T) async rethrows -> T? {
+    guard await wait() else { return nil }
     defer { signal() }
+    guard !Task.isCancelled else { return nil }
     return try await operation()
   }
 }
@@ -59,10 +77,10 @@ public final class MediaThumbnailLoader {
 
   /// Opens security-scoped access to the folder holding a file. The app picks the
   /// folder on the main actor from cached roots and returns an opener; the opener runs
-  /// off the main actor (it resolves a bookmark) and returns the matching stop closure.
+  /// off the main actor and returns the matching stop closure.
   public var fileAccess: (@MainActor (URL) -> FileAccessOpener?)?
 
-  public typealias FileAccessOpener = @Sendable () -> (@Sendable () -> Void)?
+  public typealias FileAccessOpener = @Sendable () async -> (@Sendable () -> Void)?
 
   private let cache: NSCache<NSString, CachedThumbnail> = {
     let cache = NSCache<NSString, CachedThumbnail>()
@@ -123,6 +141,7 @@ public final class MediaThumbnailLoader {
   ) async -> CGImage? {
     let pixelSize = max(1, Int(pointSize * scale))
     let key = Self.cacheKey(for: record, pixelSize: pixelSize)
+    guard record.status != .deleted, !Task.isCancelled else { return nil }
 
     if let cached = cache.object(forKey: key as NSString) {
       return cached.cgImage
@@ -134,10 +153,10 @@ public final class MediaThumbnailLoader {
     } else {
       task = Task<CGImage?, Never> { [weak self, record] in
         guard let self else { return nil }
-        return await self.semaphore.withPermit {
-          guard !Task.isCancelled else { return nil }
-          return await self.generate(for: record, pointSize: pointSize, scale: scale, pixelSize: pixelSize)
+        let image = await self.semaphore.withPermit {
+          await self.generate(for: record, pointSize: pointSize, scale: scale, pixelSize: pixelSize)
         }
+        return image ?? nil
       }
       inFlightTasks[key] = task
     }
@@ -200,7 +219,8 @@ public final class MediaThumbnailLoader {
       let fileURL = URL(fileURLWithPath: sourcePath)
       let opener = fileAccess?(fileURL)
       let work = Task.detached(priority: .userInitiated) { () -> CGImage? in
-        let stopAccess = opener?()
+        guard !Task.isCancelled else { return nil }
+        let stopAccess = await opener?()
         defer { stopAccess?() }
         guard !Task.isCancelled, FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
         return await Self.generateQuickLookThumbnail(for: fileURL, pointSize: pointSize, scale: scale)
@@ -339,12 +359,12 @@ public struct MediaThumbnailView: View {
     }
     .animation(reduceMotion ? nil : .smooth, value: image != nil)
     .accessibilityHidden(true)
-    .task(id: key) {
-      image = MediaThumbnailLoader.shared.cachedImage(for: key)
+    .task(id: record.status == .deleted ? nil : key) {
       guard record.status != .deleted else {
         image = nil
         return
       }
+      image = MediaThumbnailLoader.shared.cachedImage(for: key)
       let loaded = await MediaThumbnailLoader.shared.loadThumbnail(
         for: record,
         pointSize: size,

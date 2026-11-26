@@ -2,6 +2,7 @@ import CoreGraphics
 import CryptoKit
 import Foundation
 import ImageIO
+import os
 
 /// Thumbnails of Google Photos items for the shared `ThumbnailPipeline`. Ids are
 /// `RemoteThumbnailID` strings (media key and content version, so edits get new images).
@@ -9,8 +10,15 @@ import ImageIO
 /// are kept in a size-capped disk cache per account and decoded, downsampled, off the
 /// main thread.
 public final class GoogleThumbnailSource: ThumbnailSource, Sendable {
-  private let client: GooglePhotosMobileClient
+  typealias Fetch =
+    @Sendable (_ id: RemoteThumbnailID, _ side: Int, _ crop: Bool, _ waitsOutRateLimit: Bool) async throws -> Data
+
+  private let fetch: Fetch
+  private let decodeImage: @Sendable (Data, Int) -> CGImage?
   private let cache: ThumbnailDiskCache
+  /// Closed once the library is switched away from or removed: the shared client may
+  /// already hold another account's credential, so nothing more is requested.
+  private let requests = AccountRequests()
   /// What's on screen has slots of its own: indexing thousands of items in the background
   /// never makes the Library wait for a turn. Each thumbnail takes Google about half a
   /// second, over one HTTP/2 connection, so a Mac window's screenful needs a dozen at once.
@@ -19,28 +27,72 @@ public final class GoogleThumbnailSource: ThumbnailSource, Sendable {
 
   private let accountEmail: String
 
-  public init(client: GooglePhotosMobileClient, accountEmail: String) {
-    self.client = client
+  public convenience init(client: GooglePhotosMobileClient, accountEmail: String) {
+    self.init(accountEmail: accountEmail) { id, side, crop, waitsOutRateLimit in
+      try await client.thumbnail(
+        mediaKey: id.mediaKey, width: side, height: side, contentVersion: id.contentVersion, crop: crop,
+        waitsOutRateLimit: waitsOutRateLimit)
+    }
+  }
+
+  init(
+    accountEmail: String, decode: @escaping @Sendable (Data, Int) -> CGImage? = GoogleThumbnailSource.decode,
+    fetch: @escaping Fetch
+  ) {
+    decodeImage = decode
+    self.fetch = fetch
     self.accountEmail = accountEmail
-    cache = ThumbnailDiskCache(
-      directory: ThumbnailDiskCache.directory(for: accountEmail), byteLimit: ThumbnailDiskCache.defaultByteLimit)
+    cache = ThumbnailDiskCache(accountEmail: accountEmail, byteLimit: ThumbnailDiskCache.defaultByteLimit)
+  }
+
+  /// Requests nothing more and cancels what's out; `drain` returns once that has ended.
+  func retire() { requests.close() }
+
+  func drain() async { await requests.drain() }
+
+  public func thumbnailIdentity(for id: String) -> ThumbnailIdentity {
+    ThumbnailIdentity(id: id, version: 0, accountEmail: accountEmail)
+  }
+
+  private func isLocked(_ id: RemoteThumbnailID) -> Bool {
+    LockedItems.contains(id.mediaKey, accountEmail: accountEmail)
+  }
+
+  /// One request, in its turn. The library can be retired or the item moved to the Locked
+  /// Folder while it waits or while it's out: then nothing is sent, or nothing comes back.
+  private func download(
+    _ id: RemoteThumbnailID, side: Int, crop: Bool, waitsOutRateLimit: Bool = true, limiter: DownloadLimiter
+  ) async throws -> Data {
+    guard !requests.isClosed, await limiter.acquire() else { throw CancellationError() }
+    defer { limiter.release() }
+    guard !isLocked(id) else { throw CancellationError() }
+    let data = try await requests.run { [fetch] in try await fetch(id, side, crop, waitsOutRateLimit) }
+    guard !requests.isClosed, !isLocked(id) else { throw CancellationError() }
+    return data
   }
 
   public func requestImage(
     id: String, pixelSize: CGSize, quality: ImageRequestQuality,
-    deliver: @escaping @Sendable (CGImage, Bool) -> Void
+    onUnavailable: @escaping @Sendable () -> Void, deliver: @escaping @Sendable (CGImage, Bool) -> Void
   ) -> ImageRequestToken {
-    guard let parsed = RemoteThumbnailID(id) else { return .none }
+    guard let parsed = RemoteThumbnailID(id), !requests.isClosed, !isLocked(parsed) else {
+      onUnavailable()
+      return .none
+    }
     let side = Self.requestSide(for: pixelSize, quality: quality)
     // Grid cells are square, so their thumbnails come cropped to fill the cell.
-    let crop = quality != .display
-    let key = "\(parsed.mediaKey)-\(parsed.contentVersion)-\(side)\(crop ? "c" : "")"
+    let crop = quality == .fast || quality == .thumbnail
+    let key = ThumbnailDiskCache.Key(parsed, side: side, crop: crop)
     // Only cells and pages on screen ask (nothing prefetches), so they go ahead of indexing.
     let task = Task.detached(priority: .userInitiated) {
-      [client, cache, limiter, accountEmail] in
+      [self, cache, limiter, accountEmail] in
+      var succeeded = false
+      defer { if !succeeded, !Task.isCancelled { onUnavailable() } }
       // A cell flung past cancels before its task starts: nothing is read for it.
       guard !Task.isCancelled else { return }
-      if let data = cache.data(for: key), let image = Self.decode(data, maxPixel: side) {
+      if let data = cache.data(for: key), let image = decodeImage(data, side) {
+        guard !Task.isCancelled, !requests.isClosed, !isLocked(parsed) else { return }
+        succeeded = true
         deliver(image, true)
         return
       }
@@ -49,7 +101,9 @@ public final class GoogleThumbnailSource: ThumbnailSource, Sendable {
       if let kept = KeptThumbnails.data(mediaKey: parsed.mediaKey, accountEmail: accountEmail),
         let image = Self.decode(kept, maxPixel: side)
       {
+        guard !Task.isCancelled, !requests.isClosed, !isLocked(parsed) else { return }
         let isEnough = quality != .display && side <= KeptThumbnails.side
+        succeeded = isEnough
         deliver(Self.cropped(image, square: crop), isEnough)
         if isEnough { return }
       }
@@ -57,18 +111,17 @@ public final class GoogleThumbnailSource: ThumbnailSource, Sendable {
       // first time, a small whole-photo preview comes first, as in Photos: the photo is
       // there at once, soft, and sharpens.
       if quality == .display {
-        let prefix = "\(parsed.mediaKey)-\(parsed.contentVersion)-"
-        if let smaller = cache.largestSmaller(than: side, prefix: prefix), let image = Self.decode(smaller, maxPixel: side) {
+        if let smaller = cache.largestSmaller(than: side, of: parsed), let image = Self.decode(smaller, maxPixel: side) {
+          guard !Task.isCancelled, !requests.isClosed, !isLocked(parsed) else { return }
           deliver(image, false)
-        } else if side > Self.previewSide, await limiter.acquire() {
-          let preview = try? await client.thumbnail(
-            mediaKey: parsed.mediaKey, width: Self.previewSide, height: Self.previewSide,
-            contentVersion: parsed.contentVersion, crop: false)
-          limiter.release()
-          if let preview, !Task.isCancelled, let image = Self.decode(preview, maxPixel: Self.previewSide) {
-            cache.store(preview, for: prefix + String(Self.previewSide))
-            deliver(image, false)
-          }
+        } else if side > Self.previewSide,
+          let preview = try? await download(parsed, side: Self.previewSide, crop: false, limiter: limiter),
+          !Task.isCancelled, !requests.isClosed, !isLocked(parsed),
+          let image = decodeImage(preview, Self.previewSide)
+        {
+          guard await storeIfActive(preview, for: ThumbnailDiskCache.Key(parsed, side: Self.previewSide, crop: false), id: parsed)
+          else { return }
+          deliver(image, false)
         }
       }
       // Fast scrolling never touches the network.
@@ -79,17 +132,17 @@ public final class GoogleThumbnailSource: ThumbnailSource, Sendable {
       for attempt in 0..<Self.retryDelays.count + 1 {
         guard !Task.isCancelled else { return }
         if attempt > 0 { try? await Task.sleep(for: Self.retryDelays[attempt - 1]) }
-        guard await limiter.acquire() else { return }
         do {
-          let data = try await client.thumbnail(
-            mediaKey: parsed.mediaKey, width: side, height: side, contentVersion: parsed.contentVersion, crop: crop)
-          limiter.release()
-          guard !Task.isCancelled, let image = Self.decode(data, maxPixel: side) else { return }
-          cache.store(data, for: key)
+          let data = try await download(parsed, side: side, crop: crop, limiter: limiter)
+          guard !Task.isCancelled, !requests.isClosed, !isLocked(parsed), let image = decodeImage(data, side),
+            await storeIfActive(data, for: key, id: parsed)
+          else { return }
+          succeeded = true
           deliver(image, true)
           return
+        } catch is CancellationError {
+          return
         } catch {
-          limiter.release()
           // Gone or refused for this item alone: asking again won't change it.
           if case GPhotosError.httpError(let status, _) = error, (400..<500).contains(status), status != 429 { return }
         }
@@ -98,23 +151,32 @@ public final class GoogleThumbnailSource: ThumbnailSource, Sendable {
     return ImageRequestToken { task.cancel() }
   }
 
+  private func storeIfActive(_ data: Data, for key: ThumbnailDiskCache.Key, id: RemoteThumbnailID) async -> Bool {
+    do {
+      try await requests.run { [self] in
+        try Task.checkCancellation()
+        guard !isLocked(id) else { throw CancellationError() }
+        cache.store(data, for: key)
+      }
+      return !Task.isCancelled && !requests.isClosed && !isLocked(id)
+    } catch {
+      return false
+    }
+  }
+
   /// The whole photo, uncropped, about `side` pixels on its longest edge, for on-device
   /// analysis (search labels, faces). Read from the cache when a viewer size is there;
   /// otherwise downloaded and not kept, so indexing a library doesn't push the thumbnails
   /// people look at out of the cache. Waits its turn behind what's on screen. Nil when
   /// the image can't be decoded; throws when it can't be fetched.
   func analysisImage(_ id: RemoteThumbnailID, side: Int) async throws -> CGImage? {
-    let prefix = "\(id.mediaKey)-\(id.contentVersion)-"
+    guard !isLocked(id) else { throw CancellationError() }
     for cached in [side, 1024, 1600] where cached >= side {
-      if let data = cache.data(for: prefix + String(cached)), let image = Self.decode(data, maxPixel: side) {
+      if let data = cache.data(for: ThumbnailDiskCache.Key(id, side: cached, crop: false)), let image = Self.decode(data, maxPixel: side) {
         return image
       }
     }
-    guard await analysisLimiter.acquire() else { throw CancellationError() }
-    defer { analysisLimiter.release() }
-    let data = try await client.thumbnail(
-      mediaKey: id.mediaKey, width: side, height: side, contentVersion: id.contentVersion, crop: false,
-      waitsOutRateLimit: false)
+    let data = try await download(id, side: side, crop: false, waitsOutRateLimit: false, limiter: analysisLimiter)
     return Self.decode(data, maxPixel: side)
   }
 
@@ -192,15 +254,17 @@ final class DownloadLimiter: @unchecked Sendable {
     }
     let granted = await withTaskCancellationHandler {
       await withCheckedContinuation { continuation in
-        let granted: Bool = lock.withLock {
+        let acquired: Bool? = lock.withLock {
+          // Cancellation may run before the continuation has been registered.
+          if Task.isCancelled { return false }
           if free > 0 {
             free -= 1
             return true
           }
           waiters.append((id, continuation))
-          return false
+          return nil
         }
-        if granted { continuation.resume(returning: true) }
+        if let acquired { continuation.resume(returning: acquired) }
       }
     } onCancel: {
       let waiter: CheckedContinuation<Bool, Never>? = lock.withLock {
@@ -247,16 +311,31 @@ public struct RemoteThumbnailID: Equatable, Sendable {
   public var string: String { "g:\(contentVersion):\(mediaKey)" }
 }
 
-/// Files named by key hash, written atomically, trimmed oldest-first past the limit.
-/// Thread-safe through the file system; the size estimate is advisory.
+/// Files named by media key hash, content version and size, written atomically, trimmed
+/// oldest-first past the limit. Thread-safe through the file system; the size estimate is
+/// advisory. Nothing in the Locked Folder is kept.
 final class ThumbnailDiskCache: @unchecked Sendable {
+  struct Key: Sendable {
+    let mediaKey: String
+    let fileName: String
+
+    init(_ id: RemoteThumbnailID, side: Int, crop: Bool) {
+      mediaKey = id.mediaKey
+      fileName = ThumbnailDiskCache.itemName(for: id.mediaKey) + "-\(id.contentVersion)-\(side)\(crop ? "c" : "")"
+    }
+  }
+
   let directory: URL
+  private let accountEmail: String
   private let byteLimit: Int64
   private let lock = NSLock()
   private var approximateBytes: Int64 = 0
-  private var isTrimming = true
-  /// Files read this run, whose dates were moved up so trimming keeps what is viewed.
+  private var isTrimming = false
+  /// Deleted with its account: nothing is read or written again.
+  private var isRemoved = false
+  /// Files read lately, whose dates were moved up so trimming keeps what is viewed.
   private var touched = Set<String>()
+  private static let touchedLimit = 10_000
 
   static let defaultByteLimit: Int64 = 1 << 30
 
@@ -265,23 +344,41 @@ final class ThumbnailDiskCache: @unchecked Sendable {
       .appending(path: RemoteLibraryStore.fileName(for: accountEmail).replacingOccurrences(of: ".sqlite", with: ""))
   }
 
-  init(directory: URL, byteLimit: Int64) {
-    self.directory = directory
+  init(accountEmail: String, byteLimit: Int64) {
+    self.accountEmail = accountEmail
+    directory = Self.directory(for: accountEmail)
     self.byteLimit = byteLimit
     try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    // Listing every file competes with the first screen's thumbnail reads, so it waits.
-    DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 30) { [self] in trim() }
+    // Listing every file competes with the first screen's thumbnail reads, so it waits. A
+    // cache dropped (its account switched away) in the meantime isn't listed.
+    DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 30) { [weak self] in self?.startTrim() }
   }
 
-  private func url(for key: String) -> URL {
-    let digest = Insecure.SHA1.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
-    return directory.appending(path: digest)
+  /// Lowercase hex of the media key's SHA-1, which its files' names start with.
+  static func itemName(for key: String) -> String {
+    let digits = Array("0123456789abcdef".utf8)
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(40)
+    for byte in Insecure.SHA1.hash(data: Data(key.utf8)) {
+      bytes.append(digits[Int(byte >> 4)])
+      bytes.append(digits[Int(byte & 0x0f)])
+    }
+    return String(decoding: bytes, as: UTF8.self)
   }
 
-  func data(for key: String) -> Data? {
+  private func url(for key: Key) -> URL {
+    directory.appending(path: key.fileName)
+  }
+
+  func data(for key: Key) -> Data? {
+    guard !lock.withLock({ isRemoved }) else { return nil }
     let url = url(for: key)
     guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
-    if lock.withLock({ touched.insert(url.lastPathComponent).inserted }) {
+    let isFirstRead = lock.withLock {
+      if touched.count >= Self.touchedLimit { touched.removeAll(keepingCapacity: true) }
+      return touched.insert(url.lastPathComponent).inserted
+    }
+    if isFirstRead {
       DispatchQueue.global(qos: .background).async {
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
       }
@@ -290,28 +387,60 @@ final class ThumbnailDiskCache: @unchecked Sendable {
   }
 
   /// The biggest uncropped cached size of one item below `side`.
-  func largestSmaller(than side: Int, prefix: String) -> Data? {
+  func largestSmaller(than side: Int, of id: RemoteThumbnailID) -> Data? {
     let steps = [6144, 4096, 3072, 2048, 1600, 1024, 800, 512, 320, 192, 96]
     for step in steps where step < side {
-      if let data = data(for: prefix + String(step)) { return data }
+      if let data = data(for: Key(id, side: step, crop: false)) { return data }
     }
     return nil
   }
 
-  func store(_ data: Data, for key: String) {
-    try? data.write(to: url(for: key), options: .atomic)
+  func store(_ data: Data, for key: Key) {
+    guard !lock.withLock({ isRemoved }), !LockedItems.contains(key.mediaKey, accountEmail: accountEmail) else { return }
+    let url = url(for: key)
+    try? data.write(to: url, options: .atomic)
+    // Locked while it was being written, after `remove` looked.
+    if LockedItems.contains(key.mediaKey, accountEmail: accountEmail) { try? FileManager.default.removeItem(at: url) }
     let shouldTrim = lock.withLock {
       approximateBytes += Int64(data.count)
-      guard approximateBytes > byteLimit, !isTrimming else { return false }
+      return approximateBytes > byteLimit && !isTrimming
+    }
+    if shouldTrim { DispatchQueue.global(qos: .background).async { [weak self] in self?.startTrim() } }
+  }
+
+  /// Deletes the cache with its account; later reads and writes do nothing.
+  func removeAll() {
+    lock.withLock {
+      isRemoved = true
+      approximateBytes = 0
+      touched.removeAll()
+    }
+    try? FileManager.default.removeItem(at: directory)
+  }
+
+  /// Deletes every size and version of these items. A file whose name doesn't say whose it
+  /// is could be one of them, so it goes too.
+  static func remove(_ mediaKeys: Set<String>, accountEmail: String) {
+    let directory = directory(for: accountEmail)
+    guard let files = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
+    let items = Set(mediaKeys.map(itemName))
+    for file in files where belongs(file, to: items) {
+      try? FileManager.default.removeItem(at: directory.appending(path: file))
+    }
+  }
+
+  private static func belongs(_ file: String, to items: Set<String>) -> Bool {
+    guard let dash = file.firstIndex(of: "-") else { return true }
+    return items.contains(String(file[..<dash]))
+  }
+
+  private func startTrim() {
+    let starts = lock.withLock {
+      guard !isTrimming, !isRemoved else { return false }
       isTrimming = true
       return true
     }
-    if shouldTrim { DispatchQueue.global(qos: .background).async { [self] in trim() } }
-  }
-
-  func removeAll() {
-    try? FileManager.default.removeItem(at: directory)
-    lock.withLock { approximateBytes = 0 }
+    if starts { trim() }
   }
 
   /// Deletes the least recently used files until the cache is under 80% of its limit.
@@ -319,7 +448,13 @@ final class ThumbnailDiskCache: @unchecked Sendable {
     let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
     let files =
       (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys)) ?? []
+    let locked = Set(LockedItems.keys(accountEmail: accountEmail).map(Self.itemName))
     var entries = files.compactMap { url -> (URL, Int64, Date)? in
+      // What an earlier run couldn't delete.
+      if Self.belongs(url.lastPathComponent, to: locked) {
+        try? FileManager.default.removeItem(at: url)
+        return nil
+      }
       guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
       return (url, Int64(values.fileSize ?? 0), values.contentModificationDate ?? .distantPast)
     }

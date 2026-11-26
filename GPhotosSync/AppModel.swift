@@ -11,18 +11,6 @@ import os
 
 private let libraryScanLogger = Logger(subsystem: "org.gphotosapp.gphotos", category: "LibraryScan")
 
-/// The selected account's records, partitioned by status in one pass.
-public struct AccountBuckets: Equatable {
-  public var all: [TransferRecord] = []
-  public var uploading: [TransferRecord] = []
-  public var queued: [TransferRecord] = []
-  public var sent: [TransferRecord] = []
-  public var failed: [TransferRecord] = []
-  public var completedBytes: Int64 = 0
-  /// Positions in `all`, so upload rows find their record on every progress tick.
-  public var indexByID: [String: Int] = [:]
-}
-
 /// What a cleanup would remove: photo-library assets (one system prompt), the app's own
 /// staged copies of manual uploads and files in backed-up folders (no prompt).
 public struct CleanupPlan: Sendable, Equatable {
@@ -128,7 +116,9 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   private var folderRescanRequested = false
   /// Bumped when a folder is removed, turned off or replaced, so a scan already under
   /// way can't queue its files.
-  private var folderGeneration = 0
+  private var folderGeneration = 0 {
+    didSet { cleanupPolicy.invalidate() }
+  }
   /// Where each folder's bookmark last resolved to a readable directory.
   @ObservationIgnored private var resolvedFolderRoots: [String: URL] = [:]
   /// Every path the backed-up folders may be known by, for checks that run per record on
@@ -146,13 +136,16 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// The photo upload extension, which backs up the library after the app is closed.
   @ObservationIgnored let backgroundUploads = BackgroundUploads()
   @ObservationIgnored private var backgroundUploadPoll: Task<Void, Never>?
+  @ObservationIgnored private var backgroundUploadPollSleep: Task<Void, Never>?
+  @ObservationIgnored private var backgroundUploadWakeRequested = false
+  @ObservationIgnored private let backgroundUploadObserver = ShareObserverHolder()
   @ObservationIgnored private var isImportingBackgroundUploads = false
   @ObservationIgnored private var isReconcilingBackgroundUploads = false
   private(set) var backgroundUploadWaitIDs = Set<String>()
   var isStoppedForSession: Bool { stopRequested }
   @ObservationIgnored private var isSceneActive = false
   /// Albums for items the extension uploaded, added once no batch is running.
-  @ObservationIgnored private var pendingAlbumKeys: (accountEmail: String, keysByAlbum: [String: [String]])?
+  @ObservationIgnored private var pendingAlbumKeys: [String: [String: [String]]] = [:]
   /// Whether the running continued task holds the batch through background expiration.
   @ObservationIgnored private var continuedUploadHoldsBatch = false
   @ObservationIgnored private var deferredFolderRescanDelay = FolderMediaScanner.writeSettleInterval
@@ -160,7 +153,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// every folder each `writeSettleInterval`, so consecutive deferrals back off to this.
   private static let maxDeferredFolderRescanDelay: TimeInterval = 5 * 60
 
-  public override init() {
+  public init() {
     super.init()
     refreshFolderRootPaths()
     MediaThumbnailLoader.shared.fileAccess = { [weak self] url in
@@ -177,7 +170,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     }
     self.photoLibraryStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     startObservingLibraryIfAuthorized()
-    BackgroundUploadLedgerStore.shared.update { $0.resetAppClaims() }
+    backgroundUploads.resetAppClaims()
     workerPool.claimPhotoUpload = BackgroundUploads.claimForApp
     workerPool.releasePhotoUpload = BackgroundUploads.releaseAppClaim
     workerPool.onBatchCompleted = { [weak self] in
@@ -246,51 +239,36 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     photoLibraryStatus == .authorized || photoLibraryStatus == .limited
   }
 
-  /// Partitioned once per `refreshRecords()`. The hero card reads these on every
-  /// progress tick, so filtering the whole manifest inside `body` was O(records)
-  /// allocations per evaluation.
-  public private(set) var accountBuckets = AccountBuckets()
+  @ObservationIgnored private var bucketSnapshot = AccountTransferBuckets()
+  public var accountBuckets: AccountTransferBuckets {
+    _ = accountBucketsRevision
+    return bucketSnapshot.accountEmail == selectedAccount?.email ? bucketSnapshot : AccountTransferBuckets()
+  }
+  private(set) var accountBucketsRevision = 0
 
-  public var accountRecords: [TransferRecord] { accountBuckets.all }
   public var accountPendingRecords: [TransferRecord] { accountBuckets.queued }
-  public var accountSentRecords: [TransferRecord] { accountBuckets.sent }
-  public var accountFailedRecords: [TransferRecord] { accountBuckets.failed }
-  public var accountUploadingRecords: [TransferRecord] { accountBuckets.uploading }
-
-  public var accountUploadingCount: Int { accountBuckets.uploading.count }
+  public var accountUploadingCount: Int { accountBuckets.uploadingCount }
   public var accountQueuedCount: Int { accountBuckets.queued.count }
   public var accountCompletedByteCount: Int64 { accountBuckets.completedBytes }
-  public var accountFailedCount: Int { accountBuckets.failed.count }
-  public var accountTransferredCount: Int { accountBuckets.sent.count }
+  public var accountFailedCount: Int { accountBuckets.failedCount }
+  public var accountTransferredCount: Int { accountBuckets.sentCount }
 
-  /// What `accountBuckets` was last built from, so an unchanged refresh skips the pass.
   @ObservationIgnored private var bucketsSource: (revision: Int?, email: String?)?
 
   public override func refreshRecords() async {
     await super.refreshRecords()
     let source = (revision: recordsRevision, email: selectedAccount?.email)
     if let bucketsSource, bucketsSource == source { return }
+    let records = records
+    let previous = bucketSnapshot
+    let (buckets, changed) = await Task.detached(priority: .utility) {
+      let buckets = AccountTransferBuckets(records: records, accountEmail: source.email)
+      return (buckets, !buckets.hasSameRecords(as: previous))
+    }.value
+    guard source == (recordsRevision, selectedAccount?.email), bucketsSource.map({ $0 != source }) ?? true else { return }
     bucketsSource = source
-    guard let email = selectedAccount?.email else {
-      if accountBuckets != AccountBuckets() { accountBuckets = AccountBuckets() }
-      return
-    }
-    let prefix = "\(email)|"
-    var buckets = AccountBuckets()
-    for record in records where record.id.hasPrefix(prefix) {
-      if record.isSkipped { continue }
-      buckets.indexByID[record.id] = buckets.all.count
-      buckets.all.append(record)
-      switch record.status {
-      case .sending: buckets.uploading.append(record)
-      case .pending: buckets.queued.append(record)
-      case .sent, .deleted:
-        buckets.sent.append(record)
-        buckets.completedBytes += record.byteCount ?? 0
-      case .failed: buckets.failed.append(record)
-      }
-    }
-    if buckets != accountBuckets { accountBuckets = buckets }
+    bucketSnapshot = buckets
+    if changed { accountBucketsRevision &+= 1 }
   }
 
   /// Whether Sync Now can ever do anything. A tap while busy queues one more pass instead
@@ -320,6 +298,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     refreshBackgroundUploads()
     // Scopes held for the previous account's batch, which an account change stops.
     releaseFolderUploadAccessIfIdle()
+    if !pendingAlbumKeys.isEmpty { Task { [weak self] in await self?.addPendingAlbums() } }
     await resumePendingManualUploads()
   }
 
@@ -431,13 +410,21 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
 
   /// Whether a processing task would have anything to do: a scan under way or requested,
   /// uploads queued or in flight, or staged picks to resume.
-  public var hasPendingBackgroundWork: Bool {
-    guard selectedAccount != nil else { return false }
-    let background = BackgroundUploadLedgerStore.shared.read()
-    return !background.jobs.isEmpty || !background.results.isEmpty || isStarting || isScanning || rescanRequested || isRunning
-      || isScanningFolders || folderRescanRequested
-      || !pendingManualUploads.isEmpty || !accountBuckets.queued.isEmpty || !accountBuckets.uploading.isEmpty
-      || !backgroundUploadWaitIDs.isEmpty
+  var hasKnownBackgroundWork: Bool {
+    selectedAccount != nil
+      && (isStarting || isScanning || rescanRequested || isRunning || isScanningFolders || folderRescanRequested
+        || !pendingManualUploads.isEmpty || !accountBuckets.queued.isEmpty || accountUploadingCount > 0)
+  }
+
+  public func hasPendingBackgroundWork() async -> Bool {
+    if hasKnownBackgroundWork { return true }
+    guard selectedAccount != nil || !hasLoadedAccounts else { return false }
+    let background = await BackgroundUploads.readLedger()
+    guard !Task.isCancelled else { return false }
+    if hasKnownBackgroundWork { return true }
+    if !hasLoadedAccounts { return !background.jobs.isEmpty || !background.results.isEmpty }
+    return background.jobs.contains { acceptsBackgroundReceipt(accountEmail: $0.accountEmail) }
+      || background.results.contains { acceptsBackgroundReceipt(accountEmail: $0.accountEmail) }
   }
 
   /// Library changes, background tasks and foreground activation; a tapped Sync Now calls
@@ -519,7 +506,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// observer, so a full rescan only runs when access changed, work was left queued
   /// (for example by a background task that ran out of time). Folders have no change
   /// feed on iOS, so they are rescanned every time.
-  public func refreshPhotoLibraryStatus() async {
+  public func refreshPhotoLibraryStatus(using foregroundRead: FolderMediaScanner.ForegroundRead? = nil) async {
     let previous = photoLibraryStatus
     photoLibraryStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     startObservingLibraryIfAuthorized()
@@ -537,7 +524,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
       if photoLibraryStatus != previous { needsFullLibraryScan = true }
       if !stopRequested { await scanLibrary() }
     }
-    await syncFoldersAutomatically()
+    await syncFoldersAutomatically(using: foregroundRead)
   }
 
   public func openPhotoSettings() {
@@ -849,62 +836,24 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     await scanLibrary()
   }
 
-  /// Reads the assets that changed since the last pass, or the whole library when that
-  /// isn't known.
-  private func scanLibrary() async {
-    guard !stopRequested, !Task.isCancelled, isAuthorized, let account = selectedAccount else { return }
-    guard !isRunning, !workerPool.isBatchFinalizing, !isScanning else {
-      rescanRequested = true
-      return
-    }
-    isScanning = true
-    rescanRequested = false
-    defer {
-      isScanning = false
-      // A library change that arrived during the pass sets this; honour it once the
-      // pass ends rather than dropping it.
-      if rescanRequested, !isRunning, !stopRequested {
-        rescanRequested = false
-        Task { @MainActor [weak self] in
-          await self?.scanLibrary()
-        }
-      }
-    }
-    let generation = accountGeneration
-    let basis = LibraryScanBasis(accountEmail: account.email, removalCount: await manifestStore.removalCount)
-    var scope: Set<String>? =
-      needsFullLibraryScan || libraryScanBasis != basis || excludedAssetIDs == nil
-        || changedAssetIDs.count > Self.maxChangedAssets
-      ? nil : changedAssetIDs
-    needsFullLibraryScan = false
-    changedAssetIDs = []
-    var finished = false
-    let retriesFailedNow = retriesFailedItemsNow
-    retriesFailedItemsNow = false
-    // A pass cut short (often by the next change notification) may have read only part
-    // of its scope, so the scope is owed to the next one.
-    defer {
-      if !finished {
-        if retriesFailedNow { retriesFailedItemsNow = true }
-        if let scope { changedAssetIDs.formUnion(scope) } else { needsFullLibraryScan = true }
-      }
-    }
-    let pairLivePhotos = settings.pairLivePhotos
+  @concurrent
+  private nonisolated static func describeLibrary(
+    records currentRecords: [TransferRecord], account: GoogleAccount, settings: AppSettings,
+    scope initialScope: Set<String>?, previouslyExcluded: Set<String>
+  ) async -> (description: LibraryDescription, scope: Set<String>?, failed: [TransferRecord], savedCount: Int) {
+    var scope = initialScope
     let accountPrefix = "\(account.email)|"
     if scope != nil {
       // A whole-library pass queues every unfinished asset each time.
-      for record in await manifestStore.allRecords()
+      for record in currentRecords
       where record.status == .pending || record.status == .failed {
         guard record.id.hasPrefix(accountPrefix), let assetID = record.assetLocalIdentifier else { continue }
         scope?.insert(assetID)
       }
     }
-    let excludedAlbumIDs = settings.excludedAlbumIDs
-    let previouslyExcluded = excludedAssetIDs ?? []
     var sentAssets: [String: SentAsset] = [:]
     var alternatePhotos: [String: LibraryResource] = [:]
     var uneditedOriginals: [String: LibraryResource] = [:]
-    let currentRecords = await manifestStore.allRecords()
     for record in currentRecords where record.id.hasPrefix(accountPrefix) {
       guard let assetID = record.assetLocalIdentifier else { continue }
       // A partial pass describes only its scope and the assets that left protected albums.
@@ -934,43 +883,36 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     for (assetID, resource) in uneditedOriginals {
       sentAssets[assetID]?.uneditedOriginal = resource
     }
-    let backsUpUneditedOriginals = settings.backsUpUneditedOriginals
-    let scan = Task.detached(priority: .utility) { [sentAssets, excludedAlbumIDs, scope] in
-      Self.describeLibrary(
-        pairLivePhotos: pairLivePhotos,
-        backsUpUneditedOriginals: backsUpUneditedOriginals,
-        sentAssets: sentAssets,
-        excludedAlbumIDs: excludedAlbumIDs,
-        only: scope,
-        previouslyExcluded: previouslyExcluded
-      )
-    }
-    // A detached task does not inherit cancellation, so it is cancelled explicitly
-    // when this scan is superseded or stopped.
-    let description = await withTaskCancellationHandler {
-      await scan.value
-    } onCancel: {
-      scan.cancel()
-    }
-    let descriptors = description.assets
-    guard !Task.isCancelled,
-      accountGeneration == generation,
-      selectedAccount?.email == account.email
-    else { return }
+    let description = describeLibrary(
+      pairLivePhotos: settings.pairLivePhotos,
+      backsUpUneditedOriginals: settings.backsUpUneditedOriginals,
+      sentAssets: sentAssets,
+      excludedAlbumIDs: settings.excludedAlbumIDs,
+      only: scope,
+      previouslyExcluded: previouslyExcluded
+    )
+    let failed = scope == nil ? currentRecords.filter { $0.id.hasPrefix(accountPrefix) && $0.status == .failed } : []
+    return (description, scope, failed, sentAssets.count)
+  }
 
+  private struct LibraryQueuePlan: Sendable {
+    var records: [TransferRecord]
+    var previous: [String: TransferRecord]
+    var items: [UploadQueueItem]
+    var described: Set<String>
+  }
+
+  @concurrent
+  private nonisolated static func planLibraryQueue(
+    description: LibraryDescription, account: GoogleAccount, manifest: TransferManifestStore,
+    retriesFailedNow: Bool, pairLivePhotos: Bool, mirrorPhotoAlbums: Bool, isFullScan: Bool
+  ) async -> LibraryQueuePlan? {
+    let descriptors = description.assets
     var queueItems: [UploadQueueItem] = []
     var newRecords: [TransferRecord] = []
-    // A partial pass looks up only the records its few assets can have, rather than
-    // indexing the whole manifest on the main actor.
-    let known =
-      scope == nil
-      ? Dictionary(uniqueKeysWithValues: await manifestStore.allRecords().map { ($0.id, $0) })
-      : await manifestStore.records(
-        withIDs: descriptors.flatMap { $0.entries(accountEmail: account.email).map(\.id) })
-    guard !Task.isCancelled,
-      accountGeneration == generation,
-      selectedAccount?.email == account.email
-    else { return }
+    let known = await manifest.records(
+      withIDs: descriptors.flatMap { $0.entries(accountEmail: account.email).map(\.id) })
+    guard !Task.isCancelled else { return nil }
 
     /// True when this resource of an asset still needs to go through the upload queue.
     ///
@@ -989,22 +931,14 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     // when the scan will actually queue something — otherwise a settled library pays
     // the full cost on every change notification for nothing.
 
-    let albumMapping: PhotoAlbumMirror.Mapping? =
-      if settings.mirrorPhotoAlbums {
-        descriptors.contains(where: { descriptor in
+    let albumMapping =
+      mirrorPhotoAlbums
+        && descriptors.contains { descriptor in
           descriptor.entries(accountEmail: account.email).contains { needsUpload($0, of: descriptor) }
-        })
-          ? await Task.detached(priority: .utility) { PhotoAlbumMirror.buildMapping() }.value
-          : nil
-      } else {
-        nil
-      }
+        } ? PhotoAlbumMirror.buildMapping() : nil
 
     for descriptor in descriptors {
-      guard !Task.isCancelled,
-        accountGeneration == generation,
-        selectedAccount?.email == account.email
-      else { return }
+      guard !Task.isCancelled else { return nil }
       let assetID = descriptor.localIdentifier
       // The RAW of a RAW+JPEG pair follows the same rules as its primary: queued when
       // new, unfinished or edited since its upload. An original does not change with a
@@ -1065,16 +999,81 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
             // The RAW and the original stay out of mirrored albums, which would otherwise
             // show those photos twice.
             albumNames: isPrimary ? albumMapping?.albumNames(forAssetIdentifier: assetID) ?? [] : [],
-            pairLivePhotos: entry.role != .alternatePhoto && settings.pairLivePhotos
+            pairLivePhotos: entry.role != .alternatePhoto && pairLivePhotos
           ))
       }
     }
 
+    var previous: [String: TransferRecord] = [:]
+    for record in newRecords { previous[record.id] = known[record.id] }
+    return LibraryQueuePlan(
+      records: newRecords, previous: previous, items: queueItems,
+      described: isFullScan ? Set(descriptors.map(\.localIdentifier)) : []
+    )
+  }
+
+  /// Reads the assets that changed since the last pass, or the whole library when that
+  /// isn't known.
+  private func scanLibrary() async {
+    guard !replaysAfterAccountChange(("libraryScan", { [weak self] in await self?.scanLibrary() })) else { return }
+    guard canUseSelectedAccount, !stopRequested, !Task.isCancelled, isAuthorized, let account = selectedAccount else { return }
+    guard !isRunning, !workerPool.isBatchFinalizing, !isScanning else {
+      rescanRequested = true
+      return
+    }
+    isScanning = true
+    rescanRequested = false
+    defer {
+      isScanning = false
+      // A library change that arrived during the pass sets this; honour it once the
+      // pass ends rather than dropping it.
+      if rescanRequested, !isRunning, !stopRequested {
+        rescanRequested = false
+        Task { @MainActor [weak self] in
+          await self?.scanLibrary()
+        }
+      }
+    }
+    let generation = accountGeneration
+    let basis = LibraryScanBasis(accountEmail: account.email, removalCount: await manifestStore.removalCount)
+    var scope: Set<String>? =
+      needsFullLibraryScan || libraryScanBasis != basis || excludedAssetIDs == nil
+        || changedAssetIDs.count > Self.maxChangedAssets
+      ? nil : changedAssetIDs
+    needsFullLibraryScan = false
+    changedAssetIDs = []
+    var finished = false
+    let retriesFailedNow = retriesFailedItemsNow
+    retriesFailedItemsNow = false
+    // A pass cut short (often by the next change notification) may have read only part
+    // of its scope, so the scope is owed to the next one.
+    defer {
+      if !finished {
+        if retriesFailedNow { retriesFailedItemsNow = true }
+        if let scope { changedAssetIDs.formUnion(scope) } else { needsFullLibraryScan = true }
+      }
+    }
+    let settings = settings
+    let currentRecords = await manifestStore.allRecords()
+    let snapshot = await Self.describeLibrary(
+      records: currentRecords, account: account, settings: settings,
+      scope: scope, previouslyExcluded: excludedAssetIDs ?? []
+    )
+    scope = snapshot.scope
+    guard !Task.isCancelled, accountGeneration == generation, selectedAccount?.email == account.email else { return }
+    let description = snapshot.description
+    guard
+      let plan = await Self.planLibraryQueue(
+        description: description, account: account, manifest: manifestStore,
+        retriesFailedNow: retriesFailedNow, pairLivePhotos: settings.pairLivePhotos,
+        mirrorPhotoAlbums: settings.mirrorPhotoAlbums, isFullScan: scope == nil
+      )
+    else { return }
     guard !Task.isCancelled,
       accountGeneration == generation,
       selectedAccount?.email == account.email
     else { return }
-    guard await manifestStore.upsertBatch(newRecords, ifUnchangedSince: known) else { return }
+    guard await manifestStore.upsertBatch(plan.records, ifUnchangedSince: plan.previous) else { return }
     // Only once any RAW it found is recorded, or that RAW would never be looked for again.
     if !description.checkedAssetIDs.isEmpty {
       await manifestStore.markResourcesChecked(
@@ -1086,9 +1085,8 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     excludedAssetIDs = description.excludedAssetIDs
     if scope == nil {
       libraryScanBasis = basis
-      await removeFailedRecordsWithoutSource(failedRecords, accountEmail: account.email, includingFiles: false)
-      await removeUnfinishedRecordsOutsideLibrary(
-        described: Set(descriptors.map(\.localIdentifier)), accountEmail: account.email)
+      await removeFailedRecordsWithoutSource(snapshot.failed, accountEmail: account.email, includingFiles: false)
+      await removeUnfinishedRecordsOutsideLibrary(described: plan.described, accountEmail: account.email)
     }
     guard !Task.isCancelled,
       accountGeneration == generation,
@@ -1096,13 +1094,18 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     else { return }
 
     // An item the photo upload extension is sending is left to it; its result is imported.
-    let heldByExtension = BackgroundUploadLedgerStore.shared.read().heldRecordIDs
+    let heldByExtension = await BackgroundUploads.readLedger().heldRecordIDs
     backgroundUploadWaitIDs = heldByExtension
-    let claimedIDs = await manifestStore.claimForUpload(
-      ids: queueItems.map(\.id).filter { !heldByExtension.contains($0) })
-    let claimedItems = queueItems.filter { claimedIDs.contains($0.id) }
+    let queueItems = plan.items
+    let eligibleIDs = await Task.detached(priority: .utility) {
+      queueItems.compactMap { heldByExtension.contains($0.id) ? nil : $0.id }
+    }.value
+    let claimedIDs = await manifestStore.claimForUpload(ids: eligibleIDs)
+    let claimedItems = await Task.detached(priority: .utility) {
+      queueItems.filter { claimedIDs.contains($0.id) }
+    }.value
     libraryScanLogger.notice(
-      "Scan complete: full=\(scope == nil), assets=\(descriptors.count), saved=\(sentAssets.count), queued=\(queueItems.count), claimed=\(claimedItems.count)"
+      "Scan complete: full=\(scope == nil), assets=\(description.assets.count), saved=\(snapshot.savedCount), queued=\(queueItems.count), claimed=\(claimedItems.count)"
     )
     await refreshRecords()
     guard !stopRequested,
@@ -1125,7 +1128,9 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
       return
     }
     if workerPool.start(items: claimedItems, quality: 3, accountEmail: account.email) == .rejected {
-      if workerPool.isBatchFinalizing, !stopRequested, accountGeneration == generation { rescanRequested = true }
+      if workerPool.isBatchFinalizing || isChangingAccount, !stopRequested, accountGeneration == generation {
+        rescanRequested = true
+      }
       await manifestStore.releaseUploadClaims(ids: claimedItems.map(\.id))
       await refreshRecords()
     }
@@ -1232,6 +1237,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   }
 
   public func uploadSingleFile(url: URL) async throws -> String? {
+    guard !isChangingAccount else { return nil }
     let filename = url.lastPathComponent
     guard SupportedMediaFormats.isSupported(filename: filename) else {
       throw GPhotosError.fileReadFailed("Unsupported media type")
@@ -1369,7 +1375,9 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   }
 
   public func resumePendingManualUploads() async {
-    guard !isResumingManualUploads, selectedAccount != nil, !pendingManualUploads.isEmpty else { return }
+    guard !replaysAfterAccountChange(("manualUploads", { [weak self] in await self?.resumePendingManualUploads() }))
+    else { return }
+    guard canUseSelectedAccount, !isResumingManualUploads, !pendingManualUploads.isEmpty else { return }
     isResumingManualUploads = true
     defer {
       isResumingManualUploads = false
@@ -1377,7 +1385,10 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     }
     for url in pendingManualUploads {
       guard !Task.isCancelled, selectedAccount != nil else { break }
-      guard (try? await uploadSingleFile(url: url)) != nil else { break }
+      guard (try? await uploadSingleFile(url: url)) != nil else {
+        _ = replaysAfterAccountChange(("manualUploads", { [weak self] in await self?.resumePendingManualUploads() }))
+        break
+      }
       pendingManualUploads.removeAll { $0 == url }
       let directory = url.deletingLastPathComponent()
       try? FileManager.default.removeItem(at: Self.isStagedManualUpload(url) ? directory : url)
@@ -1392,10 +1403,12 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   }
 
   override public func retryFailedForUser() async {
+    guard canUseSelectedAccount else { return }
+    let ledger = await BackgroundUploads.readLedger()
     let retryExtensionItems =
       selectedAccount.map { account in
         let prefix = TransferRecord.accountScopedID("", accountEmail: account.email)
-        return BackgroundUploadLedgerStore.shared.read().failures.keys.contains { $0.hasPrefix(prefix) }
+        return ledger.failures.keys.contains { $0.hasPrefix(prefix) }
       } ?? false
     if let account = selectedAccount {
       await removeFailedRecordsWithoutSource(failedRecords, accountEmail: account.email, includingFiles: true)
@@ -1410,9 +1423,10 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   }
 
   override public func retryFailed() async {
-    backgroundUploads.forgetFailures()
+    guard canUseSelectedAccount else { return }
+    await backgroundUploads.forgetFailures()
     let failed = failedRecords
-    guard !Task.isCancelled, !failed.isEmpty, !isRunning, let account = selectedAccount else { return }
+    guard canUseSelectedAccount, !Task.isCancelled, !failed.isEmpty, !isRunning, let account = selectedAccount else { return }
     let generation = accountGeneration
     let accountPrefix = "\(account.email)|"
     let roots = allowedSourceRoots()
@@ -1478,10 +1492,10 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   }
 
   public override func requeueRecord(_ record: TransferRecord) async {
-    guard let account = selectedAccount else { return }
+    guard canUseSelectedAccount, let account = selectedAccount else { return }
     let generation = accountGeneration
     guard !Task.isCancelled, record.id.hasPrefix("\(account.email)|") else { return }
-    backgroundUploads.forgetFailure(of: record.id)
+    await backgroundUploads.forgetFailure(of: record.id)
     if record.status == .failed,
       await removeFailedRecordsWithoutSource([record], accountEmail: account.email, includingFiles: true)
     {
@@ -1644,12 +1658,15 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     // that isn't readable yet: neither says a photo is gone.
     guard photoLibraryStatus == .authorized, !described.isEmpty else { return }
     let prefix = "\(accountEmail)|"
-    let stale = await manifestStore.allRecords().filter { record in
-      guard record.status == .pending, record.id.hasPrefix(prefix), record.sourcePath == nil,
-        record.sharedEntryID == nil, let asset = record.assetLocalIdentifier
-      else { return false }
-      return !described.contains(asset)
-    }
+    let records = await manifestStore.allRecords()
+    let stale = await Task.detached(priority: .utility) {
+      records.filter { record in
+        guard record.status == .pending, record.id.hasPrefix(prefix), record.sourcePath == nil,
+          record.sharedEntryID == nil, let asset = record.assetLocalIdentifier
+        else { return false }
+        return !described.contains(asset)
+      }
+    }.value
     guard !stale.isEmpty else { return }
     var settled = 0
     for record in stale {
@@ -1794,8 +1811,8 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
       // The scans queue what's unfinished; a partial library pass covers its pending items.
       await scanLibrary()
       await syncFolders()
-    } else if accountRecords.contains(where: {
-      $0.status == .pending && $0.sourcePath.map { FolderBackup.isPath($0, insideAny: folderRoots) } == true
+    } else if accountPendingRecords.contains(where: {
+      $0.sourcePath.map { FolderBackup.isPath($0, insideAny: folderRoots) } == true
     }) {
       await syncFolders(resumingOnly: true)
     }
@@ -1872,7 +1889,6 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
 
   override public func primaryBatchDidComplete() async {
     await super.primaryBatchDidComplete()
-    await refreshRecords()
     updateAppBusy()
     // Signed in before notifications were ever asked for: the moment a backup has just run
     // in front of the user is when a summary of the ones that run while closed makes sense.
@@ -1913,11 +1929,29 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     updateAppBusy()
     if isRunning { startLiveActivity() }
     guard backgroundUploadPoll == nil else { return }
+    backgroundUploadObserver.token = BackgroundUploadLedgerStore.observeWork { [weak self] in
+      Task { @MainActor in
+        guard let self, self.isSceneActive else { return }
+        self.backgroundUploadWakeRequested = true
+        self.backgroundUploadPollSleep?.cancel()
+      }
+    }
     backgroundUploadPoll = Task { [weak self] in
-      while !Task.isCancelled {
-        await self?.reconcileBackgroundUploads(timeout: .seconds(30))
-        do { try await Task.sleep(for: .seconds(15)) } catch { return }
-        guard self != nil else { return }
+      while !Task.isCancelled, let self {
+        self.backgroundUploadWakeRequested = false
+        let ledger = await BackgroundUploads.readLedger()
+        let interval: Duration
+        if ledger.hasWork() || !self.backgroundUploadWaitIDs.isEmpty {
+          await self.reconcileBackgroundUploads(timeout: .seconds(30), ledger: ledger)
+          interval = await BackgroundUploads.readLedger().foregroundPollInterval()
+        } else {
+          interval = ledger.foregroundPollInterval()
+        }
+        guard !Task.isCancelled else { return }
+        if self.backgroundUploadWakeRequested { continue }
+        let sleep = Task { do { try await Task.sleep(for: interval) } catch {} }
+        self.backgroundUploadPollSleep = sleep
+        await sleep.value
       }
     }
   }
@@ -1925,8 +1959,11 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// A batch still running keeps uploading here for as long as iOS allows.
   public func sceneDidEnterBackground() {
     isSceneActive = false
+    backgroundUploadObserver.token = nil
     backgroundUploadPoll?.cancel()
     backgroundUploadPoll = nil
+    backgroundUploadPollSleep?.cancel()
+    backgroundUploadPollSleep = nil
     updateAppBusy()
   }
 
@@ -1935,20 +1972,24 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   }
 
   func reconcileBackgroundTransfers() async {
-    defer { BackgroundTaskRegistrar.scheduleProcessing(for: self) }
     if !hasLoadedAccounts, !didStart { await loadAccounts() }
     await reconcileBackgroundUploads(timeout: .seconds(8))
+    await BackgroundTaskRegistrar.scheduleProcessing(for: self)
   }
 
-  private func reconcileBackgroundUploads(timeout: Duration) async {
+  private func reconcileBackgroundUploads(timeout: Duration, ledger snapshot: BackgroundUploadLedger? = nil) async {
     guard hasLoadedAccounts, !isReconcilingBackgroundUploads, !Task.isCancelled else { return }
     isReconcilingBackgroundUploads = true
     defer { isReconcilingBackgroundUploads = false }
     var previouslyHeld = backgroundUploadWaitIDs
-    await importBackgroundUploads()
+    let ledger: BackgroundUploadLedger
+    if let snapshot { ledger = snapshot } else { ledger = await BackgroundUploads.readLedger() }
+    await importBackgroundUploads(ledger)
     previouslyHeld.formUnion(backgroundUploadWaitIDs)
-    await backgroundUploads.finishJobs(timeout: timeout)
-    await importBackgroundUploads()
+    if !ledger.jobs.isEmpty {
+      await backgroundUploads.finishJobs(timeout: timeout)
+      await importBackgroundUploads()
+    }
     guard !isStarting, isSceneActive, settings.autoSyncEnabled, !Task.isCancelled else { return }
     if accountPendingRecords.contains(where: {
       previouslyHeld.contains($0.id) && !backgroundUploadWaitIDs.contains($0.id)
@@ -1957,59 +1998,62 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     }
   }
 
-  private func importBackgroundUploads() async {
-    guard hasLoadedAccounts, credentialError == nil, !isImportingBackgroundUploads else { return }
+  private func importBackgroundUploads(_ snapshot: BackgroundUploadLedger? = nil) async {
+    guard hasLoadedAccounts, !isImportingBackgroundUploads else { return }
     isImportingBackgroundUploads = true
-    let store = BackgroundUploadLedgerStore.shared
-    defer {
-      backgroundUploadWaitIDs = store.read().heldRecordIDs
-      isImportingBackgroundUploads = false
+    defer { isImportingBackgroundUploads = false }
+    await withAccountWork(wake: ("receipts", { [weak self] in await self?.importBackgroundUploads() })) {
+      await self.recordBackgroundReceipts(snapshot)
     }
-    let results = store.read().results
-    guard !results.isEmpty else { return }
-    let emails = Set(accounts.map(\.email))
+  }
+
+  private func recordBackgroundReceipts(_ snapshot: BackgroundUploadLedger?) async {
+    let ledger: BackgroundUploadLedger
+    if let snapshot { ledger = snapshot } else { ledger = await BackgroundUploads.readLedger() }
+    backgroundUploadWaitIDs = ledger.heldRecordIDs
+    guard !ledger.results.isEmpty else { return }
     let primaryEmail = selectedAccount?.email
     let mapping =
-      results.contains { $0.accountEmail == primaryEmail && $0.role == .primary } ? await mirroredAlbumMapping() : nil
+      ledger.results.contains { $0.accountEmail == primaryEmail && $0.role == .primary } ? await mirroredAlbumMapping() : nil
+    guard !Task.isCancelled else { return }
+    let valid = ledger.results.filter { acceptsBackgroundReceipt(accountEmail: $0.accountEmail) }
+    let outcomes = await manifestStore.recordBackgroundUploads(valid)
     var settled: [BackgroundUploadResult] = []
     var keysByAlbum: [String: [String]] = [:]
-    for result in results {
-      // An account removed since has nothing to record.
-      guard emails.contains(result.accountEmail) else {
-        settled.append(result)
-        continue
-      }
-      switch await manifestStore.recordBackgroundUpload(result) {
-      case .recorded:
-        settled.append(result)
-        guard result.accountEmail == primaryEmail, result.role == .primary, let mapping else { continue }
-        for album in mapping.albumNames(forAssetIdentifier: result.assetLocalIdentifier)
-        where !(keysByAlbum[album]?.contains(result.mediaKey) ?? false) {
-          keysByAlbum[album, default: []].append(result.mediaKey)
-        }
-      case .superseded:
-        settled.append(result)
-      case .deferred:
-        break
+    for (result, outcome) in zip(valid, outcomes) {
+      guard outcome != .deferred, acceptsBackgroundReceipt(accountEmail: result.accountEmail) else { continue }
+      settled.append(result)
+      guard outcome == .recorded, result.accountEmail == primaryEmail, result.role == .primary, let mapping else { continue }
+      for album in mapping.albumNames(forAssetIdentifier: result.assetLocalIdentifier)
+      where !(keysByAlbum[album]?.contains(result.mediaKey) ?? false) {
+        keysByAlbum[album, default: []].append(result.mediaKey)
       }
     }
-    // Kept in the ledger until the manifest holds them.
-    guard await manifestStore.flush() else { return }
-    let imported = Dictionary(uniqueKeysWithValues: settled.map { ($0.recordID, $0) })
-    if !imported.isEmpty {
-      store.update { ledger in
+    // A settled receipt is durably recorded. Separately discard orphaned receipts for
+    // accounts that are already gone. The removal gate stays closed until their records are gone.
+    let configuredEmails = Set(accounts.map(\.email))
+    let discarded = ledger.results.filter { !configuredEmails.contains($0.accountEmail) }
+    let imported = Dictionary(
+      (settled + discarded).map { ($0.recordID, $0) },
+      uniquingKeysWith: { _, last in last })
+    guard !imported.isEmpty else { return }
+    backgroundUploadWaitIDs = await BackgroundUploads.withLedger {
+      let store = BackgroundUploadLedgerStore.shared
+      var held = Set<String>()
+      let saved = store.persist(notifiesAboutWork: false) { ledger in
         ledger.results.removeAll { imported[$0.recordID] == $0 }
         ledger.appWorkEpoch = UUID()
+        held = ledger.heldRecordIDs
+        return true
       }
+      return saved ? held : store.read().heldRecordIDs
     }
     BackgroundUploadLog.write("app: recorded \(settled.count) uploads made while closed")
     if let primaryEmail, !keysByAlbum.isEmpty {
-      var pending = pendingAlbumKeys?.accountEmail == primaryEmail ? pendingAlbumKeys?.keysByAlbum ?? [:] : [:]
-      pending.merge(keysByAlbum) { old, new in old + new.filter { !old.contains($0) } }
-      pendingAlbumKeys = (primaryEmail, pending)
+      addPendingAlbumKeys(keysByAlbum, accountEmail: primaryEmail)
     }
     await refreshRecords()
-    if pendingAlbumKeys != nil, !isOffline, !isWaitingForUnmeteredNetwork {
+    if !pendingAlbumKeys.isEmpty, !isOffline, !isWaitingForUnmeteredNetwork {
       Task { [weak self] in await self?.addPendingAlbums() }
     }
   }
@@ -2049,10 +2093,26 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
 
   /// Not while a batch runs: its own album step could create the same album.
   private func addPendingAlbums() async {
-    guard !isRunning, let pending = pendingAlbumKeys else { return }
-    pendingAlbumKeys = nil
-    guard pending.accountEmail == selectedAccount?.email else { return }
-    let failed = await workerPool.addToAlbums(pending.keysByAlbum, accountEmail: pending.accountEmail)
+    await withAccountWork(isPrimaryOnly: true, wake: ("albums", { [weak self] in await self?.addPendingAlbums() })) {
+      await self.applyPendingAlbums()
+    }
+  }
+
+  private func addPendingAlbumKeys(_ keysByAlbum: [String: [String]], accountEmail: String) {
+    guard !keysByAlbum.isEmpty else { return }
+    pendingAlbumKeys[accountEmail, default: [:]].merge(keysByAlbum) { old, new in old + new.filter { !old.contains($0) } }
+  }
+
+  private func applyPendingAlbums() async {
+    guard !Task.isCancelled, !isRunning, let email = selectedAccount?.email,
+      let pending = pendingAlbumKeys.removeValue(forKey: email)
+    else { return }
+    let failed = await workerPool.addToAlbums(pending, accountEmail: email)
+    if Task.isCancelled {
+      // Cut off by an account change: the albums not finished wait for this account's next pass.
+      addPendingAlbumKeys(pending.filter { failed.contains($0.key) }, accountEmail: email)
+      return
+    }
     if !failed.isEmpty {
       BackgroundUploadLog.write("app: couldn't add to \(failed.joined(separator: ", "))")
     }
@@ -2100,6 +2160,10 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     Task { [weak self] in
       await self?.accountMirror.runIdleWindow()
     }
+  }
+
+  public override func resumeCopies() {
+    if isSceneActive { checkAndRunForegroundMirror() }
   }
 
   public override func idleMirrorConditionsHold() -> Bool {
@@ -2244,6 +2308,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// backed-up folders and photo-library assets. Shared-sheet items are owned by the
   /// share queue.
   private func eligibleCleanupRecords(accountEmail: String) async -> EligibleCleanup {
+    guard !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail else { return EligibleCleanup() }
     await manifestStore.setRetention(settings.autoDeleteDelay)
     // A folder's free space is measured on its own volume, so the store's home-volume
     // "low on space" gate is applied below to everything else instead.
@@ -2262,6 +2327,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
       guard let asset = record.assetLocalIdentifier else { return true }
       return !recentlyViewed.contains(asset)
     }
+    guard !Task.isCancelled, allowsAccountWork else { return EligibleCleanup() }
     let eligible = await remoteCopyVerifier.confirmed(unused, accountEmail: accountEmail)
     let homeIsLow = settings.smartDeleteEnabled ? await manifestStore.bytesNeededToRecover() > 0 : true
     let stagedRoots = stagedSourceRoots()
@@ -2292,6 +2358,10 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// read off the main actor; with "Only When Low on Space" the plan stops once it frees
   /// enough to get back above the threshold.
   public func prepareLibraryCleanup() async -> CleanupPlan {
+    await withAccountWork { await self.planLibraryCleanup() } ?? CleanupPlan()
+  }
+
+  private func planLibraryCleanup() async -> CleanupPlan {
     guard settings.autoDeleteDelay != .never, let accountEmail = selectedAccount?.email else { return CleanupPlan() }
     let eligible = await eligibleCleanupRecords(accountEmail: accountEmail)
     let staged = eligible.staged
@@ -2312,7 +2382,9 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     if isAuthorized, !library.isEmpty {
       libraryRecords = await planLibraryRecords(library, accountEmail: accountEmail, bytesNeeded: bytesNeeded)
     }
-    guard settings.autoDeleteDelay != .never, selectedAccount?.email == accountEmail else { return CleanupPlan() }
+    guard !Task.isCancelled, allowsAccountWork, settings.autoDeleteDelay != .never, selectedAccount?.email == accountEmail else {
+      return CleanupPlan()
+    }
     return CleanupPlan(
       libraryRecords: libraryRecords,
       stagedRecords: staged,
@@ -2453,7 +2525,11 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// files through the verified file path, library assets in a single PhotoKit request
   /// so the system asks once. A declined or failed request leaves every record as it was.
   public func performCleanup(plan: CleanupPlan) async {
-    guard !isCleaningUp else { return }
+    await withAccountWork { await self.applyCleanup(plan: plan) }
+  }
+
+  private func applyCleanup(plan: CleanupPlan) async {
+    guard !Task.isCancelled, !isCleaningUp else { return }
     isCleaningUp = true
     defer { isCleaningUp = false }
     cleanupMessage = nil
@@ -2464,8 +2540,8 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     let stagedIDs = Set(current.staged.map(\.id))
     let folderIDs = Set(current.folder.map(\.id))
     let libraryIDs = Set(current.library.map(\.id))
-    let files = await removeStagedCopies(plan.stagedRecords.filter { stagedIDs.contains($0.id) })
-    let folderFiles = await removeFolderFiles(plan.folderRecords.filter { folderIDs.contains($0.id) })
+    let files = await removeStagedCopies(plan.stagedRecords.filter { stagedIDs.contains($0.id) }, accountEmail: accountEmail)
+    let folderFiles = await removeFolderFiles(plan.folderRecords.filter { folderIDs.contains($0.id) }, accountEmail: accountEmail)
     let library = await deleteLibraryAssets(
       plan.libraryRecords.filter { libraryIDs.contains($0.id) }, accountEmail: accountEmail)
     await refreshRecords()
@@ -2489,13 +2565,26 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
         cleanupMessage = String(localized: "Nothing to clean up right now.")
       }
     }
+    scheduleCleanupRekey(files.deletedRecords + folderFiles.deletedRecords + library.deletedRecords, accountEmail: accountEmail)
+  }
+
+  private func scheduleCleanupRekey(_ records: [TransferRecord], accountEmail: String) {
+    guard !records.isEmpty, canUseSelectedAccount,
+      let cloudLibrary, cloudLibrary.accountEmail == accountEmail
+    else { return }
+    LibraryIndexer.scheduleRekeyDeleted(records, cloud: cloudLibrary)
+  }
+
+  private struct FileCleanupResult {
+    var failed = 0
+    var deletedRecords: [TransferRecord] = []
+    var removed: Int { deletedRecords.count }
   }
 
   /// Staged copies are the app's own files, so they need no prompt.
-  private func removeStagedCopies(_ records: [TransferRecord]) async -> (removed: Int, failed: Int) {
-    guard !records.isEmpty else { return (0, 0) }
-    var removed = 0
-    var failed = 0
+  private func removeStagedCopies(_ records: [TransferRecord], accountEmail: String) async -> FileCleanupResult {
+    guard !records.isEmpty else { return FileCleanupResult() }
+    var result = FileCleanupResult()
     let roots = stagedSourceRoots()
     let files = await Task.detached(priority: .utility) { () -> [(id: String, url: URL)] in
       records.compactMap { record in
@@ -2508,27 +2597,37 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     }.value
     let recordsByID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     for file in files {
+      guard !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail else { break }
       guard await manifestStore.claimForDeletion(id: file.id) else { continue }
       if let record = recordsByID[file.id] { await KeptThumbnails.keep(record, fileURL: file.url) }
+      guard !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail else {
+        await manifestStore.releaseDeletionClaim(id: file.id)
+        break
+      }
       if await manifestStore.deleteSourceFiles(id: file.id, fileURL: file.url) {
-        removed += 1
         DeletionFailureBackoff.clear(file.id)
+        if let record = recordsByID[file.id] { result.deletedRecords.append(record) }
       } else {
-        failed += 1
+        result.failed += 1
         DeletionFailureBackoff.recordFailure(file.id)
       }
     }
-    return (removed, failed)
+    return result
   }
 
   private enum LibraryDeletion {
-    case removed(Int)
+    case removed(count: Int, records: [TransferRecord])
     case cancelled
     case failed(String)
 
     var removedCount: Int {
-      if case .removed(let count) = self { return count }
+      if case .removed(let count, _) = self { return count }
       return 0
+    }
+
+    var deletedRecords: [TransferRecord] {
+      if case .removed(_, let records) = self { return records }
+      return []
     }
   }
 
@@ -2542,14 +2641,15 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     var claimed: [TransferRecord] = []
     for record in records
     where record.id.hasPrefix(prefix) && record.sourcePath == nil && record.assetLocalIdentifier != nil {
+      guard !Task.isCancelled, allowsAccountWork else { break }
       if await manifestStore.claimForDeletion(id: record.id) { claimed.append(record) }
     }
-    guard !claimed.isEmpty else { return .removed(0) }
+    guard !claimed.isEmpty else { return .removed(count: 0, records: []) }
 
     let snapshot = await readLibrarySnapshot(for: claimed, accountEmail: accountEmail)
     let confirmed = planLibraryRecords(claimed, snapshot: snapshot, bytesNeeded: nil).map(\.id)
     var markedIDs = Set<String>()
-    if selectedAccount?.email == accountEmail {
+    if !Task.isCancelled, allowsAccountWork, selectedAccount?.email == accountEmail {
       markedIDs = await manifestStore.markDeleted(ids: confirmed)
     }
     // A record the store refused to mark takes its whole asset, and burst, back out.
@@ -2567,7 +2667,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
       await manifestStore.releaseDeletionClaim(id: record.id)
     }
     let marked = claimed.filter { markedIDs.contains($0.id) }
-    guard !marked.isEmpty else { return .removed(0) }
+    guard !marked.isEmpty else { return .removed(count: 0, records: []) }
 
     // An asset's primary and RAW records name it once.
     var seen = Set<String>()
@@ -2575,6 +2675,8 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     // The library keeps showing these from Google Photos with a thumbnail kept here.
     await KeptThumbnails.keepAll(marked, accountEmail: accountEmail)
     do {
+      try Task.checkCancellation()
+      guard allowsAccountWork, selectedAccount?.email == accountEmail else { throw CancellationError() }
       try await Self.removeFromPhotoLibrary(identifiers)
     } catch {
       // A second failure is left for the launch reconcile, which sees the asset still
@@ -2588,14 +2690,14 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
       }
       let nsError = error as NSError
       let declined =
-        (nsError.domain == PHPhotosErrorDomain && nsError.code == PHPhotosError.userCancelled.rawValue)
+        error is CancellationError || (nsError.domain == PHPhotosErrorDomain && nsError.code == PHPhotosError.userCancelled.rawValue)
         || (nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError)
       return declined ? .cancelled : .failed(error.localizedDescription)
     }
     for record in marked {
       await manifestStore.releaseDeletionClaim(id: record.id)
     }
-    return .removed(identifiers.count)
+    return .removed(count: identifiers.count, records: marked)
   }
 
   /// Formed off the main actor: PhotoKit runs the change block on its own queue.
@@ -2616,17 +2718,28 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// library is the expensive part, so it runs at most hourly and only when the set of
   /// eligible records changed, unless the quiet period has passed since the last plan.
   public func runCleanupMaintenance() async {
+    await withAccountWork(wake: ("cleanup", { [weak self] in await self?.runCleanupMaintenance() })) {
+      await self.applyCleanupMaintenance()
+    }
+  }
+
+  private func applyCleanupMaintenance() async {
     guard !isRunningCleanupMaintenance, !isCleaningUp, !isRunning, !Task.isCancelled,
       settings.autoDeleteDelay != .never, let accountEmail = selectedAccount?.email
     else { return }
     isRunningCleanupMaintenance = true
-    defer { isRunningCleanupMaintenance = false }
+    var deletedRecords: [TransferRecord] = []
+    defer {
+      isRunningCleanupMaintenance = false
+      scheduleCleanupRekey(deletedRecords, accountEmail: accountEmail)
+    }
 
     await recoverDeletionTombstones()
     let eligible = await eligibleCleanupRecords(accountEmail: accountEmail)
     if !eligible.staged.isEmpty || !eligible.folder.isEmpty {
-      _ = await removeStagedCopies(eligible.staged)
-      _ = await removeFolderFiles(eligible.folder)
+      let staged = await removeStagedCopies(eligible.staged, accountEmail: accountEmail)
+      let folders = await removeFolderFiles(eligible.folder, accountEmail: accountEmail)
+      deletedRecords = staged.deletedRecords + folders.deletedRecords
       await refreshRecords()
     }
     let library = eligible.library
@@ -2989,9 +3102,9 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
 
   /// Background passes, foreground activation and folder changes. Sync Now calls
   /// `syncFolders()` directly, so it also scans while auto-sync is off.
-  private func syncFoldersAutomatically() async {
+  private func syncFoldersAutomatically(using foregroundRead: FolderMediaScanner.ForegroundRead? = nil) async {
     guard !stopRequested, settings.autoSyncEnabled else { return }
-    await syncFolders()
+    await syncFolders(using: foregroundRead)
   }
 
   private func resumeRequestedFolderScan() async {
@@ -3004,8 +3117,15 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// Scans every enabled folder off the main actor and queues what isn't backed up yet,
   /// with the same identity rules as the Mac's watched folders. The scan's folder scopes
   /// are handed to the upload batch, which reads the files in place.
-  public func syncFolders(resumingOnly: Bool = false) async {
-    guard !stopRequested, !Task.isCancelled, let account = selectedAccount else { return }
+  public func syncFolders(
+    resumingOnly: Bool = false, using foregroundRead: FolderMediaScanner.ForegroundRead? = nil
+  ) async {
+    let wake: AccountWake = (
+      resumingOnly ? "folderResume" : "folderScan",
+      { [weak self] in await self?.syncFolders(resumingOnly: resumingOnly) }
+    )
+    guard !replaysAfterAccountChange(wake) else { return }
+    guard canUseSelectedAccount, !stopRequested, !Task.isCancelled, let account = selectedAccount else { return }
     let enabled = backedUpFolders.filter(\.isEnabled)
     guard !enabled.isEmpty else { return }
     // A resume never asks for a full scan: that would find new files with Auto-Sync off, and
@@ -3016,8 +3136,13 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     }
     isScanningFolders = true
     folderRescanRequested = false
+    let generation = accountGeneration
+    let folderGeneration = self.folderGeneration
     defer {
       isScanningFolders = false
+      if !stopRequested {
+        replayInterruptedFolderScan(accountEmail: account.email, generation: generation, wake: wake)
+      }
       // A request made while the pool is busy is resumed when its batch completes.
       if folderRescanRequested, !stopRequested, !workerPool.isRunning, !workerPool.isBatchFinalizing {
         folderRescanRequested = false
@@ -3026,12 +3151,11 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
         }
       }
     }
-    let generation = accountGeneration
-    let folderGeneration = self.folderGeneration
     let exclusions = settings.folderExclusions
     let scanTask = Task.detached(priority: .utility) { () -> FolderScanResult in
       let accesses = FolderBackup.beginAccess(enabled)
-      return FolderScanResult(accesses: accesses, media: FolderBackup.collectMedia(in: accesses, excluding: exclusions))
+      let media = await FolderBackup.collectMedia(in: accesses, excluding: exclusions, using: foregroundRead)
+      return FolderScanResult(accesses: accesses, media: media)
     }
     // A detached task does not inherit cancellation. Cancelled, it still returns the
     // accesses it took, so every one of them is ended below.
@@ -3043,12 +3167,12 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     var heldAccesses = scan.accesses
     defer { FolderBackup.endAccess(heldAccesses) }
     applyFolderAccesses(scan.accesses)
-    guard !stopRequested, !Task.isCancelled,
-      accountGeneration == generation,
-      self.folderGeneration == folderGeneration,
-      selectedAccount?.email == account.email
+    guard canUseSelectedAccount, !stopRequested, !Task.isCancelled, accountGeneration == generation,
+      self.folderGeneration == folderGeneration, selectedAccount?.email == account.email
     else {
-      if !stopRequested, selectedAccount != nil, !resumingOnly { folderRescanRequested = true }
+      if !stopRequested, self.folderGeneration != folderGeneration, !resumingOnly {
+        folderRescanRequested = true
+      }
       return
     }
     if scan.media.deferredRecentWrites, !resumingOnly {
@@ -3115,7 +3239,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     resumingOnly: Bool = false
   ) async -> Bool {
     func isCurrent() -> Bool {
-      !stopRequested && !Task.isCancelled && accountGeneration == generation
+      canUseSelectedAccount && !stopRequested && !Task.isCancelled && accountGeneration == generation
         && self.folderGeneration == folderGeneration && selectedAccount?.email == accountEmail
     }
     let currentRecords = await manifestStore.allRecords()
@@ -3124,6 +3248,11 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     let createAlbumsFromFolders = settings.createAlbumsFromFolders
     let retriesFailedNow = retriesFolderFailuresNow
     retriesFolderFailuresNow = false
+    defer {
+      if retriesFailedNow, !stopRequested, shouldReplayFolderScan(accountEmail: accountEmail, generation: generation) {
+        retriesFolderFailuresNow = true
+      }
+    }
     // Matching a whole folder tree against the manifest and pairing Live Photos (which
     // stats every candidate) must not block the main actor.
     let plan = await Task.detached(priority: .utility) {
@@ -3145,6 +3274,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
     } else {
       guard await manifestStore.upsertBatch(plan.newRecords) else { return false }
     }
+    guard isCurrent() else { return false }
     let claimedIDs = await manifestStore.claimForUpload(ids: planned.map(\.id))
     let claimedItems = planned.filter { claimedIDs.contains($0.id) }
     await refreshRecords()
@@ -3224,16 +3354,16 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
   /// plan was checked off the main actor and the store re-verifies each file, so nothing
   /// here stats one. The pass stops if the folders or protected folders change
   /// underneath it.
-  private func removeFolderFiles(_ records: [TransferRecord]) async -> (removed: Int, failed: Int) {
+  private func removeFolderFiles(_ records: [TransferRecord], accountEmail: String) async -> FileCleanupResult {
     let folderGeneration = self.folderGeneration
     let pass = await openFolderCleanup(records)
     defer { FolderBackup.endAccess(pass.accesses) }
     func planStillHolds() -> Bool {
-      !Task.isCancelled && settings.autoDeleteDelay != .never && settings.ignoredFolders == pass.ignoredFolders
+      !Task.isCancelled && allowsAccountWork && selectedAccount?.email == accountEmail
+        && settings.autoDeleteDelay != .never && settings.ignoredFolders == pass.ignoredFolders
         && self.folderGeneration == folderGeneration
     }
-    var removed = 0
-    var failed = 0
+    var result = FileCleanupResult()
     for item in pass.items {
       guard planStillHolds() else { break }
       let id = item.record.id
@@ -3244,15 +3374,24 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
         break
       }
       await KeptThumbnails.keep(item.record, fileURL: item.fileURL)
-      if await manifestStore.deleteSourceFiles(id: id, fileURL: item.fileURL, pairedFileURL: item.pairedFileURL) {
-        removed += 1
+      let current = settings
+      let isDue = await manifestStore.isStillDue(id: id, settings: current, accountEmail: accountEmail, accounts: accounts)
+      guard isDue, settings == current, planStillHolds() else {
+        await manifestStore.releaseDeletionClaim(id: id)
+        break
+      }
+      let policy = cleanupPolicy.current
+      if await manifestStore.deleteSourceFiles(
+        id: id, fileURL: item.fileURL, pairedFileURL: item.pairedFileURL, mayRemove: cleanupPolicy.check(root: item.root))
+      {
         DeletionFailureBackoff.clear(id)
-      } else {
-        failed += 1
+        result.deletedRecords.append(item.record)
+      } else if cleanupPolicy.current == policy {
+        result.failed += 1
         DeletionFailureBackoff.recordFailure(id)
       }
     }
-    return (removed, failed)
+    return result
   }
 }
 

@@ -8,13 +8,52 @@
   /// Connects the pager, the filmstrip and the scrub preview without going through
   /// SwiftUI state, which would re-render the viewer on every frame of a swipe or scrub.
   @MainActor
+  @Observable
   final class FilmstripLink {
-    fileprivate weak var strip: FilmstripView?
-    fileprivate weak var preview: ScrubPreviewView?
+    @ObservationIgnored fileprivate weak var strip: FilmstripView?
+    @ObservationIgnored fileprivate weak var preview: ScrubPreviewView?
+    @ObservationIgnored fileprivate var readyID: String?
+    /// The item under the strip's middle during a scrub, for the title only.
+    private(set) var scrubbedIndex: Int?
+    private(set) var isMoving = false
+    @ObservationIgnored private var lastTitleTime: CFTimeInterval = 0
+    @ObservationIgnored private var pendingTitle: Task<Void, Never>?
+
+    fileprivate func scrubbed(to index: Int?) {
+      if isMoving != (index != nil) { isMoving = index != nil }
+      pendingTitle?.cancel()
+      pendingTitle = nil
+      let now = CACurrentMediaTime()
+      // A few times a second reads as live and leaves the frames to the strip.
+      if index != nil, now - lastTitleTime < 0.1 {
+        pendingTitle = Task { [weak self] in
+          try? await Task.sleep(for: .milliseconds(100))
+          if !Task.isCancelled { self?.scrubbed(to: index) }
+        }
+        return
+      }
+      lastTitleTime = now
+      if scrubbedIndex != index { scrubbedIndex = index }
+    }
+
+    var isScrubbing: Bool { strip?.isScrubbing == true || strip?.isTracking == true }
+
+    func pageImageReady(_ id: String) {
+      readyID = id
+      preview?.pageImageReady(id)
+    }
+
+    func handoffImage(for id: String) -> CGImage? { preview?.handoffImage(for: id) }
+
+    /// A swipe on the photo takes over from a strip still coming to rest.
+    func pagerTouched() { strip?.interruptFling() }
 
     /// The pager's position in items while the user swipes (2.4 is 40% of the way from
     /// the third photo to the fourth): the strip moves with the finger, as in Photos.
-    func pagerMoved(to position: CGFloat) { strip?.follow(position) }
+    func pagerMoved(to position: CGFloat) {
+      if !isScrubbing, position != position.rounded(), preview?.isWaitingForPage == true { preview?.reset() }
+      strip?.follow(position)
+    }
 
     #if DEBUG
       func runStress(seconds: TimeInterval) { strip?.runStress(seconds: seconds) }
@@ -56,7 +95,12 @@
 
   final class FilmstripView: UIScrollView, UIScrollViewDelegate {
     weak var source: (any MediaViewerSource)? {
-      didSet { reload() }
+      didSet {
+        endScrub()
+        reload()
+        link?.preview?.reset()
+        link?.readyID = nil
+      }
     }
     weak var link: FilmstripLink?
     var onScrub: (Int) -> Void = { _ in }
@@ -72,9 +116,13 @@
     private var count = 0
     private var thumbnailRevision = 0
     private var shownIndex = -1
+    private var committedIndex = -1
     private var slices: [Int: Slice] = [:]
     private var pool: [Slice] = []
-    private var isScrubbing: Bool { isTracking || isDragging || isDecelerating || isStressing }
+    private var landing: [ThumbnailTicket] = []
+    fileprivate var isScrubbing: Bool { trackingScrub || isStressing }
+    private var trackingScrub = false
+    private var adjustingInset = false
     private var isStressing = false
 
     #if DEBUG
@@ -82,6 +130,8 @@
       /// finger, and logs frame times (`-UIScreen cloudFilmstripStress`).
       func runStress(seconds: TimeInterval) {
         isStressing = true
+        trackingScrub = true
+        link?.preview?.startStress()
         _ = ScrollStress(name: "filmstrip", seconds: seconds) { [weak self] frame in
           guard let self else { return }
           self.contentOffset.x += self.pitch * 25 * frame
@@ -97,8 +147,10 @@
     private let feedback = UISelectionFeedbackGenerator()
 
     private final class Slice: CALayer {
-      var itemID: String?
+      var identity: ThumbnailIdentity?
       var ticket: ThumbnailTicket?
+      var needsUpgrade = false
+      var image: CGImage?
 
       override init() {
         super.init()
@@ -112,14 +164,14 @@
       }
 
       func setImage(_ image: CGImage?) {
+        self.image = image
         contents = image
         cropContents()
       }
 
       /// Fills the slice with the middle of the image, as aspect-fill would.
       func cropContents() {
-        guard let contents, CFGetTypeID(contents as CFTypeRef) == CGImage.typeID, bounds.height > 0 else { return }
-        let image = contents as! CGImage
+        guard let image, bounds.height > 0 else { return }
         let imageRatio = CGFloat(image.width) / CGFloat(max(image.height, 1))
         let sliceRatio = bounds.width / bounds.height
         contentsRect =
@@ -141,7 +193,7 @@
       // The centering inset is the only one; a landscape safe area mustn't add to it.
       contentInsetAdjustmentBehavior = .never
       alwaysBounceHorizontal = true
-      decelerationRate = .fast
+      decelerationRate = .normal
       clipsToBounds = false
       addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTap(_:))))
       isAccessibilityElement = true
@@ -154,29 +206,48 @@
     override var intrinsicContentSize: CGSize { CGSize(width: UIView.noIntrinsicMetric, height: Self.height) }
 
     func tearDown() {
-      for (_, slice) in slices { slice.ticket?.cancel() }
+      endScrub()
+      reload()
+      link?.preview?.reset()
     }
 
     /// Follows the viewer's page, unless the user is moving the strip.
     func show(_ index: Int, count: Int, thumbnailRevision: Int) {
-      if count != self.count {
-        self.count = count
-        // The last slice's own width too, so the last photo can come to the middle.
-        contentSize = CGSize(width: CGFloat(max(count - 1, 0)) * pitch + Self.sliceWidth, height: Self.height)
-        reload()
-      }
+      committedIndex = index
       if thumbnailRevision != self.thumbnailRevision {
-        self.thumbnailRevision = thumbnailRevision
-        reload()
+        cancelLanding()
+        link?.preview?.invalidateRequest()
       }
-      guard index != shownIndex, !isScrubbing else { return }
-      shownIndex = index
-      let target = offset(for: index)
-      // After a swipe the strip has followed the finger and is nearly there already.
-      let near = abs(contentOffset.x - target) < pitch * 0.75
-      let animated = !near && window != nil && !UIAccessibility.isReduceMotionEnabled
-      setContentOffset(CGPoint(x: target, y: 0), animated: animated)
-      if !animated { layoutSlices() }
+      if count != self.count {
+        cancelLanding()
+        self.count = count
+        contentSize = CGSize(width: CGFloat(max(count - 1, 0)) * pitch + Self.sliceWidth, height: Self.height)
+      }
+      if let source {
+        for (position, slice) in slices {
+          if position >= count || slice.identity != source.thumbnailIdentity(at: position) {
+            slices[position] = nil
+            recycle(slice)
+          } else if thumbnailRevision != self.thumbnailRevision {
+            requestImage(for: slice, source: source.thumbnailSource, fast: isScrubbing)
+          }
+        }
+      }
+      self.thumbnailRevision = thumbnailRevision
+      if isScrubbing {
+        layoutSlices()
+        showPreview(at: centeredIndex, dwell: true)
+        return
+      }
+      if index != shownIndex {
+        shownIndex = index
+        let target = offset(for: index)
+        // After a swipe the strip has followed the finger and is nearly there already.
+        let near = abs(contentOffset.x - target) < pitch * 0.75
+        let animated = !near && window != nil && !UIAccessibility.isReduceMotionEnabled
+        setContentOffset(CGPoint(x: target, y: 0), animated: animated)
+      }
+      layoutSlices()
     }
 
     /// Tracks a swipe between photos.
@@ -201,8 +272,15 @@
       super.layoutSubviews()
       let inset = bounds.width / 2 - Self.sliceWidth / 2
       if contentInset.left != inset {
+        let position = (contentOffset.x + contentInset.left) / pitch
+        adjustingInset = true
         contentInset = UIEdgeInsets(top: 0, left: inset, bottom: 0, right: inset)
-        if shownIndex >= 0 { contentOffset.x = offset(for: shownIndex) }
+        if isScrubbing {
+          contentOffset.x = position * pitch - inset
+        } else if shownIndex >= 0 {
+          contentOffset.x = offset(for: shownIndex)
+        }
+        adjustingInset = false
       }
       if bounds.size != laidOutSize || slices.isEmpty {
         laidOutSize = bounds.size
@@ -211,23 +289,26 @@
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+      guard !adjustingInset else { return }
       layoutSlices()
-      guard isScrubbing, count > 0, let source else { return }
+      guard isScrubbing, count > 0 else { return }
       let index = centeredIndex
       guard index != shownIndex else { return }
       shownIndex = index
-      // A tick per photo while scrubbing slowly; a fling would only buzz.
-      if abs(panGestureRecognizer.velocity(in: self).x) < 600 {
+      if isDragging, abs(panGestureRecognizer.velocity(in: self).x) < 600 {
         feedback.selectionChanged()
         feedback.prepare()
       }
-      // The photo under the strip shows from cached images on every step; the viewer's
-      // page (screen-sized image, zoom, Live Text) is built once, where the scrub stops.
-      link?.preview?.show(
-        id: source.itemID(at: index), source: source.thumbnailSource)
+      showPreview(at: index, dwell: true)
+      link?.scrubbed(to: index)
     }
 
-    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) { feedback.prepare() }
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+      trackingScrub = true
+      cancelLanding()
+      link?.preview?.resumeScrub()
+      feedback.prepare()
+    }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
       if !decelerate { finishScrub() }
@@ -236,8 +317,37 @@
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) { finishScrub() }
 
     private func finishScrub() {
-      onScrub(centeredIndex)
-      link?.preview?.hideSoon()
+      guard trackingScrub else { return }
+      trackingScrub = false
+      guard count > 0 else { return endScrub() }
+      commit(centeredIndex, animated: false)
+    }
+
+    private func showPreview(at index: Int, dwell: Bool) {
+      guard let source, index >= 0, index < count else { return }
+      let pixels = source.aspectRatio(at: index).map { CGSize(width: $0, height: 1) } ?? .zero
+      link?.preview?.show(
+        identity: slices[index]?.identity ?? source.thumbnailIdentity(at: index), pixels: pixels, slice: slices[index]?.image,
+        source: source.thumbnailSource, dwell: dwell, onDwell: { [weak self] in self?.upgradeSlices() })
+    }
+
+    private func commit(_ index: Int, animated: Bool) {
+      trackingScrub = false
+      shownIndex = index
+      setContentOffset(CGPoint(x: offset(for: index), y: 0), animated: animated)
+      layoutSlices()
+      upgradeSlices()
+      showPreview(at: index, dwell: false)
+      cancelLanding(keeping: source?.thumbnailIdentity(at: index).id)
+      defer { link?.scrubbed(to: nil) }
+      guard let link, let source else {
+        onScrub(index)
+        return
+      }
+      let id = source.itemID(at: index)
+      link.preview?.commit(id: id, alreadyReady: committedIndex == index && link.readyID == id)
+      if link.readyID != id { link.readyID = nil }
+      onScrub(index)
     }
 
     func scrollViewWillEndDragging(
@@ -247,6 +357,57 @@
       let position = (targetContentOffset.pointee.x + contentInset.left) / pitch
       let index = min(max(Int(position.rounded()), 0), max(count - 1, 0))
       targetContentOffset.pointee.x = offset(for: index)
+      if index != centeredIndex { prepareLanding(at: index) }
+    }
+
+    /// Loads what the fling will stop on while it's still moving, nearest the middle first.
+    private func prepareLanding(at index: Int) {
+      cancelLanding()
+      guard let source, count > 0, bounds.width > 0 else { return }
+      let reach = Int((bounds.width / 2 / pitch).rounded(.up))
+      let thumbnails = source.thumbnailSource
+      if let pixels = source.aspectRatio(at: index) {
+        link?.preview?.prepare(
+          identity: source.thumbnailIdentity(at: index), pixels: CGSize(width: pixels, height: 1), source: thumbnails)
+      }
+      for distance in 0...reach {
+        for position in Set([index - distance, index + distance]) where position >= 0 && position < count {
+          let identity = source.thumbnailIdentity(at: position)
+          guard !identity.isLocked else { continue }
+          landing.append(
+            ThumbnailPipeline.shared.load(
+              ThumbnailKey(identity: identity, bucket: .small), from: thumbnails, quality: .thumbnail
+            ) { [weak self] image, isFinal in
+              guard let self else { return }
+              if let slice = self.slices[position], slice.identity == identity,
+                ViewerImage.accepts(image, over: slice.image, isFinal: isFinal)
+              {
+                slice.setImage(image)
+              }
+              self.link?.preview?.receive(image, identity: identity, isFinal: isFinal, isWhole: false)
+            })
+        }
+      }
+    }
+
+    private func cancelLanding(keeping id: String? = nil) {
+      for ticket in landing { ticket.cancel() }
+      landing = []
+      link?.preview?.cancelLanding(keeping: id)
+    }
+
+    fileprivate func interruptFling() {
+      guard trackingScrub, !isTracking else { return }
+      endScrub()
+      setContentOffset(contentOffset, animated: false)
+      link?.preview?.reset()
+    }
+
+    /// The strip went away or lost its items mid-scrub: the viewer's actions come back.
+    private func endScrub() {
+      cancelLanding()
+      trackingScrub = false
+      link?.scrubbed(to: nil)
     }
 
     private var centeredIndex: Int {
@@ -266,17 +427,13 @@
     private func step(_ delta: Int) {
       let index = min(max(shownIndex + delta, 0), max(count - 1, 0))
       guard index != shownIndex else { return }
-      shownIndex = index
-      setContentOffset(CGPoint(x: offset(for: index), y: 0), animated: !UIAccessibility.isReduceMotionEnabled)
-      onScrub(index)
+      commit(index, animated: !UIAccessibility.isReduceMotionEnabled)
     }
 
     @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
       let x = recognizer.location(in: self).x
       guard let (index, _) = slices.min(by: { abs($0.value.frame.midX - x) < abs($1.value.frame.midX - x) }) else { return }
-      shownIndex = index
-      setContentOffset(CGPoint(x: offset(for: index), y: 0), animated: !UIAccessibility.isReduceMotionEnabled)
-      onScrub(index)
+      commit(index, animated: !UIAccessibility.isReduceMotionEnabled)
     }
 
     /// Slices are laid out on a regular pitch; the one nearest the middle opens to its
@@ -328,30 +485,45 @@
       let slice = pool.popLast() ?? Slice()
       if slice.superlayer == nil { layer.addSublayer(slice) }
       slice.isHidden = false
-      let id = source.itemID(at: index)
-      slice.itemID = id
-      // Sharp enough for the opened slice; a fling only takes what's quick.
-      let key = ThumbnailKey(id: id, bucket: .small)
-      let cached = ThumbnailPipeline.shared.placeholder(for: key)
+      let identity = source.thumbnailIdentity(at: index)
+      slice.identity = identity
+      let key = ThumbnailKey(identity: identity, bucket: .huge)
+      let cache = ThumbnailPipeline.shared
+      let cached = cache.placeholder(for: key) ?? cache.viewerPreview(for: identity)
       slice.setImage(cached)
-      // Anything already in memory that's big enough will do: a scrub passing hundreds of
-      // photos mustn't start a request (for Google items, a download) for each.
-      if (cached?.width ?? 0) < 96 {
-        let fast = abs(panGestureRecognizer.velocity(in: self).x) > 2500
-        slice.ticket = ThumbnailPipeline.shared.load(key, from: source.thumbnailSource, quality: fast ? .fast : .thumbnail) {
-          [weak slice] image, _ in
-          guard let slice, slice.itemID == id else { return }
-          slice.setImage(image)
-        }
+      if ViewerImage.longSide(cached) < 96 {
+        requestImage(for: slice, source: source.thumbnailSource, fast: isScrubbing)
       }
       return slice
+    }
+
+    private func upgradeSlices() {
+      guard let source else { return }
+      for slice in slices.values where slice.needsUpgrade {
+        requestImage(for: slice, source: source.thumbnailSource, fast: false)
+      }
+    }
+
+    private func requestImage(for slice: Slice, source: any ThumbnailSource, fast: Bool) {
+      guard let identity = slice.identity else { return }
+      slice.ticket?.cancel()
+      slice.needsUpgrade = fast
+      // During a scrub, a newly exposed Google item only checks the cache.
+      let key = ThumbnailKey(identity: identity, bucket: fast ? .tiny : .small)
+      slice.ticket = ThumbnailPipeline.shared.load(key, from: source, quality: fast ? .fast : .thumbnail) {
+        [weak self, weak slice] image, isFinal in
+        guard let slice, slice.identity == identity, ViewerImage.accepts(image, over: slice.image, isFinal: isFinal) else { return }
+        slice.setImage(image)
+        self?.link?.preview?.receive(image, identity: identity, isFinal: isFinal, isWhole: false)
+      }
     }
 
     private func recycle(_ slice: Slice) {
       slice.ticket?.cancel()
       slice.ticket = nil
-      slice.itemID = nil
-      slice.contents = nil
+      slice.identity = nil
+      slice.setImage(nil)
+      slice.needsUpgrade = false
       slice.isHidden = true
       pool.append(slice)
     }
@@ -372,10 +544,31 @@
 
   final class ScrubPreviewView: UIView {
     private let imageLayer = CALayer()
-    private var shownID: String?
-    private var token: ImageRequestToken?
+    private var target: ThumbnailIdentity?
+    private var imageIdentity: ThumbnailIdentity?
+    private var image: CGImage?
+    private var isWhole = false
+    private var pixels: CGSize = .zero
+    private var imagePixels: CGSize = .zero
+    private var token: ThumbnailTicket?
+    private var landingToken: ThumbnailTicket?
+    private var landingID: String?
     private var detailTask: Task<Void, Never>?
     private var hideTask: Task<Void, Never>?
+    private var committedID: String?
+    var isWaitingForPage: Bool { committedID != nil }
+    #if DEBUG
+      private var stressHits = 0
+      private var stressMisses = 0
+      private var stressRunning = false
+      private var stressCommitTime: CFTimeInterval?
+
+      func startStress() {
+        stressHits = 0
+        stressMisses = 0
+        stressRunning = true
+      }
+    #endif
 
     override init(frame: CGRect) {
       super.init(frame: frame)
@@ -383,7 +576,8 @@
       isHidden = true
       backgroundColor = .systemBackground
       imageLayer.contentsGravity = .resizeAspect
-      imageLayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
+      imageLayer.masksToBounds = true
+      imageLayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull(), "contentsGravity": NSNull()]
       layer.addSublayer(imageLayer)
     }
 
@@ -391,54 +585,180 @@
 
     override func layoutSubviews() {
       super.layoutSubviews()
-      imageLayer.frame = bounds
+      layoutImage()
     }
 
-    func show(id: String, source: any ThumbnailSource) {
+    private func layoutImage() {
+      guard let image else { return }
+      let cropped = !isWhole && !ViewerImage.matchesAspect(image, imagePixels)
+      let size = AspectFit.size(for: cropped ? imagePixels : ViewerImage.size(image), in: bounds.size)
+      imageLayer.frame = CGRect(
+        x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2,
+        width: size.width, height: size.height)
+      // Filling a very long shape with a square crop would blow it up.
+      let shape = imagePixels.width > 0 && imagePixels.height > 0 ? imagePixels.width / imagePixels.height : 1
+      imageLayer.contentsGravity = cropped && max(shape, 1 / shape) < 2 ? .resizeAspectFill : .resizeAspect
+    }
+
+    func invalidateRequest() { reset() }
+
+    func cancelLanding(keeping id: String? = nil) {
+      guard id == nil || id != landingID else { return }
+      landingToken?.cancel()
+      landingToken = nil
+      landingID = nil
+    }
+
+    /// The photo a fling will stop on, loaded on the way there.
+    func prepare(identity: ThumbnailIdentity, pixels: CGSize, source: any ThumbnailSource) {
+      cancelLanding()
+      guard !identity.isLocked else { return }
+      let scale = traitCollection.displayScale
+      let target = Self.dwellPixels(pixels, in: CGSize(width: bounds.width * scale, height: bounds.height * scale))
+      let isFile = FolderItemInfo.path(fromID: identity.id) != nil
+      guard target != .zero, !ViewerImage.hasFittedPreview(for: identity, target: target, isFile: isFile) else { return }
+      landingID = identity.id
+      landingToken = ViewerImage.request(source, identity: identity, pixels: target, isFile: isFile) { [weak self] image, isFinal in
+        self?.receive(image, identity: identity, isFinal: isFinal, isWhole: true)
+      }
+    }
+
+    func resumeScrub() {
       hideTask?.cancel()
-      alpha = 1
-      guard id != shownID else { return }
-      shownID = id
-      token?.cancel()
-      let preview = ThumbnailPipeline.shared.viewerPreview(for: id)
-      imageLayer.contents = preview
-      isHidden = preview == nil
-      // Only for a photo the scrub rests on: passing photos would each start a download.
+      committedID = nil
+    }
+
+    func show(
+      identity: ThumbnailIdentity, pixels: CGSize, slice: CGImage?, source: any ThumbnailSource,
+      dwell: Bool, onDwell: @escaping () -> Void
+    ) {
+      guard identity != target else { return }
+      resumeScrub()
+      target = identity
+      self.pixels = pixels
       detailTask?.cancel()
-      detailTask = Task { @MainActor [weak self] in
+      token?.cancel()
+      token = nil
+
+      if imageIdentity?.isLocked == true || identity.isLocked {
+        reset()
+        return
+      }
+      let pipeline = ThumbnailPipeline.shared
+      let whole = pipeline.viewerPreview(for: identity)
+      let cached = ViewerImage.preview(
+        whole: whole, thumbnail: whole == nil ? pipeline.placeholder(for: ThumbnailKey(identity: identity, bucket: .huge)) : nil,
+        slice: slice, pixels: pixels)
+      #if DEBUG
+        if stressRunning {
+          if cached == nil { stressMisses += 1 } else { stressHits += 1 }
+        }
+      #endif
+      if let cached {
+        receive(cached, identity: identity, isFinal: true, isWhole: whole != nil)
+      }
+      guard dwell else { return }
+      // A pause can sharpen; crossing an item does not download its display image.
+      detailTask = Task { [weak self] in
         try? await Task.sleep(for: .milliseconds(120))
-        guard let self, !Task.isCancelled, self.shownID == id else { return }
-        let scale = self.window?.screen.scale ?? 3
-        let pixels = CGSize(width: self.bounds.width * scale, height: self.bounds.height * scale)
-        self.token = source.requestImage(id: id, pixelSize: pixels, quality: .display) { [weak self] image, _ in
-          Task { @MainActor in
-            guard let self, self.shownID == id else { return }
-            ThumbnailPipeline.shared.rememberViewerPreview(image, for: id)
-            self.imageLayer.contents = image
-            self.isHidden = false
-          }
+        guard let self, !Task.isCancelled, self.target == identity else { return }
+        onDwell()
+        let scale = self.traitCollection.displayScale
+        let container = CGSize(width: self.bounds.width * scale, height: self.bounds.height * scale)
+        let target = Self.dwellPixels(pixels, in: container)
+        let isFile = FolderItemInfo.path(fromID: identity.id) != nil
+        guard target != .zero, !ViewerImage.hasFittedPreview(for: identity, target: target, isFile: isFile) else { return }
+        self.token = ViewerImage.request(source, identity: identity, pixels: target, isFile: isFile) { [weak self] image, isFinal in
+          self?.receive(image, identity: identity, isFinal: isFinal, isWhole: true)
         }
       }
     }
 
-    /// Once the scrub stops the real page takes over; the preview fades after it has drawn.
-    func hideSoon() {
-      hideTask?.cancel()
-      hideTask = Task { @MainActor [weak self] in
-        try? await Task.sleep(for: .milliseconds(120))
-        guard let self, !Task.isCancelled else { return }
-        UIView.animate(withDuration: UIAccessibility.isReduceMotionEnabled ? 0 : 0.15) {
-          self.alpha = 0
-        } completion: { _ in
-          // Shown again meanwhile.
-          guard self.alpha == 0 else { return }
-          self.isHidden = true
-          self.shownID = nil
-          self.token?.cancel()
-          self.imageLayer.contents = nil
+    static func dwellPixels(_ pixels: CGSize, in container: CGSize) -> CGSize {
+      guard pixels.width > 0, pixels.height > 0 else {
+        let side = max(container.width, container.height)
+        return CGSize(width: side, height: side)
+      }
+      return AspectFit.size(for: pixels, in: container)
+    }
+
+    func receive(_ candidate: CGImage, identity: ThumbnailIdentity, isFinal: Bool, isWhole: Bool) {
+      guard identity == target, !identity.isLocked else { return }
+      if imageIdentity == identity {
+        let betterAspect =
+          (isWhole || ViewerImage.matchesAspect(candidate, pixels))
+          != (self.isWhole || image.map { ViewerImage.matchesAspect($0, pixels) } == true)
+        if betterAspect {
+          guard isWhole || ViewerImage.matchesAspect(candidate, pixels) else { return }
+        } else {
+          guard ViewerImage.accepts(candidate, over: image, isFinal: isFinal) else { return }
         }
       }
+      imageIdentity = identity
+      image = candidate
+      imagePixels = pixels
+      self.isWhole = isWhole
+      layoutImage()
+      imageLayer.contents = candidate
+      isHidden = false
+    }
+
+    func handoffImage(for id: String) -> CGImage? {
+      committedID == id && imageIdentity?.id == id && imageIdentity?.isLocked == false ? image : nil
+    }
+
+    func commit(id: String, alreadyReady: Bool) {
+      detailTask?.cancel()
+      committedID = id
+      #if DEBUG
+        if stressRunning {
+          stressCommitTime = CACurrentMediaTime()
+          stressRunning = false
+          NSLog("STRESS filmstrip previews hits=%d misses=%d", stressHits, stressMisses)
+        }
+      #endif
+      if alreadyReady {
+        pageImageReady(id)
+        return
+      }
+      hideTask?.cancel()
+      hideTask = Task { [weak self] in
+        try? await Task.sleep(for: .seconds(1))
+        guard !Task.isCancelled, let self else { return }
+        #if DEBUG
+          if self.stressCommitTime != nil { NSLog("STRESS filmstrip handoff timed out") }
+        #endif
+        self.reset()
+      }
+    }
+
+    func pageImageReady(_ id: String) {
+      guard committedID == id else { return }
+      #if DEBUG
+        if let start = stressCommitTime {
+          NSLog("STRESS filmstrip commitToImage=%.2fms", (CACurrentMediaTime() - start) * 1000)
+        }
+      #endif
+      reset(cancelDetail: false)
+    }
+
+    func reset(cancelDetail: Bool = true) {
+      hideTask?.cancel()
+      detailTask?.cancel()
+      if cancelDetail {
+        token?.cancel()
+        token = nil
+        cancelLanding()
+      }
+      isHidden = true
+      target = nil
+      committedID = nil
+      imageIdentity = nil
+      image = nil
+      imageLayer.contents = nil
+      #if DEBUG
+        stressCommitTime = nil
+      #endif
     }
   }
-
 #endif

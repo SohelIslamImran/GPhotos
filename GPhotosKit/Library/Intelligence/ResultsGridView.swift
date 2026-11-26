@@ -18,6 +18,9 @@ final class LibrarySubsetModel: MediaViewerSource {
   private func position(_ index: Int) -> Int? { positions.indices.contains(index) ? positions[index] : nil }
 
   func itemID(at index: Int) -> String { position(index).map(base.itemID(at:)) ?? "" }
+  func thumbnailIdentity(at index: Int) -> ThumbnailIdentity {
+    position(index).map(base.thumbnailIdentity(at:)) ?? ThumbnailIdentity(id: "")
+  }
   func aspectRatio(at index: Int) -> CGFloat? { position(index).flatMap(base.aspectRatio(at:)) }
   func badges(at index: Int) -> PhotoGridBadges { position(index).map(base.badges(at:)) ?? PhotoGridBadges() }
   func accessibilityLabel(at index: Int) -> String { position(index).map(base.accessibilityLabel(at:)) ?? "" }
@@ -29,7 +32,8 @@ final class LibrarySubsetModel: MediaViewerSource {
 struct ResultsGridView: View {
   let title: String
   let library: UnifiedLibraryModel
-  let ids: [String]
+  /// Nil while they're being found.
+  let ids: [String]?
   var searchQuery: String? = nil
   @State private var model: LibrarySubsetModel?
   @State private var reloadToken = 0
@@ -45,7 +49,8 @@ struct ResultsGridView: View {
   }()
 
   private var countSubtitle: String {
-    model.map { ProductCopy.inflected("^[\($0.itemCount) Item](inflect: true)") } ?? ""
+    // Takes the subtitle's line from the first frame, so the title doesn't move.
+    model.map { ProductCopy.inflected("^[\($0.itemCount) Item](inflect: true)") } ?? " "
   }
 
   var body: some View {
@@ -87,10 +92,12 @@ struct ResultsGridView: View {
       .navigationSubtitle(countSubtitle)
     #endif
     .task(id: ids) {
+      guard let ids else { return }
       model = LibrarySubsetModel(base: library, positions: library.positions(of: ids))
       reloadToken &+= 1
     }
     .onChange(of: library.reloadToken) {
+      guard let ids else { return }
       model = LibrarySubsetModel(base: library, positions: library.positions(of: ids))
       reloadToken &+= 1
     }

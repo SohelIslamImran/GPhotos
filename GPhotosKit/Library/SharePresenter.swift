@@ -4,6 +4,8 @@ import SwiftUI
 #if os(iOS)
   import LinkPresentation
   import UIKit
+#else
+  import AppKit
 #endif
 
 /// "1 Photo", "3 Videos", "5 Items": the share sheet's header.
@@ -20,17 +22,17 @@ func shareTitle(count: Int, videoCount: Int) -> String {
 /// redraws with a whole library selected doesn't build a list of it every time.
 struct PhotoShareButton<Item: Transferable & Sendable, Label: View>: View {
   private let items: () -> [Item]
-  /// Grid ids of the items, for thumbnails already in memory.
-  private let ids: () -> [String]
+  /// The pixel identities used by the grid and viewer.
+  private let identities: () -> [ThumbnailIdentity]
   private let videoCount: () -> Int
   private let label: () -> Label
 
   init(
-    items: @escaping @autoclosure () -> [Item], ids: @escaping @autoclosure () -> [String],
+    items: @escaping @autoclosure () -> [Item], identities: @escaping @autoclosure () -> [ThumbnailIdentity],
     videoCount: @escaping @autoclosure () -> Int, @ViewBuilder label: @escaping () -> Label
   ) {
     self.items = items
-    self.ids = ids
+    self.identities = identities
     self.videoCount = videoCount
     self.label = label
   }
@@ -38,7 +40,7 @@ struct PhotoShareButton<Item: Transferable & Sendable, Label: View>: View {
   var body: some View {
     #if os(iOS)
       Button {
-        SharePresenter.share(items(), ids: ids(), videoCount: videoCount())
+        SharePresenter.share(items(), identities: identities(), videoCount: videoCount())
       } label: {
         label()
       }
@@ -66,7 +68,7 @@ extension RemoteItemSummary {
   @MainActor
   public enum SharePresenter {
     public static func share<Item: Transferable & Sendable>(
-      _ items: [Item], ids: [String], videoCount: Int, thumbnail: CGImage? = nil
+      _ items: [Item], identities: [ThumbnailIdentity], videoCount: Int, thumbnail: CGImage? = nil
     ) {
       guard !items.isEmpty else { return }
       let providers = items.map { item in
@@ -74,7 +76,7 @@ extension RemoteItemSummary {
         provider.register(item)
         return provider
       }
-      let image = (thumbnail ?? ids.first.flatMap(cachedThumbnail)).map { UIImage(cgImage: $0) }
+      let image = (thumbnail ?? identities.first.flatMap(cachedThumbnail)).map { UIImage(cgImage: $0) }
       let title = shareTitle(count: items.count, videoCount: videoCount)
       let configuration = UIActivityItemsConfiguration(itemProviders: providers)
       configuration.metadataProvider = { key in
@@ -92,7 +94,7 @@ extension RemoteItemSummary {
         }
       }
       configuration.previewProvider = { index, _, _ in
-        guard ids.indices.contains(index), let preview = cachedThumbnail(ids[index]) else { return nil }
+        guard identities.indices.contains(index), let preview = cachedThumbnail(identities[index]) else { return nil }
         return NSItemProvider(object: UIImage(cgImage: preview))
       }
       let controller = UIActivityViewController(activityItemsConfiguration: configuration)
@@ -104,8 +106,9 @@ extension RemoteItemSummary {
     }
 
     /// The largest thumbnail already in memory: the grid or viewer just showed it.
-    static func cachedThumbnail(_ id: String) -> CGImage? {
-      ThumbnailPipeline.shared.placeholder(for: ThumbnailKey(id: id, bucket: .huge))
+    static func cachedThumbnail(_ identity: ThumbnailIdentity) -> CGImage? {
+      ThumbnailPipeline.shared.viewerPreview(for: identity)
+        ?? ThumbnailPipeline.shared.placeholder(for: ThumbnailKey(identity: identity, bucket: .huge))
     }
 
     static func topViewController() -> UIViewController? {
@@ -117,6 +120,24 @@ extension RemoteItemSummary {
         controller = presented
       }
       return controller
+    }
+  }
+#endif
+
+#if os(macOS)
+  @MainActor
+  enum SharePresenter {
+    static func share<Item: Transferable & Sendable>(_ items: [Item], identities: [ThumbnailIdentity], videoCount: Int) {
+      guard !items.isEmpty, let window = NSApp.keyWindow, let view = window.contentView else { return }
+      let providers = items.map { item in
+        let provider = NSItemProvider()
+        provider.register(item)
+        return provider
+      }
+      let picker = NSSharingServicePicker(items: providers)
+      let menu = NSMenu()
+      menu.addItem(picker.standardShareMenuItem)
+      menu.popUp(positioning: nil, at: view.convert(window.mouseLocationOutsideOfEventStream, from: nil), in: view)
     }
   }
 #endif

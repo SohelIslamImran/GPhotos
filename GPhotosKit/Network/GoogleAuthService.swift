@@ -9,9 +9,21 @@ public actor GoogleAuthService {
   /// Bumped whenever the credential changes, so a refresh that finishes afterwards
   /// cannot cache a token minted for the previous credential.
   private var credentialGeneration = 0
-  private var refreshTask: Task<AuthToken, Error>?
+  private var refreshTask: Task<Void, Never>?
+  private var refreshID: UUID?
+  private var refreshWaiters: [UUID: CheckedContinuation<String, any Error>] = [:]
 
-  private struct AuthToken: Sendable {
+  struct InstalledCredential: Equatable, Sendable {
+    let email: String
+    let generation: Int
+  }
+
+  var installedCredential: InstalledCredential? {
+    guard let query = credentialQuery, let email = Self.parseEmail(from: query) else { return nil }
+    return InstalledCredential(email: email, generation: credentialGeneration)
+  }
+
+  struct AuthToken: Sendable {
     let token: String
     let expiry: Date
   }
@@ -27,16 +39,37 @@ public actor GoogleAuthService {
     config.httpCookieStorage = nil
     config.httpShouldSetCookies = false
     config.urlCache = nil
+    config.timeoutIntervalForResource = 30
     return URLSession(configuration: config)
   }()
 
-  public init() {}
+  private let fetch: @Sendable (URLRequest, TokenBindingSession?) async throws -> AuthToken
+
+  public init() {
+    fetch = Self.fetchToken
+  }
+
+  init(fetch: @escaping @Sendable (URLRequest, TokenBindingSession?) async throws -> AuthToken) {
+    self.fetch = fetch
+  }
 
   // MARK: - Credential Configuration
 
-  public func setCredential(_ raw: String) throws {
-    let sanitized = try Self.sanitizedCredentialQuery(from: raw)
-    replaceCredential(sanitized, token: nil, expiry: nil)
+  public func setCredential(_ raw: String, expectedEmail: String? = nil) throws {
+    do {
+      let sanitized = try Self.sanitizedCredentialQuery(from: raw)
+      if let expectedEmail, Self.parseEmail(from: sanitized) != expectedEmail {
+        throw GPhotosError.invalidCredential("Credential and account do not match")
+      }
+      replaceCredential(sanitized)
+    } catch {
+      clearCredential()
+      throw error
+    }
+  }
+
+  func clearCredential() {
+    replaceCredential(nil)
   }
 
   public func credentialLanguage() -> String {
@@ -48,12 +81,13 @@ public actor GoogleAuthService {
     return "en_US"
   }
 
-  private func replaceCredential(_ query: String?, token: String?, expiry: Date?) {
+  private func replaceCredential(_ query: String?) {
     credentialQuery = query
-    cachedToken = token
-    cachedExpiry = expiry
+    cachedToken = nil
+    cachedExpiry = nil
     credentialGeneration += 1
-    refreshTask = nil
+    refreshTask?.cancel()
+    if let refreshID { finishRefresh(refreshID, result: .failure(GPhotosError.notAuthenticated)) }
   }
 
   public func accounts() throws -> [GoogleAccount] {
@@ -68,7 +102,7 @@ public actor GoogleAuthService {
 
   public func signOut() throws {
     try KeychainStore.deleteAccounts()
-    replaceCredential(nil, token: nil, expiry: nil)
+    clearCredential()
   }
 
   // MARK: - Embedded Setup Authentication Flow
@@ -105,40 +139,24 @@ public actor GoogleAuthService {
     return account
   }
 
-  /// Validates the account's credential and saves it, restoring the previous credential
-  /// and cached token if either step fails.
+  /// Validate on a separate service so the primary client's credential never changes
+  /// until the app has drained its outgoing account work.
   private func activate(_ account: GoogleAccount) async throws {
-    let previous = (query: credentialQuery, token: cachedToken, expiry: cachedExpiry)
-    let (existingAccounts, primaryEmail) = try KeychainStore.loadAccounts()
-    let isFirstAccount = existingAccounts.isEmpty || primaryEmail == nil
-
-    do {
-      if isFirstAccount {
-        try setCredential(account.credentialString)
-        _ = try await bearerToken()
-        try await verifyPhotosAccess()
-      } else {
-        // Checked on its own service: this one stays the primary account's throughout, or
-        // an upload running meanwhile could take the new account's token and go there.
-        let probe = GoogleAuthService()
-        try await probe.setCredential(account.credentialString)
+    let probe = GoogleAuthService()
+    try await probe.setCredential(account.credentialString, expectedEmail: account.email)
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask {
         _ = try await probe.bearerToken()
         try await probe.verifyPhotosAccess()
       }
-
-      var updatedAccounts = existingAccounts
-      if let index = updatedAccounts.firstIndex(where: { $0.email == account.email }) {
-        updatedAccounts[index] = account
-      } else {
-        updatedAccounts.append(account)
+      group.addTask {
+        try await Task.sleep(for: .seconds(30))
+        throw GPhotosError.from(urlError: URLError(.timedOut))
       }
-
-      let newPrimary = isFirstAccount ? account.email : primaryEmail
-      try KeychainStore.saveAccounts(updatedAccounts, primaryEmail: newPrimary)
-    } catch {
-      if isFirstAccount { replaceCredential(previous.query, token: previous.token, expiry: previous.expiry) }
-      throw error
+      defer { group.cancelAll() }
+      _ = try await group.next()
     }
+    try KeychainStore.saveAccount(account)
   }
 
   /// Checks that the account has Google Photos access before saving its credential.
@@ -154,36 +172,58 @@ public actor GoogleAuthService {
   // MARK: - Bearer Token Resolution & Refresh
 
   public func bearerToken(forceRefresh: Bool = false) async throws -> String {
+    try Task.checkCancellation()
     if !forceRefresh, let token = cachedToken, let expiry = cachedExpiry, expiry > Date().addingTimeInterval(60) {
       return token
     }
-    guard let query = credentialQuery else {
-      throw GPhotosError.notAuthenticated
-    }
+    guard let query = credentialQuery else { throw GPhotosError.notAuthenticated }
     let generation = credentialGeneration
-    // Concurrent callers, forced or not, share one in-flight refresh: its token is fresh.
-    let task: Task<AuthToken, Error>
-    if let refreshTask {
-      task = refreshTask
-    } else {
+    if refreshTask == nil {
       let (request, session) = try makeTokenRequest(query: query)
-      task = Task { try await Self.fetchToken(request, session: session) }
-      refreshTask = task
+      let id = UUID()
+      refreshID = id
+      refreshTask = Task {
+        let result: Result<AuthToken, any Error>
+        do {
+          result = .success(try await self.fetch(request, session))
+        } catch {
+          result = .failure(error)
+        }
+        self.finishRefresh(id, result: result)
+      }
     }
-    let result: Result<AuthToken, Error>
-    do {
-      result = .success(try await task.value)
-    } catch {
-      result = .failure(error)
+    let id = UUID()
+    // Cancel just this caller's wait. A retiring Library must not stay blocked on a
+    // refresh that other callers also need.
+    let token: String = try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { refreshWaiters[id] = $0 }
+    } onCancel: {
+      Task { await self.cancelRefreshWaiter(id) }
     }
-    if refreshTask == task { refreshTask = nil }
-    guard credentialGeneration == generation else {
-      return try await bearerToken(forceRefresh: forceRefresh)
+    try Task.checkCancellation()
+    guard generation == credentialGeneration else { throw GPhotosError.notAuthenticated }
+    return token
+  }
+
+  private func cancelRefreshWaiter(_ id: UUID) {
+    guard let waiter = refreshWaiters.removeValue(forKey: id) else { return }
+    waiter.resume(throwing: CancellationError())
+    guard refreshWaiters.isEmpty, let refreshID else { return }
+    refreshTask?.cancel()
+    finishRefresh(refreshID, result: .failure(CancellationError()))
+  }
+
+  private func finishRefresh(_ id: UUID, result: Result<AuthToken, any Error>) {
+    guard refreshID == id else { return }
+    refreshID = nil
+    refreshTask = nil
+    if case .success(let fresh) = result {
+      cachedToken = fresh.token
+      cachedExpiry = fresh.expiry
     }
-    let fresh = try result.get()
-    cachedToken = fresh.token
-    cachedExpiry = fresh.expiry
-    return fresh.token
+    let waiters = refreshWaiters.values
+    refreshWaiters.removeAll()
+    for waiter in waiters { waiter.resume(with: result.map(\.token)) }
   }
 
   private func makeTokenRequest(

@@ -4,6 +4,7 @@
   import Foundation
   import GPhotosKit
   import IOKit.ps
+  import Observation
   import os
 
   private let logger = Logger(subsystem: "org.gphotosapp.gphotos.mac", category: "MacMirrorScheduler")
@@ -19,7 +20,25 @@
     private init() {}
 
     public func start(store: MacSyncStore) {
+      guard self.store !== store else { return }
       self.store = store
+      monitorAccounts(in: store)
+    }
+
+    private func monitorAccounts(in store: MacSyncStore) {
+      let hasMirrorAccounts = withObservationTracking {
+        Self.hasMirrorAccounts(store)
+      } onChange: { [weak self, weak store] in
+        Task { @MainActor in
+          guard let self, let store, self.store === store else { return }
+          self.monitorAccounts(in: store)
+        }
+      }
+      guard hasMirrorAccounts else {
+        scheduler?.invalidate()
+        scheduler = nil
+        return
+      }
       guard scheduler == nil else { return }
 
       let sched = NSBackgroundActivityScheduler(identifier: "org.gphotosapp.gphotos.mirror")
@@ -48,8 +67,14 @@
       self.scheduler = sched
     }
 
+    private static func hasMirrorAccounts(_ store: MacSyncStore) -> Bool {
+      let accounts = store.accounts
+      guard let primary = store.selectedAccount?.email else { return false }
+      return accounts.contains { $0.email != primary && $0.mirrorEnabled }
+    }
+
     public func canRunMirror() -> Bool {
-      guard let store else { return false }
+      guard let store, Self.hasMirrorAccounts(store) else { return false }
       guard store.accountMirror.hasPendingWork else { return false }
       guard !store.workerPool.isRunning else { return false }
       guard Self.powerAndNetworkAllowMirror(requiresPower: store.settings.copiesOnlyWhileCharging) else { return false }
@@ -99,7 +124,7 @@
       monitorTask = Task { @MainActor [weak self] in
         while !Task.isCancelled {
           try? await Task.sleep(for: .seconds(30))
-          guard let self else { break }
+          guard !Task.isCancelled, let self else { break }
           guard let store = self.store else { break }
           if store.workerPool.isRunning || self.userIdleSeconds() < 300 {
             logger.info("Aborting mirror window due to user activity or primary upload")

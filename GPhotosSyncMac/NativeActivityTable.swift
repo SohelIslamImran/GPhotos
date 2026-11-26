@@ -1,5 +1,6 @@
 import AppKit
 import GPhotosKit
+import Observation
 import SwiftUI
 
 /// AppKit owns row reuse; SwiftUI owns the records, selection, and cell content.
@@ -18,8 +19,22 @@ struct NativeActivityTable: NSViewRepresentable {
     }
   }
 
-  let rows: [TransferRecord]
-  let revision: Int
+  final class Rows: Sendable {
+    static let empty = Rows([])
+
+    let records: [TransferRecord]
+    let indexByID: [String: Int]
+
+    init(_ records: [TransferRecord]) {
+      self.records = records
+      var indices: [String: Int] = [:]
+      indices.reserveCapacity(records.count)
+      for (index, record) in records.enumerated() { indices[record.id] = index }
+      indexByID = indices
+    }
+  }
+
+  let rows: Rows
   @Binding var selection: Set<String>
   let cell: (TransferRecord, Column) -> AnyView
   let sortChanged: ([NSSortDescriptor]) -> Void
@@ -33,8 +48,8 @@ struct NativeActivityTable: NSViewRepresentable {
   @MainActor
   final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var parent: NativeActivityTable
-    private(set) var rows: [TransferRecord] = []
-    private var revision: Int?
+    private var snapshot = Rows.empty
+    var rows: [TransferRecord] { snapshot.records }
     private var updating = false
     private weak var table: TableView?
 
@@ -109,15 +124,13 @@ struct NativeActivityTable: NSViewRepresentable {
       guard let table else { return }
       updating = true
       defer { updating = false }
-      if revision != parent.revision {
-        rows = parent.rows
-        revision = parent.revision
+      if snapshot !== parent.rows {
+        snapshot = parent.rows
         // reloadData reuses only visible cells. Animated row diffs previously built
         // thousands of hosting views and raced SwiftUI's row generator on rapid filters.
         table.reloadData()
       }
-      let selectedIDs = parent.selection
-      let selected = selectedIDs.isEmpty ? IndexSet() : IndexSet(rows.indices.filter { selectedIDs.contains(rows[$0].id) })
+      let selected = IndexSet(parent.selection.compactMap { snapshot.indexByID[$0] })
       if selected != table.selectedRowIndexes { table.selectRowIndexes(selected, byExtendingSelection: false) }
     }
 
@@ -129,7 +142,7 @@ struct NativeActivityTable: NSViewRepresentable {
       else { return nil }
       let view = tableView.makeView(withIdentifier: identifier, owner: nil) as? HostingCell ?? HostingCell()
       view.identifier = identifier
-      view.content = parent.cell(rows[row], column)
+      view.presentation.content = parent.cell(rows[row], column)
       return view
     }
 
@@ -164,14 +177,37 @@ struct NativeActivityTable: NSViewRepresentable {
     @objc func copy(_ sender: Any?) { copySelection?() }
   }
 
-  final class HostingCell: NSTableCellView {
-    private let host = NSHostingView(rootView: AnyView(EmptyView()))
-    var content = AnyView(EmptyView()) { didSet { refresh() } }
+  @MainActor
+  @Observable
+  final class CellPresentation {
+    var content = AnyView(EmptyView())
+    var isEmphasized = false
+  }
 
-    override var backgroundStyle: NSView.BackgroundStyle { didSet { refresh() } }
+  private struct CellContent: View {
+    let presentation: CellPresentation
+
+    var body: some View {
+      presentation.content
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .padding(.horizontal, 4)
+        .environment(\.backgroundProminence, presentation.isEmphasized ? .increased : .standard)
+    }
+  }
+
+  final class HostingCell: NSTableCellView {
+    let presentation = CellPresentation()
+
+    override var backgroundStyle: NSView.BackgroundStyle {
+      didSet {
+        let isEmphasized = backgroundStyle == .emphasized
+        if presentation.isEmphasized != isEmphasized { presentation.isEmphasized = isEmphasized }
+      }
+    }
 
     override init(frame frameRect: NSRect) {
       super.init(frame: frameRect)
+      let host = NSHostingView(rootView: CellContent(presentation: presentation))
       host.sizingOptions = []
       host.frame = bounds
       host.autoresizingMask = [.width, .height]
@@ -179,13 +215,5 @@ struct NativeActivityTable: NSViewRepresentable {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    private func refresh() {
-      host.rootView = AnyView(
-        content
-          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-          .padding(.horizontal, 4)
-          .environment(\.backgroundProminence, backgroundStyle == .emphasized ? .increased : .standard))
-    }
   }
 }

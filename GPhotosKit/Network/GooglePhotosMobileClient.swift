@@ -57,9 +57,12 @@ public actor GooglePhotosMobileClient {
     self.authService = authService
     self.allowsExpensiveNetworkAccess = allowsExpensiveNetworkAccess
 
+    // The app keeps its own thumbnail cache; a URL cache would store every response a
+    // second time (locked items included) and add revalidation headers the protocol does not use.
     let uploadConfig = isolatedSession ? URLSessionConfiguration.ephemeral : URLSessionConfiguration.default
     uploadConfig.timeoutIntervalForRequest = 300  // 5 min idle packet timeout
     uploadConfig.timeoutIntervalForResource = 86400 * 7  // 7 days total transfer window
+    uploadConfig.urlCache = nil
     uploadConfig.waitsForConnectivity = true
     uploadConfig.httpMaximumConnectionsPerHost = 10
     if isolatedSession {
@@ -71,6 +74,7 @@ public actor GooglePhotosMobileClient {
     let dataConfig = isolatedSession ? URLSessionConfiguration.ephemeral : URLSessionConfiguration.default
     dataConfig.timeoutIntervalForRequest = 120
     dataConfig.timeoutIntervalForResource = 600
+    dataConfig.urlCache = nil
     dataConfig.waitsForConnectivity = true
     if isolatedSession {
       dataConfig.httpCookieStorage = nil
@@ -81,6 +85,7 @@ public actor GooglePhotosMobileClient {
     let thumbnailConfig = isolatedSession ? URLSessionConfiguration.ephemeral : URLSessionConfiguration.default
     thumbnailConfig.timeoutIntervalForRequest = 20
     thumbnailConfig.timeoutIntervalForResource = 60
+    thumbnailConfig.urlCache = nil
     thumbnailConfig.waitsForConnectivity = false
     thumbnailConfig.httpMaximumConnectionsPerHost = 12
     if isolatedSession {
@@ -675,18 +680,20 @@ public actor GooglePhotosMobileClient {
   }
 
   /// Moves items to Google Photos' Trash, where they stay for 60 days. The request omits the extension headers.
-  public func trash(dedupKeys: [String]) async throws {
+  ///
+  /// `validate` runs right before each send, after any wait for a token or a rate limit.
+  public func trash(dedupKeys: [String], validate: @escaping @Sendable () throws -> Void = {}) async throws {
     _ = try await libraryRPC(
       GPhotosEndpoints.trashItems, body: LibraryMessages.trash(dedupKeys: dedupKeys, device: device),
-      extensionHeaders: false, isAction: true)
+      extensionHeaders: false, isAction: true, validate: validate)
   }
 
   /// Deletes items in Google Photos' Trash for good. Sent like `trash`, without the
   /// extension headers.
-  public func deleteForever(dedupKeys: [String]) async throws {
+  public func deleteForever(dedupKeys: [String], validate: @escaping @Sendable () throws -> Void = {}) async throws {
     _ = try await libraryRPC(
       GPhotosEndpoints.trashItems, body: LibraryMessages.deleteForever(dedupKeys: dedupKeys),
-      extensionHeaders: false, isAction: true)
+      extensionHeaders: false, isAction: true, validate: validate)
   }
 
   public func restoreFromTrash(dedupKeys: [String]) async throws {
@@ -808,7 +815,8 @@ public actor GooglePhotosMobileClient {
   }
 
   private func libraryRPC(
-    _ url: URL, body: Data, extensionHeaders: Bool = true, isAction: Bool = false
+    _ url: URL, body: Data, extensionHeaders: Bool = true, isAction: Bool = false,
+    validate: @Sendable () throws -> Void = {}
   ) async throws -> Data {
     let token = try await authService.bearerToken()
     let language = await authService.credentialLanguage()
@@ -820,7 +828,7 @@ public actor GooglePhotosMobileClient {
       request.setValue(GPhotosEndpoints.commitHeader174067345, forHTTPHeaderField: "x-goog-ext-174067345-bin")
     }
     request.httpBody = body
-    let (data, response) = try await performData(request, retriesTransportFailures: !isAction, isBrowsing: true)
+    let (data, response) = try await performData(request, retriesTransportFailures: !isAction, isBrowsing: true, validate: validate)
     try validateHTTP(response: response, data: data)
     return data
   }
@@ -889,7 +897,8 @@ public actor GooglePhotosMobileClient {
   private func performData(
     _ request: URLRequest,
     retriesTransportFailures: Bool = true,
-    isBrowsing: Bool = false
+    isBrowsing: Bool = false,
+    validate: @Sendable () throws -> Void = {}
   ) async throws -> (Data, URLResponse) {
     var request = request
     request.allowsExpensiveNetworkAccess = isBrowsing || allowsExpensiveNetworkAccess
@@ -898,6 +907,7 @@ public actor GooglePhotosMobileClient {
     var refreshedAuth = false
     while true {
       try await waitForRateLimit()
+      try validate()
       do {
         let (data, response) = try await dataSession.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode

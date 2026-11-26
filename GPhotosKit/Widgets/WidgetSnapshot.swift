@@ -7,18 +7,28 @@ import ImageIO
 /// photos, saves a small JPEG of each and lists them here.
 public struct WidgetPhotoSnapshot: Codable, Sendable, Equatable {
   public var generatedAt: Date
+  /// The browsed Google Photos account when this snapshot was built, if any.
+  public var accountEmail: String?
   /// On This Day and trips first, then the best photos when there are no memories today.
   public var memories: [WidgetPhotoSet]
   /// The most photographed people, most photos first.
   public var people: [WidgetPhotoSet]
 
-  public init(generatedAt: Date = Date(), memories: [WidgetPhotoSet] = [], people: [WidgetPhotoSet] = []) {
+  public init(
+    generatedAt: Date = Date(), accountEmail: String? = nil, memories: [WidgetPhotoSet] = [], people: [WidgetPhotoSet] = []
+  ) {
     self.generatedAt = generatedAt
+    self.accountEmail = accountEmail
     self.memories = memories
     self.people = people
   }
 
   public var isEmpty: Bool { memories.isEmpty && people.isEmpty }
+
+  /// Everything but the timestamp, to skip disk writes and WidgetKit reloads when nothing changed.
+  public func sameContent(as other: WidgetPhotoSnapshot) -> Bool {
+    accountEmail == other.accountEmail && memories == other.memories && people == other.people
+  }
 }
 
 /// A memory or a person: a title and a few photos the widget rotates through.
@@ -147,10 +157,36 @@ public enum WidgetStore {
     return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
   }
 
+  /// Takes these items off the widgets at once, on the calling thread: before the app
+  /// records that they're locked, so ending right after leaves nothing to show.
+  static func remove(_ itemIDs: Set<String>, in directory: URL = directory) {
+    // Their files' names come from their ids: one may be there without being listed.
+    var files = Set(itemIDs.map(WidgetPublisher.fileName(for:)))
+    for file in files { try? FileManager.default.removeItem(at: directory.appendingPathComponent(file)) }
+    guard var snapshot = photos(in: directory) else { return }
+    files = []
+    func kept(_ sets: [WidgetPhotoSet]) -> [WidgetPhotoSet] {
+      sets.compactMap { set in
+        var set = set
+        files.formUnion(set.photos.filter { itemIDs.contains($0.itemID) }.map(\.file))
+        set.photos.removeAll { itemIDs.contains($0.itemID) }
+        return set.photos.isEmpty ? nil : set
+      }
+    }
+    snapshot.memories = kept(snapshot.memories)
+    snapshot.people = kept(snapshot.people)
+    guard !files.isEmpty else { return }
+    for file in files { try? FileManager.default.removeItem(at: directory.appendingPathComponent(file)) }
+    if (try? write(snapshot, in: directory)) == nil {
+      try? FileManager.default.removeItem(at: directory.appendingPathComponent(photosFileName))
+    }
+  }
+
   /// Removes images no longer listed.
   static func prune(keeping files: Set<String>, in directory: URL = directory) {
     let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-    for name in names where name.hasSuffix(".jpg") && !files.contains(name) {
+    // Anything but the snapshots: an interrupted write leaves a temporary file too.
+    for name in names where !name.hasSuffix(".json") && !files.contains(name) {
       try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
     }
   }

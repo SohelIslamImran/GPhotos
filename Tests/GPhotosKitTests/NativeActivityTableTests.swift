@@ -15,9 +15,9 @@
       var menuIDs: [String] = []
     }
 
-    private func view(_ rows: [TransferRecord], revision: Int, state: State) -> NativeActivityTable {
+    private func view(_ rows: NativeActivityTable.Rows, state: State) -> NativeActivityTable {
       NativeActivityTable(
-        rows: rows, revision: revision,
+        rows: rows,
         selection: Binding(get: { state.selection }, set: { state.selection = $0 }),
         cell: { record, _ in
           state.cells += 1
@@ -36,7 +36,9 @@
         TransferRecord(id: "r\($0)", filename: "photo-\($0).jpg", mediaType: "Photo", status: $0 < 7 ? .failed : .sent)
       }
       let state = State()
-      let initial = view(records, revision: 0, state: state)
+      let full = NativeActivityTable.Rows(records)
+      let failed = NativeActivityTable.Rows(Array(records.prefix(7)))
+      let initial = view(full, state: state)
       let coordinator = initial.makeCoordinator()
       let scroll = coordinator.makeScrollView()
       scroll.frame = NSRect(x: 0, y: 0, width: 1000, height: 600)
@@ -46,13 +48,13 @@
       #expect(table.numberOfRows == records.count)
       for revision in 1...1000 {
         if revision.isMultiple(of: 25) { await Task.yield() }
-        let rows = revision.isMultiple(of: 3) ? [] : revision.isMultiple(of: 2) ? records : Array(records.prefix(7))
-        coordinator.update(view(rows, revision: revision, state: state))
+        let rows = revision.isMultiple(of: 3) ? .empty : revision.isMultiple(of: 2) ? full : failed
+        coordinator.update(view(rows, state: state))
         #expect(table === scroll.documentView)
-        #expect(table.numberOfRows == rows.count)
-        #expect(coordinator.tableView(table, viewFor: table.tableColumns[0], row: rows.count) == nil)
+        #expect(table.numberOfRows == rows.records.count)
+        #expect(coordinator.tableView(table, viewFor: table.tableColumns[0], row: rows.records.count) == nil)
         #expect(coordinator.tableView(table, viewFor: table.tableColumns[0], row: -1) == nil)
-        if !rows.isEmpty {
+        if !rows.records.isEmpty {
           #expect(coordinator.tableView(table, viewFor: table.tableColumns[0], row: 0) != nil)
         }
       }
@@ -66,16 +68,33 @@
       state.selection = ["a"]
       let a = TransferRecord(id: "a", filename: "a.jpg", mediaType: "Photo", status: .sent)
       let b = TransferRecord(id: "b", filename: "b.jpg", mediaType: "Photo", status: .failed)
-      let initial = view([a, b], revision: 0, state: state)
+      let initial = view(.init([a, b]), state: state)
       let coordinator = initial.makeCoordinator()
       let scroll = coordinator.makeScrollView()
       let table = scroll.documentView as! NSTableView
       #expect(table.selectedRowIndexes == IndexSet(integer: 0))
-      coordinator.update(view([b, a], revision: 1, state: state))
+      coordinator.update(view(.init([b, a]), state: state))
       #expect(table.selectedRowIndexes == IndexSet(integer: 1))
-      coordinator.update(view([b], revision: 2, state: state))
+      coordinator.update(view(.init([b]), state: state))
       #expect(table.selectedRowIndexes.isEmpty)
       #expect(state.selection == ["a"])
+    }
+
+    @Test("A selection-only update reuses the laid-out rows and their index")
+    func selectionOnlyUpdate() {
+      let state = State()
+      let records = (0..<100_000).map {
+        TransferRecord(id: "r\($0)", filename: "photo-\($0).jpg", mediaType: "Photo", status: .sent)
+      }
+      let initial = view(.init(records), state: state)
+      let coordinator = initial.makeCoordinator()
+      let scroll = coordinator.makeScrollView()
+      let table = scroll.documentView as! NSTableView
+      state.selection = ["r4", "r99999", "filtered-out"]
+      coordinator.update(initial)
+      #expect(table.selectedRowIndexes == IndexSet([4, 99_999]))
+      #expect(initial.rows.indexByID.count == 100_000)
+      #expect(table.numberOfRows == 100_000)
     }
 
     @Test("Native sort and context-menu callbacks use the current rows and selection")
@@ -83,7 +102,7 @@
       let state = State()
       let a = TransferRecord(id: "a", filename: "a.jpg", mediaType: "Photo", status: .sent)
       let b = TransferRecord(id: "b", filename: "b.jpg", mediaType: "Photo", status: .failed)
-      let coordinator = view([a, b], revision: 0, state: state).makeCoordinator()
+      let coordinator = view(.init([a, b]), state: state).makeCoordinator()
       let scroll = coordinator.makeScrollView()
       let table = scroll.documentView as! NativeActivityTable.TableView
       table.sortDescriptors = [NSSortDescriptor(key: "name", ascending: false)]
@@ -93,7 +112,7 @@
       #expect(state.selection == ["b"])
       #expect(table.makeMenu?() != nil)
       #expect(state.menuIDs == ["b"])
-      coordinator.update(view([a], revision: 1, state: state))
+      coordinator.update(view(.init([a]), state: state))
       #expect(table.makeMenu?() != nil)
       #expect(state.menuIDs.isEmpty)
     }
@@ -105,7 +124,9 @@
       let records = (0..<12_600).map {
         TransferRecord(id: "r\($0)", filename: "photo-\($0).jpg", mediaType: "Photo", status: $0 < 7 ? .failed : .sent)
       }
-      let host = NSHostingView(rootView: view(records, revision: 0, state: state))
+      let full = NativeActivityTable.Rows(records)
+      let failed = NativeActivityTable.Rows(Array(records.prefix(7)))
+      let host = NSHostingView(rootView: view(full, state: state))
       let window = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: 1000, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
       window.isReleasedWhenClosed = false
@@ -122,15 +143,15 @@
         return
       }
       for revision in 1...300 {
-        let rows = revision.isMultiple(of: 3) ? [] : revision.isMultiple(of: 2) ? records : Array(records.prefix(7))
-        host.rootView = view(rows, revision: revision, state: state)
+        let rows = revision.isMultiple(of: 3) ? .empty : revision.isMultiple(of: 2) ? full : failed
+        host.rootView = view(rows, state: state)
         host.layoutSubtreeIfNeeded()
         try? await Task.sleep(for: .milliseconds(2))
         host.layoutSubtreeIfNeeded()
         #expect(findTable(host) === original)
-        #expect(original.numberOfRows == rows.count)
+        #expect(original.numberOfRows == rows.records.count)
         #expect(!original.usesAutomaticRowHeights)
-        if !rows.isEmpty {
+        if !rows.records.isEmpty {
           #expect(original.view(atColumn: 0, row: 0, makeIfNecessary: true) != nil)
         }
       }

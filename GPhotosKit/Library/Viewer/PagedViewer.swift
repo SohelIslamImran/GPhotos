@@ -9,20 +9,20 @@ struct PagedViewer<Page: View>: View {
   /// The position in items while the user swipes (2.4 is 40% from the third page to the
   /// fourth), for things that move with the finger. iPhone only.
   var onSwipe: ((CGFloat) -> Void)?
+  /// A finger is on the pages. iPhone only.
+  var onTouch: (() -> Void)?
   /// Which item a page shows: when the item at the current page changes (it was deleted),
   /// the next one slides in, as in Photos. iPhone only.
   var pageID: ((Int) -> String)?
   /// Where an item is now (its id, and where it was), when the library changed under it:
   /// the viewer stays on it instead of on its old position. iPhone only.
   var locate: ((String, Int) -> Int?)?
-  /// The item showing was removed and the next one took its place. iPhone only.
-  var onReplaced: ((Int) -> Void)?
   let page: (Int) -> Page
 
   var body: some View {
     #if os(iOS)
       PagedViewerRepresentable(
-        count: count, index: $index, onSwipe: onSwipe, pageID: pageID, locate: locate, onReplaced: onReplaced,
+        count: count, index: $index, onSwipe: onSwipe, onTouch: onTouch, pageID: pageID, locate: locate,
         page: page)
     #else
       PagedViewerRepresentable(count: count, index: $index, page: page)
@@ -33,7 +33,7 @@ struct PagedViewer<Page: View>: View {
 #if os(iOS)
   import UIKit
 
-  private final class PageHost: UIHostingController<AnyView> {
+  final class PageHost: UIHostingController<AnyView> {
     var index: Int
     var itemID: String?
 
@@ -50,13 +50,13 @@ struct PagedViewer<Page: View>: View {
     @MainActor required dynamic init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
   }
 
-  private struct PagedViewerRepresentable<Page: View>: UIViewControllerRepresentable {
+  struct PagedViewerRepresentable<Page: View>: UIViewControllerRepresentable {
     let count: Int
     @Binding var index: Int?
     let onSwipe: ((CGFloat) -> Void)?
+    let onTouch: (() -> Void)?
     let pageID: ((Int) -> String)?
     let locate: ((String, Int) -> Int?)?
-    let onReplaced: ((Int) -> Void)?
     let page: (Int) -> Page
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -93,6 +93,7 @@ struct PagedViewer<Page: View>: View {
       coordinator.makePage = { AnyView(page($0)) }
       coordinator.onChange = { if index != $0 { index = $0 } }
       coordinator.onSwipe = onSwipe
+      coordinator.onTouch = onTouch
       coordinator.pageID = pageID
       guard count > 0 else { return }
       let target = min(max(index ?? 0, 0), count - 1)
@@ -100,24 +101,18 @@ struct PagedViewer<Page: View>: View {
       let current = shown?.index
       // The same page with another item in it: the library changed under the viewer.
       let changed = current == target && shown?.itemID != nil && shown?.itemID != pageID?(target)
-      // Still there, elsewhere (items arrived or left before it): stay on it, in place.
-      if changed, let shown, let id = shown.itemID, let moved = locate?(id, target), moved != target,
-        moved >= 0, moved < count
-      {
-        shown.index = moved
-        // Its neighbours are asked for again around the new position.
-        controller.setViewControllers([shown], direction: .forward, animated: false)
-        coordinator.refresh()
-        // Reported after this update, which mustn't change state itself.
-        let setIndex = $index
-        DispatchQueue.main.async { setIndex.wrappedValue = moved }
+      if let moved = coordinator.relocateDisplayedPage(in: controller, to: target, locate: locate) {
+        if moved != target {
+          // Reported after this update, which mustn't change state itself.
+          let setIndex = $index
+          DispatchQueue.main.async { setIndex.wrappedValue = moved }
+        }
         return
       }
       let replaced = changed
       // The removed item slides away as it was, not refreshed into the next one.
       if replaced {
         coordinator.outgoing = shown
-        if let onReplaced { DispatchQueue.main.async { onReplaced(target) } }
       }
       if current != target || replaced {
         let forward = (current ?? -1) <= target
@@ -137,6 +132,7 @@ struct PagedViewer<Page: View>: View {
       var makePage: (Int) -> AnyView = { _ in AnyView(EmptyView()) }
       var onChange: (Int) -> Void = { _ in }
       var onSwipe: ((CGFloat) -> Void)?
+      var onTouch: (() -> Void)?
       var pageID: ((Int) -> String)?
       var swipeObservation: NSKeyValueObservation?
       private let hosts = NSHashTable<PageHost>.weakObjects()
@@ -148,6 +144,7 @@ struct PagedViewer<Page: View>: View {
         else { return }
         let width = scrollView.bounds.width
         guard width > 0 else { return }
+        if scrollView.isTracking { onTouch?() }
         onSwipe(CGFloat(current) + (scrollView.contentOffset.x - width) / width)
       }
 
@@ -155,6 +152,27 @@ struct PagedViewer<Page: View>: View {
         let host = PageHost(index: index, itemID: pageID?(index), content: makePage(index))
         hosts.add(host)
         return host
+      }
+
+      /// Keep the hosting controller, including its player and zoom, when the item moves.
+      func relocateDisplayedPage(
+        in controller: UIPageViewController, to target: Int, locate: ((String, Int) -> Int?)?
+      ) -> Int? {
+        guard let shown = controller.viewControllers?.first as? PageHost, let id = shown.itemID else { return nil }
+        let moved: Int?
+        if pageID?(target) == id {
+          moved = target
+        } else if shown.index == target {
+          moved = locate?(id, target)
+        } else {
+          moved = nil
+        }
+        guard let moved, moved != shown.index, moved >= 0, moved < count else { return nil }
+        shown.index = moved
+        // Ask for new neighbours without sliding away from the same item.
+        controller.setViewControllers([shown], direction: .forward, animated: false)
+        refresh()
+        return moved
       }
 
       weak var outgoing: PageHost?
@@ -184,8 +202,9 @@ struct PagedViewer<Page: View>: View {
         _ controller: UIPageViewController, didFinishAnimating finished: Bool,
         previousViewControllers: [UIViewController], transitionCompleted completed: Bool
       ) {
-        guard completed, let index = (controller.viewControllers?.first as? PageHost)?.index else { return }
-        onChange(index)
+        guard let index = (controller.viewControllers?.first as? PageHost)?.index else { return }
+        onSwipe?(CGFloat(index))
+        if completed { onChange(index) }
       }
     }
   }
@@ -193,7 +212,7 @@ struct PagedViewer<Page: View>: View {
 #else
   import AppKit
 
-  private final class PageHost: NSHostingController<AnyView> {
+  final class PageHost: NSHostingController<AnyView> {
     var index = 0
 
     override init(rootView: AnyView) {
@@ -251,7 +270,9 @@ struct PagedViewer<Page: View>: View {
       guard count > 0 else { return }
       let target = min(max(index ?? 0, 0), count - 1)
       if controller.selectedIndex != target {
-        if abs(controller.selectedIndex - target) == 1 {
+        if abs(controller.selectedIndex - target) == 1,
+          !context.transaction.disablesAnimations, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        {
           NSAnimationContext.runAnimationGroup { _ in controller.animator().selectedIndex = target }
         } else {
           controller.selectedIndex = target
@@ -268,7 +289,8 @@ struct PagedViewer<Page: View>: View {
       private let hosts = NSHashTable<PageHost>.weakObjects()
 
       func refresh() {
-        for host in hosts.allObjects { host.rootView = makePage(host.index) }
+        guard let count = controller?.arrangedObjects.count else { return }
+        for host in hosts.allObjects where host.index < count { host.rootView = makePage(host.index) }
       }
 
       func pageController(_ controller: NSPageController, identifierFor object: Any) -> NSPageController.ObjectIdentifier {

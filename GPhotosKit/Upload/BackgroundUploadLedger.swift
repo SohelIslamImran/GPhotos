@@ -74,6 +74,14 @@ public struct BackgroundUploadLedger: Codable, Sendable, Equatable {
     heldRecordIDs(at: Date())
   }
 
+  public func hasWork(at now: Date = Date()) -> Bool {
+    !jobs.isEmpty || !results.isEmpty || preparing.values.contains { $0.expires > now }
+  }
+
+  public func foregroundPollInterval(at now: Date = Date()) -> Duration {
+    .seconds(hasWork(at: now) ? 15 : 60)
+  }
+
   private func heldRecordIDs(at now: Date) -> Set<String> {
     Set(jobs.map(\.recordID)).union(results.map(\.recordID))
       .union(preparing.filter { $0.value.expires > now }.keys)
@@ -395,6 +403,12 @@ public struct BackgroundUploadResult: Codable, Sendable, Equatable {
 public struct BackgroundUploadLedgerStore: Sendable {
   public static let shared = BackgroundUploadLedgerStore(directory: AppGroupConstants.storageDirectory())
 
+  private static let workNotification = "org.gphotosapp.gphotos.background-upload-work"
+
+  public static func observeWork(handler: @escaping @Sendable () -> Void) -> UnsafeMutableRawPointer {
+    SharedQueueBridge.observeDarwinNotification(named: workNotification, handler: handler)
+  }
+
   public let directory: URL
 
   public init(directory: URL) {
@@ -422,7 +436,7 @@ public struct BackgroundUploadLedgerStore: Sendable {
       var ledger = load()
       let original = ledger
       let value = try change(&ledger)
-      if ledger != original { _ = save(ledger) }
+      if ledger != original { _ = save(ledger, replacing: original) }
       return value
     }) {
       return value
@@ -432,10 +446,11 @@ public struct BackgroundUploadLedgerStore: Sendable {
   }
 
   /// A claim must reach disk before another process can rely on it.
-  public func persist(_ change: (inout BackgroundUploadLedger) -> Bool) -> Bool {
+  public func persist(notifiesAboutWork: Bool = true, _ change: (inout BackgroundUploadLedger) -> Bool) -> Bool {
     withLock {
       var ledger = load()
-      return change(&ledger) && save(ledger)
+      let original = notifiesAboutWork ? ledger : nil
+      return change(&ledger) && save(ledger, replacing: original)
     } ?? false
   }
 
@@ -455,9 +470,14 @@ public struct BackgroundUploadLedgerStore: Sendable {
     return (try? JSONDecoder().decode(BackgroundUploadLedger.self, from: data)) ?? BackgroundUploadLedger()
   }
 
-  private func save(_ ledger: BackgroundUploadLedger) -> Bool {
+  private func save(_ ledger: BackgroundUploadLedger, replacing previous: BackgroundUploadLedger?) -> Bool {
     do {
       try JSONEncoder().encode(ledger).write(to: fileURL, options: .atomic)
+      if let previous,
+        (!ledger.results.isEmpty && ledger.results != previous.results) || (ledger.hasWork() && !previous.hasWork())
+      {
+        SharedQueueBridge.postDarwinNotification(named: Self.workNotification)
+      }
       return true
     } catch {
       BackgroundUploadLog.write("ledger: could not save: \(error.localizedDescription)")
@@ -468,6 +488,10 @@ public struct BackgroundUploadLedgerStore: Sendable {
   /// The lock is held only for a read and a write, never across a suspension point: iOS ends
   /// a suspended process that holds a lock on a file in a shared container.
   private func withLock<T>(_ body: () throws -> T) rethrows -> T? {
+    try SuspensionGuard.run { try lockedRun(body) }
+  }
+
+  private func lockedRun<T>(_ body: () throws -> T) rethrows -> T? {
     try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let descriptor = open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
     guard descriptor >= 0 else { return nil }

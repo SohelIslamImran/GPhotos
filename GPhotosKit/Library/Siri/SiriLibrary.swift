@@ -43,17 +43,62 @@ public final class SiriLibrary {
   /// Set by the app: the backed-up folders, for sharing their files when the Library
   /// hasn't opened them.
   @ObservationIgnored public var backedUpFolders: (@MainActor () -> [LibraryFolder])?
-  @ObservationIgnored private var vocabulary: [String] = []
+  @ObservationIgnored private var vocabulary: LibraryIndexStore.LabelVocabulary?
   @ObservationIgnored private var vocabularyLoadedAt = ContinuousClock.now
 
   private init() {
-    spotlight = SiriSpotlightIndexer(store: store)
+    spotlight = SiriSpotlightIndexer(
+      store: store,
+      onAccountChanged: { email in
+        FaceCropCache.removeAll()
+        await WidgetPublisher.shared.purgeCloudItems(unlessAccount: email)
+      })
   }
 
   /// The browsed account's library, reading the saved accounts first when nothing has yet.
   public func browsedCloud() async -> CloudLibrary? {
     if cloud == nil, let loadAccounts { await loadAccounts() }
     return cloud
+  }
+
+  /// Drops Google Photos records that are in the Locked Folder or no longer in the mirror.
+  /// Fails closed when no active cloud library is available or the mirror cannot be read.
+  func excludingLocked(_ records: [SiriItemRecord]) async -> [SiriItemRecord] {
+    let cloudKeys = records.compactMap { $0.id.hasPrefix("g:") ? String($0.id.dropFirst(2)) : nil }
+    guard !cloudKeys.isEmpty else { return records }
+    guard let cloud = await browsedCloud(), !cloud.isRetired else {
+      return records.filter { !$0.id.hasPrefix("g:") }
+    }
+    guard let visibleKeys = try? await cloud.store.visibleMediaKeys(in: cloudKeys) else {
+      return records.filter { !$0.id.hasPrefix("g:") }
+    }
+    return records.filter { record in
+      guard record.id.hasPrefix("g:") else { return true }
+      return visibleKeys.contains(String(record.id.dropFirst(2)))
+    }
+  }
+
+  /// Drops Google Photos index ids that are in the Locked Folder or no longer in the mirror.
+  /// Fails closed when no active cloud library is available or the mirror cannot be read.
+  func excludingLockedIDs(_ ids: [String], cloud explicitCloud: CloudLibrary? = nil) async -> [String] {
+    let cloudKeys = ids.compactMap { $0.hasPrefix("g:") ? String($0.dropFirst(2)) : nil }
+    guard !cloudKeys.isEmpty else { return ids }
+    let targetCloud: CloudLibrary?
+    if let explicitCloud {
+      targetCloud = explicitCloud
+    } else {
+      targetCloud = await browsedCloud()
+    }
+    guard let targetCloud, !targetCloud.isRetired else {
+      return ids.filter { !$0.hasPrefix("g:") }
+    }
+    guard let visibleKeys = try? await targetCloud.store.visibleMediaKeys(in: cloudKeys) else {
+      return ids.filter { !$0.hasPrefix("g:") }
+    }
+    return ids.filter { id in
+      guard id.hasPrefix("g:") else { return true }
+      return visibleKeys.contains(String(id.dropFirst(2)))
+    }
   }
 
   public func open(_ destination: Destination) {
@@ -71,35 +116,37 @@ public final class SiriLibrary {
   /// Index ids matching a spoken or typed request, best first: the index's matches for its
   /// words, narrowed to the period, kind and favorites it names. When no item has every
   /// word, items with the most of them come first.
-  public func search(_ text: String, limit: Int = 200) async -> [String] {
+  public func search(_ text: String, limit: Int = 200, completingLastWord: Bool = false) async -> [String] {
     let query = SiriSearchQuery(text)
     guard !query.isEmpty else { return [] }
     // Indexing adds labels as it goes.
-    if vocabulary.isEmpty || ContinuousClock.now - vocabularyLoadedAt > .seconds(60) {
-      vocabulary = (try? await store.allLabels()) ?? []
+    if vocabulary == nil || ContinuousClock.now - vocabularyLoadedAt > .seconds(60) {
+      vocabulary = try? await store.labelVocabulary()
       vocabularyLoadedAt = .now
     }
     let store = store
-    let vocabulary = vocabulary
+    let vocabulary = vocabulary ?? LibraryIndexStore.LabelVocabulary(labels: [])
     var ids: [String]
     if query.terms.isEmpty {
       ids = []
     } else {
-      // Spoken words are whole: no completing the last one as when typing.
-      let people = ((try? await store.people(minimumFaces: 1)) ?? []).filter { $0.name != nil }
+      let people = (try? await store.namedPeople()) ?? []
       ids = await LibraryIndexer.search(
-        query.terms.joined(separator: " "), in: store, vocabulary: vocabulary, people: people, completingLastWord: false)
+        query.terms.joined(separator: " "), in: store, vocabulary: vocabulary, people: people,
+        completingLastWord: completingLastWord)
       if ids.isEmpty, query.terms.count > 1 {
         var perTerm: [[String]] = []
-        for term in query.terms {
+        for (index, term) in query.terms.enumerated() {
           perTerm.append(
             await LibraryIndexer.search(
-              term, in: store, vocabulary: vocabulary, people: people, completingLastWord: false))
+              term, in: store, vocabulary: vocabulary, people: people,
+              completingLastWord: completingLastWord && index == query.terms.count - 1))
         }
         ids = Self.rankedByMatches(perTerm)
       }
     }
-    return await Self.filter(ids, by: query, in: store, limit: limit)
+    let filtered = await Self.filter(ids, by: query, in: store, limit: limit)
+    return await excludingLockedIDs(filtered)
   }
 
   /// Ids found by several searches, those found most often first, then in the order found.
@@ -162,7 +209,10 @@ public final class SiriLibrary {
       return url
     }
     if id.hasPrefix("g:") {
-      guard let cloud = await browsedCloud(), let item = await cloud.summary(mediaKey: String(id.dropFirst(2))) else {
+      let key = String(id.dropFirst(2))
+      guard let cloud = await browsedCloud(), !cloud.isRetired,
+        let item = await cloud.summary(mediaKey: key)
+      else {
         throw CocoaError(.fileNoSuchFile)
       }
       return try await cloud.download(item)
@@ -178,10 +228,16 @@ public final class SiriLibrary {
   public func thumbnailData(id: String, side: CGFloat = 240) async -> Data? {
     let image: CGImage?
     if id.hasPrefix("g:") {
-      guard let cloud = await browsedCloud(), let item = await cloud.summary(mediaKey: String(id.dropFirst(2))) else {
+      let key = String(id.dropFirst(2))
+      guard let cloud = await browsedCloud(), !cloud.isRetired,
+        let item = await cloud.summary(mediaKey: key)
+      else {
         return nil
       }
-      image = await Self.image(from: cloud.thumbnails, id: item.thumbnailID, side: side)
+      // Route through local device/folder copies first, and bound wait time when offline/failing.
+      let timeout: Duration = NetworkStatusMonitor.shared.isConnected ? .seconds(5) : .milliseconds(1_500)
+      return await Self.cloudThumbnailData(
+        from: cloud.localFirstThumbnails, id: item.thumbnailID, side: side, timeout: timeout, cloud: cloud, key: key)
     } else if id.hasPrefix(FolderItemInfo.idPrefix) {
       image = nil
     } else {
@@ -192,18 +248,44 @@ public final class SiriLibrary {
     return await Task.detached(priority: .utility) { Self.jpeg(image, side: side) }.value
   }
 
-  private nonisolated static func image(from source: any ThumbnailSource, id: String, side: CGFloat) async -> CGImage? {
-    let resumed = OSAllocatedUnfairLock(initialState: false)
-    return await withCheckedContinuation { continuation in
-      _ = source.requestImage(id: id, pixelSize: CGSize(width: side, height: side), quality: .thumbnail) { image, isFinal in
-        guard isFinal,
-          resumed.withLock({ state in
-            defer { state = true }
-            return !state
-          })
-        else { return }
-        continuation.resume(returning: image)
+  nonisolated static func cloudThumbnailData(
+    from source: any ThumbnailSource, id: String, side: CGFloat, timeout: Duration, cloud: CloudLibrary, key: String
+  ) async -> Data? {
+    guard (try? cloud.checkUnlocked(key)) != nil,
+      let image = await Self.image(from: source, id: id, side: side, timeout: timeout),
+      (try? cloud.checkUnlocked(key)) != nil
+    else { return nil }
+    let jpeg = await Task.detached(priority: .utility) { Self.jpeg(image, side: side) }.value
+    guard (try? cloud.checkUnlocked(key)) != nil else { return nil }
+    return jpeg
+  }
+
+  nonisolated static func image(
+    from source: any ThumbnailSource, id: String, side: CGFloat, timeout: Duration = .seconds(5)
+  ) async -> CGImage? {
+    let wait = SiriImageWait()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        wait.begin(continuation)
+        if Task.isCancelled {
+          wait.finish(useBest: false)
+          return
+        }
+        let token = source.requestImage(
+          id: id, pixelSize: CGSize(width: side, height: side), quality: .thumbnail,
+          onUnavailable: { wait.finish(useBest: true) }
+        ) { image, isFinal in
+          wait.offer(image, isFinal: isFinal)
+        }
+        wait.attach(token: token)
+        let timer = Task {
+          try? await Task.sleep(for: timeout)
+          wait.finish(useBest: true)
+        }
+        wait.attach(timer: timer)
       }
+    } onCancel: {
+      wait.finish(useBest: false)
     }
   }
 
@@ -226,5 +308,57 @@ public final class SiriLibrary {
     }
     CGImageDestinationAddImage(destination, scaled, [kCGImageDestinationLossyCompressionQuality: 0.75] as CFDictionary)
     return CGImageDestinationFinalize(destination) ? data as Data : nil
+  }
+}
+
+/// Coordinates cancellation, timeout and final delivery for one Siri thumbnail request.
+private final class SiriImageWait: @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<CGImage?, Never>?
+  private var best: CGImage?
+  private var token: ImageRequestToken?
+  private var timer: Task<Void, Never>?
+  private var isDone = false
+
+  func begin(_ continuation: CheckedContinuation<CGImage?, Never>) {
+    lock.withLock { self.continuation = continuation }
+  }
+
+  func attach(token: ImageRequestToken) {
+    let cancelNow = lock.withLock { () -> Bool in
+      self.token = token
+      return isDone
+    }
+    if cancelNow { token.cancel() }
+  }
+
+  func attach(timer: Task<Void, Never>) {
+    let cancelNow = lock.withLock { () -> Bool in
+      self.timer = timer
+      return isDone
+    }
+    if cancelNow { timer.cancel() }
+  }
+
+  func offer(_ image: CGImage, isFinal: Bool) {
+    lock.withLock { best = image }
+    if isFinal { finish(useBest: true) }
+  }
+
+  func finish(useBest: Bool) {
+    let (continuation, image, token, timer) = lock.withLock {
+      () -> (CheckedContinuation<CGImage?, Never>?, CGImage?, ImageRequestToken?, Task<Void, Never>?) in
+      guard !isDone else { return (nil, nil, nil, nil) }
+      isDone = true
+      defer {
+        self.continuation = nil
+        self.token = nil
+        self.timer = nil
+      }
+      return (self.continuation, useBest ? best : nil, self.token, self.timer)
+    }
+    timer?.cancel()
+    token?.cancel()
+    continuation?.resume(returning: image)
   }
 }

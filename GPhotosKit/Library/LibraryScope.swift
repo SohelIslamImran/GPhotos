@@ -51,16 +51,26 @@ public enum LibraryFilter: String, CaseIterable, Hashable, Sendable {
   case livePhotos
   case screenshots
   case notBackedUp
+  case notIncludedInBackup
   case backedUp
-  /// Merged timeline only: items in Google Photos that aren't on this device.
+  /// Merged timeline only: Google Photos items without a confirmed local copy.
   case cloudOnly
 
   /// The filters a device-only grid offers, as in Photos' menu: the main list, then the
   /// media types in their own submenu.
-  public static let deviceFilters: [LibraryFilter] = [.all, .favorites, .notBackedUp, .backedUp]
+  public static let deviceFilters: [LibraryFilter] = [.all, .favorites, .notBackedUp, .backedUp, .notIncludedInBackup]
   public static let mediaTypes: [LibraryFilter] = [.photos, .videos, .livePhotos, .screenshots]
 
   public var isMediaType: Bool { Self.mediaTypes.contains(self) }
+
+  public var emptyTitle: String {
+    switch self {
+    case .notBackedUp: String(localized: "No Items Need Backup")
+    case .notIncludedInBackup: String(localized: "No Items Excluded from Backup")
+    case .backedUp: String(localized: "Nothing Backed Up Yet")
+    default: String(localized: "No \(title)")
+    }
+  }
 
   public var title: String {
     switch self {
@@ -72,6 +82,7 @@ public enum LibraryFilter: String, CaseIterable, Hashable, Sendable {
     case .livePhotos: String(localized: "Live Photos")
     case .screenshots: String(localized: "Screenshots")
     case .notBackedUp: String(localized: "Not Backed Up")
+    case .notIncludedInBackup: String(localized: "Not Included in Backup")
     case .backedUp: String(localized: "Backed Up")
     }
   }
@@ -85,12 +96,22 @@ public enum LibraryFilter: String, CaseIterable, Hashable, Sendable {
     case .livePhotos: "livephoto"
     case .screenshots: "camera.viewfinder"
     case .notBackedUp: "icloud.slash"
+    case .notIncludedInBackup: "minus.circle"
     case .backedUp: "checkmark.icloud"
     case .cloudOnly: "cloud"
     }
   }
 
-  var dependsOnBackup: Bool { self == .notBackedUp || self == .backedUp }
+  var dependsOnBackup: Bool { self == .notBackedUp || self == .backedUp || self == .notIncludedInBackup }
+
+  func includesBackupItem(inScope: Bool, backedUp: Bool) -> Bool {
+    switch self {
+    case .notBackedUp: inScope && !backedUp
+    case .notIncludedInBackup: !inScope && !backedUp
+    case .backedUp: backedUp
+    default: true
+    }
+  }
 }
 
 /// Media types Photos keeps as smart albums.
@@ -179,13 +200,13 @@ public enum LibraryMediaKind: String, CaseIterable, Hashable, Sendable {
 /// Builds the PhotoKit fetch for a scope and filter. Runs off the main actor.
 enum LibraryFetch {
   static func assets(
-    scope: LibraryScope, filter: LibraryFilter, backedUpIDs: Set<String>
+    scope: LibraryScope, filter: LibraryFilter
   ) -> PHFetchResult<PHAsset> {
     let options = PHFetchOptions()
     if scope.isDateOrdered {
       options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
     }
-    options.predicate = predicate(for: filter, backedUpIDs: backedUpIDs)
+    options.predicate = predicate(for: filter)
     switch scope {
     case .all:
       options.includeAssetSourceTypes = [.typeUserLibrary, .typeCloudShared, .typeiTunesSynced]
@@ -213,7 +234,7 @@ enum LibraryFetch {
     return PHAsset.fetchAssets(in: album, options: options)
   }
 
-  static func predicate(for filter: LibraryFilter, backedUpIDs: Set<String>) -> NSPredicate? {
+  static func predicate(for filter: LibraryFilter) -> NSPredicate? {
     switch filter {
     case .all: nil
     case .favorites: NSPredicate(format: "isFavorite == YES")
@@ -221,9 +242,30 @@ enum LibraryFetch {
     case .videos: NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
     case .livePhotos: NSPredicate(format: "(mediaSubtypes & %d) != 0", PHAssetMediaSubtype.photoLive.rawValue)
     case .screenshots: NSPredicate(format: "(mediaSubtypes & %d) != 0", PHAssetMediaSubtype.photoScreenshot.rawValue)
-    case .notBackedUp: NSPredicate(format: "NOT (localIdentifier IN %@)", Array(backedUpIDs))
-    case .backedUp: NSPredicate(format: "localIdentifier IN %@", Array(backedUpIDs))
-    case .cloudOnly: NSPredicate(value: false)
+    case .notBackedUp, .notIncludedInBackup, .backedUp, .cloudOnly: nil
     }
+  }
+}
+
+/// The read-only classification shared by the Library and device collections.
+struct PhotoBackupScope: Equatable, Sendable {
+  var excludedIDs: Set<String> = []
+
+  static var backsUpPhotos: Bool {
+    #if os(iOS)
+      true
+    #else
+      false
+    #endif
+  }
+
+  func includes(id: String, source: PHAssetSourceType, isMedia: Bool, isHidden: Bool = false) -> Bool {
+    Self.backsUpPhotos && source.contains(.typeUserLibrary) && isMedia && !isHidden && !excludedIDs.contains(id)
+  }
+
+  func includes(_ asset: PHAsset) -> Bool {
+    includes(
+      id: asset.localIdentifier, source: asset.sourceType,
+      isMedia: asset.mediaType == .image || asset.mediaType == .video, isHidden: asset.isHidden)
   }
 }

@@ -75,4 +75,42 @@ struct RemoteCopyVerifierTests {
     _ = await verifier.confirmed(records, accountEmail: "a@example.com", now: start.addingTimeInterval(90))
     #expect(await log.calls.count == 2)
   }
+
+  @Test("A lookup spanning a credential change confirms nothing and cannot seed the cache")
+  func discardsChangedCredentialResults() async throws {
+    let email = "a@example.com"
+    let auth = GoogleAuthService()
+    try await auth.setCredential("Email=\(email)")
+    let started = OneShotSignal()
+    let release = OneShotSignal()
+    let log = LookupLog()
+    let verifier = RemoteCopyVerifier(auth: auth) { sha1, motion in
+      await log.record(sha1, motion)
+      if await log.calls.count == 1 {
+        started.resume()
+        await release.wait()
+        return "stale-media"
+      }
+      return nil
+    }
+    let records = [Self.record("switched", sha1: Self.hash(9))]
+    let wrongAccount = LookupLog()
+    let wrongAccountVerifier = RemoteCopyVerifier(auth: auth) { sha1, motion in
+      await wrongAccount.record(sha1, motion)
+      return "wrong-account-media"
+    }
+    #expect(await wrongAccountVerifier.confirmed(records, accountEmail: "b@example.com").isEmpty)
+    #expect(await wrongAccount.calls.isEmpty)
+
+    let lookup = Task { await verifier.confirmed(records, accountEmail: email) }
+    await started.wait()
+    // Reinstall even the same email: an email check alone cannot establish which token was used.
+    try await auth.setCredential("Email=\(email)&Token=changed")
+    release.resume()
+    #expect(await lookup.value.isEmpty)
+    #expect(await verifier.cachedConfirmationCount == 0)
+    #expect(await verifier.confirmed(records, accountEmail: email).isEmpty)
+    #expect(await log.calls.count == 2)
+  }
+
 }

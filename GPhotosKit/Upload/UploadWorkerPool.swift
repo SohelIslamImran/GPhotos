@@ -104,7 +104,7 @@ public final class PowerAssertionManager {
 
 // MARK: - Worker State
 
-public struct WorkerState: Identifiable, Sendable {
+public struct WorkerState: Identifiable, Sendable, Equatable {
   public let id: Int
   public var itemID: String = ""
   public var status: String  // "idle", "hashing", "checking", "uploading", "finalizing", "completed", "skipped", "error"
@@ -393,11 +393,12 @@ public final class UploadWorkerPool {
   public var iCloudDownloadLimit: Int64?
   /// Google asked this account to slow down; uploads resume when the wait ends.
   public private(set) var isRateLimited = false
-  public var claimPhotoUpload: (@Sendable (String) -> Bool)?
+  public var claimPhotoUpload: (@Sendable (String) async -> Bool)?
   public var releasePhotoUpload: (@Sendable (String) -> Void)?
   public var onItemCompleted: (@Sendable () async -> Void)?
   public var onItemFinished: (@Sendable (String, TransferStatus) async -> Void)?
   public var onBatchCompleted: (@Sendable () async -> Void)?
+  var canStartBatch: ((String?) -> Bool)?
   public var onBatchStarted: (@MainActor @Sendable () -> Void)?
   public var onProgressUpdated: (@MainActor @Sendable () -> Void)?
   public var onBatchCancelled: (@MainActor @Sendable () -> Void)?
@@ -583,7 +584,9 @@ public final class UploadWorkerPool {
     quality: Int64 = 3,
     accountEmail: String? = nil
   ) -> StartOutcome {
-    guard !Task.isCancelled, !items.isEmpty, !isStopping, !isBatchFinalizing else { return .rejected }
+    guard !Task.isCancelled, !items.isEmpty, !isStopping, !isBatchFinalizing, canStartBatch?(accountEmail) != false else {
+      return .rejected
+    }
     if isRunning {
       guard !isCancelling, accountEmail == currentAccountEmail else { return .rejected }
       let previousCount = pendingQueue.count
@@ -622,15 +625,16 @@ public final class UploadWorkerPool {
     pendingQueue = suspects.isEmpty ? uniqueItems : uniqueItems.filter { !PreparationGuard.shared.isSuspect($0.id) } + suspects
     isDrainCancelled = false
     refreshTrackedItemIDs()
+    pendingWorkerProgress.removeAll(keepingCapacity: true)
     batchProgress = BatchUploadProgress()
     for item in uniqueItems { batchProgress.include(id: item.id, size: item.fileSize) }
     batchProgress.sample(at: ProcessInfo.processInfo.systemUptime)
     metricsTask?.cancel()
     metricsTask = Task { @MainActor [weak self] in
       while !Task.isCancelled {
-        try? await Task.sleep(for: .milliseconds(500))
+        try? await Task.sleep(for: .milliseconds(250))
         guard !Task.isCancelled, let self, self.isRunning else { return }
-        self.recalculateOverallProgress()
+        self.flushWorkerProgress()
       }
     }
     completedItemsBytes = 0
@@ -754,16 +758,14 @@ public final class UploadWorkerPool {
   /// would be dropped along with their upload claims.
   func enqueue(items: [UploadQueueItem]) {
     guard isRunning, !items.isEmpty else { return }
-    var existingIDs = trackedItemIDs
     var newItems: [UploadQueueItem] = []
-    for item in items where existingIDs.insert(item.id).inserted {
+    for item in items where trackedItemIDs.insert(item.id).inserted {
       newItems.append(item)
     }
     guard !newItems.isEmpty else { return }
     self.pendingQueue.append(contentsOf: newItems)
     self.lastBatchTotalCount += newItems.count
     for item in newItems { batchProgress.include(id: item.id, size: item.fileSize) }
-    refreshTrackedItemIDs()
     recalculateOverallProgress()
   }
 
@@ -844,7 +846,7 @@ public final class UploadWorkerPool {
       }
 
       // A full account stops dispatch but still collects the uploads already in flight.
-      while (nextDispatchIndex < pendingQueue.count && canDispatchUploads || inFlight > 0)
+      dispatch: while (nextDispatchIndex < pendingQueue.count && canDispatchUploads || inFlight > 0)
         && !isCancelled && !isDrainCancelled
       {
         while isPaused && !isCancelled && !Task.isCancelled
@@ -877,8 +879,11 @@ public final class UploadWorkerPool {
           if exportBytes > 0, inFlight > 0 {
             // Wait for a worker to free its export before dispatching another one.
             // Independent free-space checks can all pass before any export is written.
+            let available = await Self.availableExportCapacity()
+            guard !Task.isCancelled, canDispatchUploads, generation == self.generation else { break }
+            if isPaused { continue dispatch }
             do {
-              try Self.requireFreeSpace(for: exportBytes, reserving: reservedExports.values.reduce(0, +))
+              try Self.requireFreeSpace(for: exportBytes, reserving: reservedExports.values.reduce(0, +), available: available)
             } catch {
               break
             }
@@ -999,6 +1004,10 @@ public final class UploadWorkerPool {
   ) async -> [String] {
     var failed: [String] = []
     for (album, keys) in keysByAlbum.sorted(by: { $0.key.localizedStandardCompare($1.key) == .orderedAscending }) {
+      guard !Task.isCancelled else {
+        failed.append(album)
+        continue
+      }
       if showsProgress { statusMessage = "Adding to \(album)…" }
       do {
         try await addToAlbum(named: album, mediaKeys: keys, accountEmail: accountEmail)
@@ -1070,12 +1079,23 @@ public final class UploadWorkerPool {
   public nonisolated static func requireFreeSpace(
     for bytes: Int64, reserving reservedBytes: Int64 = 0, at directory: URL = FileManager.default.temporaryDirectory
   ) throws {
-    let margin: Int64 = 200_000_000
+    try requireFreeSpace(for: bytes, reserving: reservedBytes, available: exportCapacity(at: directory))
+  }
+
+  @concurrent
+  private nonisolated static func availableExportCapacity() async -> Int64? {
+    exportCapacity(at: FileManager.default.temporaryDirectory)
+  }
+
+  private nonisolated static func exportCapacity(at directory: URL) -> Int64? {
     let values = try? directory.resourceValues(forKeys: [.volumeAvailableCapacityKey, .volumeAvailableCapacityForImportantUsageKey])
-    guard
-      let available = [values?.volumeAvailableCapacity.map(Int64.init), values?.volumeAvailableCapacityForImportantUsage]
-        .compactMap({ $0 }).min()
-    else { return }
+    return [values?.volumeAvailableCapacity.map(Int64.init), values?.volumeAvailableCapacityForImportantUsage]
+      .compactMap { $0 }.min()
+  }
+
+  private nonisolated static func requireFreeSpace(for bytes: Int64, reserving reservedBytes: Int64 = 0, available: Int64?) throws {
+    guard let available else { return }
+    let margin: Int64 = 200_000_000
     let needed = max(0, bytes).addingReportingOverflow(max(0, reservedBytes))
     guard !needed.overflow, needed.partialValue <= Int64.max - margin else {
       throw GPhotosError.notEnoughSpace(needed: Int64.max)
@@ -1119,7 +1139,18 @@ public final class UploadWorkerPool {
     }
   }
 
-  @ObservationIgnored private var lastProgressWrite: [Int: TimeInterval] = [:]
+  @ObservationIgnored private var pendingWorkerProgress: [Int: (base: WorkerState, latest: WorkerState)] = [:]
+
+  func flushWorkerProgress() {
+    var updated = workers
+    for (index, pending) in pendingWorkerProgress
+    where updated.indices.contains(index) && updated[index] == pending.base {
+      updated[index] = pending.latest
+    }
+    pendingWorkerProgress.removeAll(keepingCapacity: true)
+    if updated != workers { workers = updated }
+    recalculateOverallProgress()
+  }
 
   /// Applies a progress callback to a worker slot. Callbacks hop to the main actor in
   /// their own tasks, so one can land after the item finished or the slot was reused;
@@ -1131,7 +1162,8 @@ public final class UploadWorkerPool {
       phase.acceptedStatuses.contains(workers[workerID].status)
     else { return }
     let previous = workers[workerID]
-    var state = previous
+    let pending = pendingWorkerProgress[workerID]
+    var state = pending?.base == previous ? pending?.latest ?? previous : previous
     if phase == .uploading && previous.status != "uploading" {
       state.bytesUploaded = 0
       state.resetMetrics()
@@ -1146,13 +1178,21 @@ public final class UploadWorkerPool {
     } else {
       batchProgress.sent(id: itemID, bytes: state.bytesUploaded, at: now)
     }
-    guard
-      state.status != previous.status || state.message != previous.message
-        || now - (lastProgressWrite[workerID] ?? 0) >= 0.25
-    else { return }
-    lastProgressWrite[workerID] = now
-    workers[workerID] = state
-    recalculateOverallProgress()
+    if state.status != previous.status || state.message != previous.message {
+      pendingWorkerProgress[workerID] = nil
+      workers[workerID] = state
+      recalculateOverallProgress()
+    } else {
+      pendingWorkerProgress[workerID] = (previous, state)
+    }
+  }
+
+  func prepareWorker(_ workerID: Int, for item: UploadQueueItem) {
+    pendingWorkerProgress[workerID] = nil
+    workers[workerID] = WorkerState(
+      id: workerID, itemID: item.id, status: "hashing", filename: item.filename,
+      message: "Analyzing media...", bytesTotal: item.fileSize)
+    currentFilename = item.filename
   }
 
   private func notifyFinished(itemID: String, status: TransferStatus) async {
@@ -1212,13 +1252,18 @@ public final class UploadWorkerPool {
       return nil
     }
     let coordinatesPhotoUpload = item.assetLocalIdentifier != nil && claimPhotoUpload != nil
-    if coordinatesPhotoUpload, claimPhotoUpload?(item.id) != true {
+    if coordinatesPhotoUpload, await claimPhotoUpload?(item.id) != true {
       await manifest.releaseUploadClaim(id: item.id)
       await onItemCompleted?()
       return nil
     }
     defer {
       if coordinatesPhotoUpload { releasePhotoUpload?(item.id) }
+    }
+    if Task.isCancelled {
+      await manifest.releaseUploadClaim(id: item.id)
+      await onItemCompleted?()
+      return nil
     }
     let accountEmail = currentAccountEmail
     let allowsICloudDownloads = iCloudDownloadLimit.map { item.fileSize <= $0 } ?? true
@@ -1276,16 +1321,7 @@ public final class UploadWorkerPool {
       }
     }
 
-    await MainActor.run {
-      self.workers[workerID].itemID = item.id
-      self.workers[workerID].status = "hashing"
-      self.workers[workerID].filename = item.filename
-      self.workers[workerID].message = "Analyzing media..."
-      self.workers[workerID].bytesUploaded = 0
-      self.workers[workerID].bytesTotal = item.fileSize
-      self.workers[workerID].resetMetrics()
-      self.currentFilename = item.filename
-    }
+    prepareWorker(workerID, for: item)
 
     let didStart = await manifest.updateStatus(
       id: item.id, status: .sending, progress: 0.0, transferredBytes: 0, accountEmail: accountEmail)
@@ -1348,7 +1384,8 @@ public final class UploadWorkerPool {
           }
           if activeLiveExport == nil && needsMotion {
             uploadLogger.debug("Exporting Live Photo \(item.id, privacy: .private(mask: .hash))")
-            try Self.requireFreeSpace(for: item.fileSize)
+            try await Self.requireFreeSpace(for: item.fileSize, available: Self.availableExportCapacity())
+            try Task.checkCancellation()
             do {
               let live = try await LivePhotoManager.exportLivePhoto(
                 asset: asset, unedited: item.resourceRole == .uneditedOriginal,
@@ -1370,7 +1407,8 @@ public final class UploadWorkerPool {
           }
           if activeLiveExport == nil && !FileManager.default.fileExists(atPath: activeFileURL.path) {
             uploadLogger.debug("Exporting asset \(item.id, privacy: .private(mask: .hash))")
-            try Self.requireFreeSpace(for: item.fileSize)
+            try await Self.requireFreeSpace(for: item.fileSize, available: Self.availableExportCapacity())
+            try Task.checkCancellation()
             try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
             let target = exportDirectory.appendingPathComponent(UUID().uuidString + "." + item.filename)
             activeFileURL = try await AssetExportService.exportResource(

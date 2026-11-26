@@ -15,6 +15,7 @@ struct PlacesView: View {
   @State private var cellDegrees = 8.0
   @State private var area: PlaceClusters.Area?
   @State private var regroupGeneration = 0
+  @State private var regroupTask: Task<Void, Never>?
   @State private var isLoaded = false
 
   var body: some View {
@@ -41,8 +42,10 @@ struct PlacesView: View {
       area = PlaceClusters.Area(
         centerLatitude: region.center.latitude, centerLongitude: region.center.longitude,
         latitudeRadius: region.span.latitudeDelta * 1.5, longitudeRadius: region.span.longitudeDelta * 1.5)
-      Task { await regroup() }
+      regroupTask?.cancel()
+      regroupTask = Task { await regroup() }
     }
+    .onDisappear { regroupTask?.cancel() }
     .overlay {
       if !isLoaded {
         ProgressView()
@@ -58,18 +61,25 @@ struct PlacesView: View {
       library.setCloudLibrary(cloud)
       await library.start(records: records)
     }
-    .task(id: library?.reloadToken) {
+    .task(id: library.map { [$0.reloadToken, $0.indexMetadataToken, $0.isLoaded ? 1 : 0] }) {
       guard let library else {
         isLoaded = true
         return
       }
       let snapshot = library.indexSnapshot()
-      points = await Task.detached(priority: .userInitiated) { Self.points(snapshot) }.value
+      let needsRegion = !hasFramed
+      let loaded = await Task.detached(priority: .userInitiated) {
+        let unfiltered = snapshot.unfiltered()
+        let found = Self.points(unfiltered)
+        let region = needsRegion ? PlaceClusters.region(containing: found) : nil
+        return (found, region)
+      }.value
       guard !Task.isCancelled else { return }
+      points = loaded.0
       isLoaded = library.isLoaded
       // A fixed starting region, set once: the automatic one frames the pins again every
       // time they regroup, which moves the map, which regroups them, without end.
-      if !hasFramed, let region = PlaceClusters.region(containing: points) {
+      if !hasFramed, let region = loaded.1 {
         hasFramed = true
         position = .region(region)
         cellDegrees = PlaceClusters.cellDegrees(forSpan: region.span.longitudeDelta)
@@ -85,17 +95,24 @@ struct PlacesView: View {
     let points = points
     let cell = cellDegrees
     let area = area
-    let grouped = await Task.detached(priority: .userInitiated) {
+    let work = Task.detached(priority: .userInitiated) {
       PlaceClusters.make(points, cellDegrees: cell, area: area)
-    }.value
-    if generation == regroupGeneration { clusters = grouped }
+    }
+    let grouped = await withTaskCancellationHandler {
+      await work.value
+    } onCancel: {
+      work.cancel()
+    }
+    if !Task.isCancelled, generation == regroupGeneration { clusters = grouped }
   }
 
   /// Newest first, as the timeline lists them.
-  nonisolated private static func points(_ snapshot: UnifiedLibraryModel.IndexSnapshot) -> [PlacePoint] {
+  nonisolated static func points(_ snapshot: UnifiedLibraryModel.IndexSnapshot) -> [PlacePoint] {
     let moments = snapshot.moments()
     var points: [PlacePoint] = []
-    for (position, moment) in moments.enumerated() {
+    // The unified timeline runs oldest first, so iterate in reverse for newest-first pins.
+    for position in moments.indices.reversed() {
+      let moment = moments[position]
       guard let latitude = moment.latitude, let longitude = moment.longitude, latitude != 0 || longitude != 0,
         CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: latitude, longitude: longitude)),
         let id = snapshot.indexID(at: position)
@@ -113,7 +130,7 @@ private struct PlacePin: View {
   var body: some View {
     LibraryThumbnail(
       id: library.flatMap { library in
-        library.positions(of: [cluster.ids.first ?? ""]).first.map(library.itemID(at:))
+        cluster.ids.first.flatMap(library.position(ofIndexID:)).map(library.itemID(at:))
       }, bucket: .small, source: library?.thumbnailSource ?? PhotoKitImageSource.shared
     )
     .frame(width: 56, height: 56)
@@ -147,10 +164,7 @@ struct PlaceLibraryScreen: View {
     if let library {
       ResultsGridView(title: title, library: library, ids: ids)
         .task {
-          guard let request = MKReverseGeocodingRequest(location: CLLocation(latitude: latitude, longitude: longitude))
-          else { return }
-          let item = try? await request.mapItems.first
-          if let name = item?.addressRepresentations?.cityName ?? item?.addressRepresentations?.regionName {
+          if let name = await PlaceNameCache.shared.placeName(latitude: latitude, longitude: longitude) {
             title = name
           }
         }

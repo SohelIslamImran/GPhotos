@@ -9,6 +9,7 @@ import SwiftUI
 final class VideoPlayback {
   private(set) var player: AVPlayer?
   private(set) var isPlaying = false
+  private(set) var isBuffering = false
   /// 0 at the start, 1 at the end.
   private(set) var progress: Double = 0
   private(set) var isMuted = false
@@ -22,19 +23,30 @@ final class VideoPlayback {
   @ObservationIgnored private var resumesAfterScrub = false
 
   /// The player of the page now showing, or nil when it isn't a video.
+  func stop(_ player: AVPlayer) {
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    if self.player === player { attach(nil) }
+  }
+
   func attach(_ newPlayer: AVPlayer?) {
     guard newPlayer !== player else { return }
     detach()
     player = newPlayer
     progress = 0
+    isBuffering = false
     guard let newPlayer else { return }
     newPlayer.isMuted = isMuted
     isPlaying = newPlayer.timeControlStatus != .paused
+    isBuffering = newPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate
     // KVO reports on the thread that made the change, which isn't promised to be main.
     statusObservation = newPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
       let playing = player.timeControlStatus != .paused
+      let buffering = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
       Task { @MainActor in
-        guard let self, player === self.player, !self.isScrubbing else { return }
+        guard let self, player === self.player else { return }
+        self.isBuffering = buffering
+        guard !self.isScrubbing else { return }
         self.isPlaying = playing
       }
     }

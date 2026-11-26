@@ -5,8 +5,12 @@ struct ActivityView: View {
   let model: AppModel
   @State private var filter: ActivityFilter
   @State private var query = ""
-  @State private var visible: [TransferRecord] = []
-  @State private var counts: [ActivityFilter: Int] = [:]
+  @State private var rows: AccountActivityRows?
+
+  private var request: ActivityRequest {
+    ActivityRequest(
+      email: model.selectedAccount?.email, revision: model.accountBucketsRevision, filter: filter, query: query)
+  }
 
   init(model: AppModel, filter: ActivityFilter) {
     self.model = model
@@ -15,7 +19,9 @@ struct ActivityView: View {
   }
 
   var body: some View {
-    List {
+    let visible = rows?.records(for: model.selectedAccount?.email) ?? []
+    let request = self.request
+    return List {
       ForEach(visible) { record in
         LiveActivityRow(model: model, record: record)
           .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -37,11 +43,11 @@ struct ActivityView: View {
           .listRowBackground(Rectangle().fill(.regularMaterial))
           .contextMenu {
             Button("Copy File Name", systemImage: "doc.on.doc") {
-              UIPasteboard.general.string = record.filename
+              copy(record.filename, from: record)
             }
             if let path = record.sourcePath {
               Button("Copy Path", systemImage: "link") {
-                UIPasteboard.general.string = path
+                copy(path, from: record)
               }
             }
             if record.status == .failed || record.status == .pending {
@@ -54,7 +60,7 @@ struct ActivityView: View {
             }
             if record.status == .failed, let error = record.lastError, !error.isEmpty {
               Button("Copy Error", systemImage: "exclamationmark.bubble") {
-                UIPasteboard.general.string = error
+                copy(error, from: record)
               }
             }
             if record.status == .failed {
@@ -82,7 +88,7 @@ struct ActivityView: View {
     .navigationTitle("Activity")
     .toolbarTitleDisplayMode(.inline)
     .safeAreaBar(edge: .top) {
-      ActivityFilterBar(selection: $filter, counts: counts)
+      ActivityFilterBar(selection: $filter, counts: model.accountBuckets.activityCounts)
     }
     .toolbar {
       if model.accountFailedCount > 0 {
@@ -92,20 +98,30 @@ struct ActivityView: View {
         }
       }
     }
-    .onAppear(perform: refresh)
-    .onChange(of: model.accountRecords) { refresh() }
-    .onChange(of: filter) { refresh() }
-    .task(id: query) {
-      try? await Task.sleep(for: .milliseconds(150))
-      guard !Task.isCancelled else { return }
-      refresh()
+    .task(id: request) {
+      if !request.query.isEmpty {
+        do { try await Task.sleep(for: .milliseconds(150)) } catch { return }
+      }
+      let buckets = model.accountBuckets
+      guard buckets.accountEmail == request.email else { return }
+      let matches = await Task.detached(priority: .userInitiated) {
+        buckets.activityRows(filter: request.filter, query: request.query)
+      }.value
+      guard !Task.isCancelled, request == self.request else { return }
+      rows = matches
     }
   }
 
-  private func refresh() {
-    let records = model.accountRecords
-    visible = filter.apply(to: records, query: query)
-    counts = ActivityFilter.counts(in: records)
+  private func copy(_ text: String, from record: TransferRecord) {
+    guard let email = model.selectedAccount?.email, email == TransferRecord.accountEmail(fromScopedID: record.id) else { return }
+    UIPasteboard.general.string = text
+  }
+
+  private struct ActivityRequest: Equatable, Sendable {
+    let email: String?
+    let revision: Int
+    let filter: ActivityFilter
+    let query: String
   }
 }
 

@@ -130,7 +130,7 @@ extension SiriItemRecord {
     return records
   }
 
-  private static func baseRecord(
+  static func baseRecord(
     at position: Int, in snapshot: UnifiedLibraryModel.IndexSnapshot, googleDetails: [String: RemoteSiriDetails]
   ) -> SiriItemRecord? {
     switch snapshot.entries[position] {

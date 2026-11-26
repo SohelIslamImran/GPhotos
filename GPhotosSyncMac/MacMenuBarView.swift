@@ -8,13 +8,10 @@ struct MacMenuBarView: View {
   @Environment(\.openWindow) private var openWindow
   @Environment(\.dismiss) private var dismiss
 
-  var body: some View {
-    DisplayedBackupStatus(store.backupStatus) { status in
-      content(status)
-    }
-  }
+  var tracksPopoverVisibility = false
+  @State private var isWindowVisible = false
 
-  private func content(_ status: BackupStatus) -> some View {
+  var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       header
         .frame(height: 34, alignment: .leading)
@@ -22,38 +19,12 @@ struct MacMenuBarView: View {
 
       Divider()
 
-      VStack(alignment: .leading, spacing: 12) {
-        HStack(spacing: 12) {
-          StatusEmblem(status, size: 34)
-          VStack(alignment: .leading, spacing: 1) {
-            Text(status.title)
-              .font(.subheadline.weight(.semibold))
-              .lineLimit(1)
-            Text(status.subtitle)
-              .font(.caption)
-              .foregroundStyle(.secondary)
-              .lineLimit(2, reservesSpace: true)
-          }
-        }
-        .frame(height: 52, alignment: .leading)
-        .accessibilityElement(children: .combine)
-
-        // All phases share a slot so the actions and menu rows stay in place.
-        Group {
-          if store.isRunning {
-            MenuBarProgress(pool: store.workerPool)
-          } else if store.selectedAccount != nil {
-            counts
-          } else {
-            Color.clear.accessibilityHidden(true)
-          }
-        }
-        .frame(height: 82)
-
-        actions(for: status)
-          .frame(height: 36)
+      if !tracksPopoverVisibility || isWindowVisible {
+        MacMenuBarStatus(store: store, counts: { counts }, actions: actions(for:))
+      } else {
+        // Keep the popover's initial window size while its live views are detached.
+        Color.clear.frame(height: 218)
       }
-      .padding(.vertical, 12)
 
       Divider()
 
@@ -72,6 +43,9 @@ struct MacMenuBarView: View {
     }
     .padding(14)
     .frame(width: 320)
+    .background {
+      if tracksPopoverVisibility { MenuBarWindowVisibility(isVisible: $isWindowVisible) }
+    }
   }
 
   private var header: some View {
@@ -304,6 +278,95 @@ private struct MenuRow: View {
 }
 
 /// Reads the pool itself so per-tick progress re-renders only this block.
+private struct MacMenuBarStatus<Counts: View, Actions: View>: View {
+  let store: MacSyncStore
+  @ViewBuilder let counts: () -> Counts
+  @ViewBuilder let actions: (BackupStatus) -> Actions
+
+  var body: some View {
+    DisplayedBackupStatus(store.backupStatus) { status in
+      VStack(alignment: .leading, spacing: 12) {
+        HStack(spacing: 12) {
+          StatusEmblem(status, size: 34)
+          VStack(alignment: .leading, spacing: 1) {
+            Text(status.title)
+              .font(.subheadline.weight(.semibold))
+              .lineLimit(1)
+            Text(status.subtitle)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .lineLimit(2, reservesSpace: true)
+          }
+        }
+        .frame(height: 52, alignment: .leading)
+        .accessibilityElement(children: .combine)
+
+        // All phases share a slot so the actions and menu rows stay in place.
+        Group {
+          if store.isRunning {
+            MenuBarProgress(pool: store.workerPool)
+          } else if store.selectedAccount != nil {
+            counts()
+          } else {
+            Color.clear.accessibilityHidden(true)
+          }
+        }
+        .frame(height: 82)
+
+        actions(status)
+          .frame(height: 36)
+      }
+      .padding(.vertical, 12)
+    }
+  }
+}
+
+private struct MenuBarWindowVisibility: NSViewRepresentable {
+  @Binding var isVisible: Bool
+
+  func makeNSView(context: Context) -> Probe {
+    let probe = Probe()
+    probe.visibilityChanged = { isVisible = $0 }
+    return probe
+  }
+
+  func updateNSView(_ view: Probe, context: Context) {
+    view.visibilityChanged = { isVisible = $0 }
+  }
+
+  final class Probe: NSView {
+    var visibilityChanged: ((Bool) -> Void)?
+    private var observer: NSObjectProtocol?
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      stopObserving()
+      if let window {
+        observer = NotificationCenter.default.addObserver(
+          forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: nil
+        ) { [weak self] _ in
+          MainActor.assumeIsolated { self?.reportVisibility() }
+        }
+      }
+      reportVisibility()
+    }
+
+    private func reportVisibility() {
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        self.visibilityChanged?(self.window?.occlusionState.contains(.visible) == true)
+      }
+    }
+
+    private func stopObserving() {
+      if let observer { NotificationCenter.default.removeObserver(observer) }
+      observer = nil
+    }
+
+    isolated deinit { stopObserving() }
+  }
+}
+
 private struct MenuBarProgress: View {
   let pool: UploadWorkerPool
   @Environment(\.accessibilityReduceMotion) private var reduceMotion

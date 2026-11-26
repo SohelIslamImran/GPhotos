@@ -6,7 +6,7 @@ import Photos
 /// PhotoKit's change history names the assets changed since the save, so only those are
 /// read again. Anything the history can't vouch for falls back to reading everything.
 enum DeviceInfoSnapshot {
-  private static let magic: UInt32 = 0x4449_5331  // "DIS1"
+  private static let magic: UInt32 = 0x4449_5332  // "DIS2"
   /// A sparse check catches a set that drifted without showing in the history (shared
   /// albums, a pruned history); a moved item changes every index after it.
   private static let sampleCount = 256
@@ -34,11 +34,15 @@ enum DeviceInfoSnapshot {
     return infos
   }
 
-  static func readAll(_ result: PHFetchResult<PHAsset>) -> [DeviceItemInfo] {
+  static func readAll(
+    _ result: PHFetchResult<PHAsset>, indices: [Int]? = nil, limit: Int? = nil
+  ) -> [DeviceItemInfo] {
+    let count = min(indices?.count ?? result.count, limit ?? Int.max)
     var infos: [DeviceItemInfo] = []
-    infos.reserveCapacity(result.count)
+    infos.reserveCapacity(count)
     var lastDate = Date.distantFuture
-    result.enumerateObjects { asset, _, _ in
+    for index in 0..<count {
+      let asset = result.object(at: indices?[index] ?? index)
       // Undated assets sort with their neighbours, as in the fetch.
       let date = asset.creationDate ?? lastDate
       lastDate = date
@@ -49,10 +53,15 @@ enum DeviceInfoSnapshot {
 
   private static func info(_ asset: PHAsset, date: Date) -> DeviceItemInfo {
     let coordinate = asset.location?.coordinate
-    return DeviceItemInfo(
+    var info = DeviceItemInfo(
       localIdentifier: asset.localIdentifier, date: date, width: asset.pixelWidth, height: asset.pixelHeight,
       isVideo: asset.mediaType == .video, isFavorite: asset.isFavorite, latitude: coordinate?.latitude,
       longitude: coordinate?.longitude, subtypes: asset.mediaSubtypes.rawValue)
+    info.source = asset.sourceType
+    info.isMedia = asset.mediaType == .image || asset.mediaType == .video
+    info.isHidden = asset.isHidden
+    info.version = PhotoBackupEvidence.Version(AssetExportService.version(of: asset))
+    return info
   }
 
   // MARK: Replaying the history
@@ -186,6 +195,13 @@ enum DeviceInfoSnapshot {
         append(info.longitude ?? 0)
       }
       append(UInt64(info.subtypes))
+      append(UInt64(info.source.rawValue))
+      append(
+        UInt8(
+          (info.isMedia ? 1 : 0) | (info.isHidden ? 2 : 0)
+            | (info.version.hasAdjustments == true ? 4 : 0) | (info.version.hasAdjustments != nil ? 8 : 0)))
+      append(info.version.modifiedAt?.timeIntervalSinceReferenceDate ?? .nan)
+      append(info.version.adjustmentTimestamp?.timeIntervalSinceReferenceDate ?? .nan)
     }
     try? data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
   }
@@ -225,13 +241,23 @@ enum DeviceInfoSnapshot {
           latitude = lat
           longitude = lon
         }
-        guard let subtypes = read(UInt64.self) else { return nil }
-        infos.append(
-          DeviceItemInfo(
-            localIdentifier: String(decoding: idBytes, as: UTF8.self),
-            date: Date(timeIntervalSinceReferenceDate: date), width: Int(width), height: Int(height),
-            isVideo: flags & 1 != 0, isFavorite: flags & 2 != 0, latitude: latitude, longitude: longitude,
-            subtypes: UInt(subtypes)))
+        guard let subtypes = read(UInt64.self), let source = read(UInt64.self), let assetFlags = read(UInt8.self),
+          let modified = readDouble(), let adjustment = readDouble()
+        else { return nil }
+        var info = DeviceItemInfo(
+          localIdentifier: String(decoding: idBytes, as: UTF8.self),
+          date: Date(timeIntervalSinceReferenceDate: date), width: Int(width), height: Int(height),
+          isVideo: flags & 1 != 0, isFavorite: flags & 2 != 0, latitude: latitude, longitude: longitude,
+          subtypes: UInt(subtypes))
+        info.source = PHAssetSourceType(rawValue: UInt(source))
+        info.isMedia = assetFlags & 1 != 0
+        info.isHidden = assetFlags & 2 != 0
+        info.version = PhotoBackupEvidence.Version(
+          .init(
+            modifiedAt: modified.isNaN ? nil : Date(timeIntervalSinceReferenceDate: modified),
+            hasAdjustments: assetFlags & 8 == 0 ? nil : assetFlags & 4 != 0,
+            adjustmentTimestamp: adjustment.isNaN ? nil : Date(timeIntervalSinceReferenceDate: adjustment)))
+        infos.append(info)
       }
       return Saved(token: token, infos: infos)
     }

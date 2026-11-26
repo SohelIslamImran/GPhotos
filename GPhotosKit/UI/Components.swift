@@ -136,7 +136,7 @@ public struct TransferProgressSummary: Equatable {
 /// The hero card: what is happening, how far along it is, and the one action that matters.
 public struct StatusCard<Actions: View>: View {
   private let status: BackupStatus
-  private let progress: TransferProgressSummary?
+  private let progress: @MainActor () -> TransferProgressSummary?
   private let actions: Actions
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -145,8 +145,14 @@ public struct StatusCard<Actions: View>: View {
   #endif
 
   public init(status: BackupStatus, progress: TransferProgressSummary?, @ViewBuilder actions: () -> Actions) {
+    self.init(status: status, liveProgress: { progress }, actions: actions)
+  }
+
+  public init(
+    status: BackupStatus, liveProgress: @escaping @MainActor () -> TransferProgressSummary?, @ViewBuilder actions: () -> Actions
+  ) {
     self.status = status
-    self.progress = progress
+    self.progress = liveProgress
     self.actions = actions()
   }
 
@@ -166,16 +172,12 @@ public struct StatusCard<Actions: View>: View {
           .transition(.blurReplace)
           .fixedSize()
       }
-      if let progress {
-        ProgressBlock(progress: progress, tint: status.tint, showsRate: status != .waitingForNetwork && status != .rateLimited)
-          .transition(.opacity.combined(with: .move(edge: .top)))
-      }
+      StatusCardProgress(status: status, summary: progress)
     }
     .padding(18)
     .frame(maxWidth: .infinity, alignment: .leading)
     .glassCard(cornerRadius: Radius.hero, tint: status.tint)
     .animation(reduceMotion ? nil : .smooth(duration: 0.45), value: status.kind)
-    .animation(reduceMotion ? nil : .smooth(duration: 0.35), value: progress == nil)
   }
 
   private var stacksActions: Bool {
@@ -206,6 +208,23 @@ public struct StatusCard<Actions: View>: View {
       .frame(maxWidth: .infinity, alignment: .leading)
     }
     .accessibilityElement(children: .combine)
+  }
+}
+
+private struct StatusCardProgress: View {
+  let status: BackupStatus
+  let summary: @MainActor () -> TransferProgressSummary?
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  var body: some View {
+    let progress = summary()
+    Group {
+      if let progress {
+        ProgressBlock(progress: progress, tint: status.tint, showsRate: status != .waitingForNetwork && status != .rateLimited)
+          .transition(.opacity.combined(with: .move(edge: .top)))
+      }
+    }
+    .animation(reduceMotion ? nil : .smooth(duration: 0.35), value: progress == nil)
   }
 }
 

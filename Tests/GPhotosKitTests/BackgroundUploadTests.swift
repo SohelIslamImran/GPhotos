@@ -25,7 +25,8 @@ struct BackgroundUploadTests {
     uploaded: Bool = true, pairedSHA1: String? = nil
   ) -> BackgroundUploadResult {
     BackgroundUploadResult(
-      recordID: recordID, accountEmail: "me@example.com", assetLocalIdentifier: "asset", role: .primary,
+      recordID: recordID, accountEmail: "me@example.com",
+      assetLocalIdentifier: TransferRecord.unscopedID(from: recordID), role: .primary,
       filename: "IMG_0001.HEIC", mediaType: "Photo", creationDate: nil, assetModifiedAt: modifiedAt, byteCount: 10,
       mediaKey: "key", sha1: "c2hh", pairedSHA1: pairedSHA1, uploaded: uploaded, foundInAccount: !uploaded,
       finishedAt: Date(timeIntervalSince1970: 200))
@@ -39,6 +40,54 @@ struct BackgroundUploadTests {
   }
 
   // MARK: - Ledger
+
+  @Test("Fast foreground polling follows jobs, results and live preparations")
+  func foregroundPollingTracksWork() {
+    var ledger = BackgroundUploadLedger()
+    let now = Date(timeIntervalSince1970: 10)
+    ledger.appBusyUntil = now.addingTimeInterval(100)
+    #expect(ledger.foregroundPollInterval(at: now) == .seconds(60))
+    ledger.appBusyUntil = nil
+    let claimed = ledger.claimForPreparation(recordID: "asset", jobID: "job", at: now)
+    #expect(claimed)
+    #expect(ledger.foregroundPollInterval(at: now) == .seconds(15))
+    #expect(ledger.foregroundPollInterval(at: now.addingTimeInterval(301)) == .seconds(60))
+    ledger.jobs = [job()]
+    #expect(ledger.foregroundPollInterval(at: now) == .seconds(15))
+    ledger.jobs = []
+    ledger.results = [result()]
+    #expect(ledger.foregroundPollInterval(at: now) == .seconds(15))
+  }
+
+  @Test("Bulk import persists settled receipts and leaves in-flight items for the next pass")
+  func bulkImport() async throws {
+    let url = temporaryDirectory().appendingPathComponent("manifest.json")
+    let store = TransferManifestStore(fileURL: url)
+    let first = result(recordID: "me@example.com|first")
+    let second = result(recordID: "me@example.com|second")
+    let inFlight = result(recordID: "me@example.com|sending")
+    let pending = TransferRecord(id: inFlight.recordID, filename: "IMG.HEIC", mediaType: "Photo", status: .pending)
+    #expect(await store.upsert(pending))
+    #expect(await store.claimForUpload(id: pending.id))
+    #expect(await store.recordBackgroundUploads([first, inFlight, second]) == [.recorded, .deferred, .recorded])
+    let restored = TransferManifestStore(fileURL: url)
+    #expect(await restored.record(for: first.recordID)?.status == .sent)
+    #expect(await restored.record(for: second.recordID)?.status == .sent)
+    #expect(await store.record(for: pending.id)?.status == .sending)
+  }
+
+  @Test("Bulk import restores in-memory records if the manifest cannot be written")
+  func bulkImportRollsBack() async throws {
+    let root = temporaryDirectory()
+    let blocked = root.appendingPathComponent("blocked")
+    try Data().write(to: blocked)
+    let store = TransferManifestStore(fileURL: blocked.appendingPathComponent("manifest.json"))
+    let first = result(recordID: "me@example.com|first")
+    let second = result(recordID: "me@example.com|second")
+    #expect(await store.recordBackgroundUploads([first, second]) == [.deferred, .deferred])
+    #expect(await store.record(for: first.recordID) == nil)
+    #expect(await store.record(for: second.recordID) == nil)
+  }
 
   @Test("Preparation and unimported results both hold the app off the record")
   func holdsRecordAcrossUploadHandoff() {

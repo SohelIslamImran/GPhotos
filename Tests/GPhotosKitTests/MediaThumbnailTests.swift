@@ -114,6 +114,21 @@ struct MediaThumbnailTests {
     #expect(await semaphore.availablePermits == 4)
   }
 
+  @Test("A cancelled queued thumbnail leaves before a permit is released")
+  func cancelledThumbnailWaiter() async {
+    let semaphore = AsyncSemaphore(maxPermits: 1)
+    #expect(await semaphore.wait())
+    let queued = Task { await semaphore.withPermit { true } }
+    while await semaphore.waitingCount == 0 { await Task.yield() }
+    queued.cancel()
+    #expect(await queued.value == nil)
+    #expect(await semaphore.waitingCount == 0)
+    #expect(await semaphore.availablePermits == 0)
+    await semaphore.signal()
+    #expect(await semaphore.withPermit { true } == true)
+    #expect(await semaphore.availablePermits == 1)
+  }
+
   @Test("TransferRecord mediaType helpers identify video, photo, and live photo")
   func transferRecordMediaHelpers() {
     let photo = TransferRecord(

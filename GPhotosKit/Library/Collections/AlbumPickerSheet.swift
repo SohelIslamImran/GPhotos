@@ -4,13 +4,16 @@ import SwiftUI
 /// Adds items to an existing album or a new one.
 struct AlbumPickerSheet: View {
   let assets: [PHAsset]
+  var count: Int? = nil
+  var resolve: (() async -> [PHAsset])? = nil
   let onDone: () -> Void
-  @State private var collections = PhotoCollectionsModel()
+  private let collections = PhotoCollectionsModel.shared
   @State private var isNaming = false
   @State private var newTitle = ""
   @State private var errorMessage: String?
 
   var body: some View {
+    let count = count ?? assets.count
     NavigationStack {
       List {
         Button {
@@ -21,7 +24,7 @@ struct AlbumPickerSheet: View {
         Section("Albums") {
           ForEach(collections.albums) { album in
             Button {
-              finish { try await LibraryActions.add(assets, toAlbum: album.id) }
+              finish { try await LibraryActions.add($0, toAlbum: album.id) }
             } label: {
               HStack(spacing: 12) {
                 LibraryThumbnail(id: album.keyAssetID, bucket: .small)
@@ -37,7 +40,7 @@ struct AlbumPickerSheet: View {
           }
         }
       }
-      .navigationTitle(assets.count == 1 ? "Add to Album" : "Add \(assets.count) Items to Album")
+      .navigationTitle(count <= 1 ? "Add to Album" : "Add \(count) Items to Album")
       #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
       #endif
@@ -50,7 +53,7 @@ struct AlbumPickerSheet: View {
         Button("Save") {
           let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
           guard !title.isEmpty else { return }
-          finish { try await LibraryActions.createAlbum(titled: title, with: assets) }
+          finish { try await LibraryActions.createAlbum(titled: title, with: $0) }
         }
       } message: {
         Text("Enter a name for this album.")
@@ -62,17 +65,18 @@ struct AlbumPickerSheet: View {
       } message: {
         Text(errorMessage ?? "")
       }
-      .task { await collections.load() }
+      .task { await collections.loadIfNeeded() }
     }
     #if os(macOS)
       .frame(minWidth: 360, minHeight: 420)
     #endif
   }
 
-  private func finish(_ action: @escaping @MainActor () async throws -> Void) {
+  private func finish(_ action: @escaping @MainActor ([PHAsset]) async throws -> Void) {
     Task {
       do {
-        try await action()
+        let current = await resolve?() ?? assets
+        if resolve == nil || !current.isEmpty { try await action(current) }
         onDone()
       } catch {
         errorMessage = error.localizedDescription

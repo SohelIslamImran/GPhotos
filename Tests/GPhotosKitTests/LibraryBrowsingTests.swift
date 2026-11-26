@@ -7,6 +7,21 @@ import Testing
 
 @Suite("Library browsing")
 struct LibraryBrowsingTests {
+  @Test("Backup utilities open the merged Library with the matching filter")
+  func backupCollectionRoutes() {
+    #expect(CollectionRoute.backupUtilities.compactMap(\.mergedLibraryFilter) == [.notBackedUp, .backedUp, .notIncludedInBackup])
+    #expect(CollectionRoute.scope(.all, .notBackedUp).mergedLibraryFilter == nil)
+    #expect(CollectionRoute.cloud(.library).mergedLibraryFilter == nil)
+  }
+
+  @Test("Backup filters describe their empty results")
+  func filterEmptyTitles() {
+    #expect(LibraryFilter.notBackedUp.emptyTitle == "No Items Need Backup")
+    #expect(LibraryFilter.notIncludedInBackup.emptyTitle == "No Items Excluded from Backup")
+    #expect(LibraryFilter.backedUp.emptyTitle == "Nothing Backed Up Yet")
+    #expect(LibraryFilter.videos.emptyTitle == "No Videos")
+  }
+
   private static let calendar: Calendar = {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(identifier: "UTC")!
@@ -105,13 +120,74 @@ struct LibraryBrowsingTests {
 
   @Test("Filters become PhotoKit predicates")
   func filters() {
-    #expect(LibraryFetch.predicate(for: .all, backedUpIDs: []) == nil)
-    #expect(LibraryFetch.predicate(for: .favorites, backedUpIDs: [])?.predicateFormat == "isFavorite == 1")
-    let notBackedUp = LibraryFetch.predicate(for: .notBackedUp, backedUpIDs: ["x"])?.predicateFormat ?? ""
-    #expect(notBackedUp.hasPrefix("NOT localIdentifier IN"))
+    #expect(LibraryFetch.predicate(for: .all) == nil)
+    #expect(LibraryFetch.predicate(for: .favorites)?.predicateFormat == "isFavorite == 1")
+    #expect(LibraryFetch.predicate(for: .notBackedUp) == nil)
+    #expect(LibraryFetch.predicate(for: .backedUp) == nil)
+    #expect(LibraryFetch.predicate(for: .notIncludedInBackup) == nil)
     #expect(LibraryScope.album(id: "1", title: "Trip").isDateOrdered == false)
     #expect(LibraryScope.all.isDateOrdered)
   }
+  @Test("Collections and the merged timeline use the same backup membership")
+  func backupFilterParity() {
+    let account = "current@example.com"
+    func record(_ id: String, status: TransferStatus, role: AssetResourceRole = .primary) -> TransferRecord {
+      TransferRecord(
+        id: "\(account)|\(id)", filename: "image.jpg", mediaType: "Photo", status: status,
+        sentAccountEmails: status == .sent ? [account] : [], assetLocalIdentifier: id, resourceRole: role)
+    }
+    var skipped = record("skipped", status: .failed)
+    skipped.isSkipped = true
+    let records = [
+      record("uploaded", status: .sent), record("edited", status: .sent), skipped,
+      record("raw-only", status: .sent, role: .alternatePhoto),
+    ]
+    let evidence = PhotoBackupEvidence.read(records, accountEmail: account, excludedAlbumIDs: [])
+    let ids = ["uploaded", "skip-source", "skipped", "local", "edited", "raw-only"]
+    let items = ids.map { id in
+      var item = DeviceItemInfo(localIdentifier: id, date: .distantPast, width: 1, height: 1, isVideo: false, isFavorite: false)
+      if id == "skip-source" { item.source = .typeCloudShared }
+      if id == "edited" {
+        item.version = PhotoBackupEvidence.Version(.init(modifiedAt: .now, hasAdjustments: true))
+      }
+      return item
+    }
+    for filter in [LibraryFilter.notBackedUp, .backedUp, .notIncludedInBackup] {
+      let collection = items.indices.filter { index in
+        let item = items[index]
+        return filter.includesBackupItem(
+          inScope: evidence.scope.includes(id: item.localIdentifier, source: item.source, isMedia: item.isMedia),
+          backedUp: evidence.state(for: item.localIdentifier, version: item.version.assetVersion) == .backedUp)
+      }
+      let merged = TimelineMerge.project(
+        device: items, cloud: [], uploadedMediaKeys: [:], uploadedSHA1s: [:], folder: [], uploadedFileKeys: [:],
+        filter: filter, hidesScreenshots: false, backup: evidence)
+      #expect(Set(merged.entries) == Set(collection.map { .device($0, cloud: nil) }))
+    }
+    #expect(evidence.states["raw-only"] == nil)
+    #expect(evidence.states["skipped"] == nil)
+    #expect(evidence.state(for: "edited", version: items[4].version.assetVersion) == nil)
+    #expect(!evidence.scope.includes(id: "skipped", source: .typeUserLibrary, isMedia: true))
+    #expect(!evidence.scope.includes(id: "local", source: .typeiTunesSynced, isMedia: true))
+    #expect(!evidence.scope.includes(id: "local", source: .typeUserLibrary, isMedia: true, isHidden: true))
+    #expect(evidence.scope.includes(id: "local", source: .typeUserLibrary, isMedia: true) == PhotoBackupScope.backsUpPhotos)
+    #expect(PhotoBackupEvidence.read(records, accountEmail: nil, excludedAlbumIDs: []).states.isEmpty)
+  }
+
+  @Test("A disabled folder remains browsable and moves out of Not Backed Up")
+  func disabledFolderScope() {
+    let item = FolderItemInfo(path: "/f/a.jpg", date: .distantPast, size: 1, isVideo: false)
+    func entries(_ filter: LibraryFilter) -> [UnifiedEntry] {
+      TimelineMerge.project(
+        device: [], cloud: [], uploadedMediaKeys: [:], uploadedSHA1s: [:], folder: [item], uploadedFileKeys: [:],
+        filter: filter, hidesScreenshots: false, excludedFilePaths: [item.path]
+      ).entries
+    }
+    #expect(entries(.all) == [.folder(0, cloud: nil)])
+    #expect(entries(.notIncludedInBackup) == [.folder(0, cloud: nil)])
+    #expect(entries(.notBackedUp).isEmpty)
+  }
+
 }
 
 @Suite("Merged timeline")
@@ -186,10 +262,10 @@ struct TimelineMergeTests {
     let devices = [device("d2", 200, favorite: true), device("d1", 100, video: true)]
     let clouds = [cloud("c3", 300), cloud("c2", 200, favorite: false)]
     #expect(
-      TimelineMerge.merge(device: devices, cloud: clouds, uploadedMediaKeys: [:], filter: .cloudOnly) == [.cloud(0)])
+      TimelineMerge.merge(device: devices, cloud: clouds, uploadedMediaKeys: [:], filter: .cloudOnly) == [.cloud(1), .cloud(0)])
     #expect(
       TimelineMerge.merge(device: devices, cloud: clouds, uploadedMediaKeys: [:], filter: .notBackedUp)
-        == [.device(1, cloud: nil)])
+        == [.device(1, cloud: nil), .device(0, cloud: 1)])
     #expect(
       TimelineMerge.merge(device: devices, cloud: clouds, uploadedMediaKeys: [:], filter: .favorites)
         == [.device(0, cloud: 1)])

@@ -136,7 +136,7 @@ enum BackgroundTaskRegistrar {
       await windDown(model)
       await model.prepareForBackground()
       if !model.continuedUpload.isRunning { PreparationGuard.shared.forgetInFlight() }
-      scheduleProcessing(for: model)
+      await scheduleProcessing(for: model)
     }
     await model.refreshRecords()
     guard model.selectedAccount != nil else { return "Open GPhotos and sign in to back up." }
@@ -184,7 +184,7 @@ enum BackgroundTaskRegistrar {
     if UIApplication.shared.applicationState == .background, !model.continuedUpload.isRunning {
       PreparationGuard.shared.forgetInFlight()
     }
-    scheduleProcessing(for: model)
+    await scheduleProcessing(for: model)
     scheduleMirror(for: model)
     activeBackupPass = nil
     gate.finish(success: success)
@@ -209,15 +209,49 @@ enum BackgroundTaskRegistrar {
     TaskRequests.submit(request)
   }
 
+  @MainActor
+  static func scheduleProcessingOnBackground(for model: AppModel) {
+    if model.hasKnownBackgroundWork {
+      submitProcessing()
+      return
+    }
+
+    var assertion = UIBackgroundTaskIdentifier.invalid
+    var work: Task<Void, Never>?
+    func endAssertion() {
+      guard assertion != .invalid else { return }
+      UIApplication.shared.endBackgroundTask(assertion)
+      assertion = .invalid
+    }
+    assertion = UIApplication.shared.beginBackgroundTask(withName: "Schedule photo backup") {
+      MainActor.assumeIsolated {
+        work?.cancel()
+        submitProcessing()
+        endAssertion()
+      }
+    }
+    guard assertion != .invalid else {
+      // We cannot wait for the ledger before suspension.
+      submitProcessing()
+      return
+    }
+    work = Task {
+      await scheduleProcessing(for: model)
+      endAssertion()
+    }
+  }
+
   /// Withdraws an earlier request when nothing is left, so the system doesn't wake the
   /// app for an empty pass.
   @MainActor
-  static func scheduleProcessing(for model: AppModel) {
-    guard model.hasPendingBackgroundWork else {
+  static func scheduleProcessing(for model: AppModel) async {
+    let hasWork = await model.hasPendingBackgroundWork()
+    guard !Task.isCancelled else { return }
+    if hasWork {
+      submitProcessing()
+    } else {
       TaskRequests.cancel(BackgroundTaskIdentifiers.processing)
-      return
     }
-    submitProcessing()
   }
 
   private static func submitProcessing() {

@@ -88,7 +88,8 @@ public struct LibraryView: View {
 
   private func refreshBackupStates() async {
     await model.updateBackupStates(
-      from: records, confirmedCloudAssets: cloud?.localAssetIDs ?? [:], accountEmail: cloud?.accountEmail)
+      from: records, confirmedCloudIDs: cloud?.localFirstThumbnails.localCopies.confirmedAssetIDs ?? [],
+      accountEmail: cloud?.accountEmail)
   }
 
   private func lifecycle(_ view: some View) -> some View {
@@ -103,6 +104,9 @@ public struct LibraryView: View {
       }
       .onChange(of: cloud?.accountEmail) { Task { await refreshBackupStates() } }
       .onChange(of: cloud?.localCopyRevision) { Task { await refreshBackupStates() } }
+      .onReceive(NotificationCenter.default.publisher(for: AppSettingsStore.didChange).receive(on: DispatchQueue.main)) { _ in
+        Task { await refreshBackupStates() }
+      }
       // Positions shift when photos arrive or leave, so the selection follows its photos.
       .onChange(of: model.reloadToken) {
         guard !selection.isEmpty else { return }
@@ -245,7 +249,7 @@ public struct LibraryView: View {
   @ViewBuilder private var emptyState: some View {
     if model.filter != .all {
       ContentUnavailableView {
-        Label("No \(model.filter.title)", systemImage: model.filter.symbol)
+        Label(model.filter.emptyTitle, systemImage: model.filter.symbol)
       } actions: {
         Button("Show All Items") { Task { await model.setFilter(.all) } }
       }
@@ -327,7 +331,7 @@ public struct LibraryView: View {
   @ViewBuilder private var selectionButtons: some View {
     let assets = picked
     PhotoShareButton(
-      items: assets.map(SharedAsset.init), ids: assets.map(\.localIdentifier),
+      items: assets.map(SharedAsset.init), identities: assets.map(PhotoKitImageSource.identity(for:)),
       videoCount: assets.filter { $0.mediaType == .video }.count
     ) {
       Label("Share", systemImage: "square.and.arrow.up")
@@ -396,7 +400,7 @@ public struct LibraryView: View {
       items.append(
         PhotoGridMenuItem(String(localized: "Share"), systemImage: "square.and.arrow.up") {
           SharePresenter.share(
-            assets.map(SharedAsset.init), ids: assets.map(\.localIdentifier),
+            assets.map(SharedAsset.init), identities: assets.map(PhotoKitImageSource.identity(for:)),
             videoCount: assets.filter { $0.mediaType == .video }.count)
         })
     #endif

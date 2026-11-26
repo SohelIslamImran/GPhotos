@@ -22,6 +22,11 @@ public struct GoogleAccount: Identifiable, Codable, Hashable, Sendable {
     self.addedDate = addedDate
     self.mirrorEnabled = mirrorEnabled
   }
+
+  /// Whether a service signed in as `other` is signed in as this account too.
+  func hasSameCredential(as other: Self) -> Bool {
+    email == other.email && androidId == other.androidId && credentialString == other.credentialString
+  }
 }
 
 public struct KeychainAccountPayload: Codable, Sendable, Equatable {

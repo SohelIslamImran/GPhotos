@@ -175,6 +175,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
 }
 
 public enum AppSettingsStore {
+  static let didChange = Notification.Name("AppSettingsDidChange")
   private static var settingsURL: URL {
     AppGroupConstants.storageDirectory().appendingPathComponent(AppGroupConstants.settingsFileName)
   }
@@ -214,6 +215,7 @@ public enum AppSettingsStore {
   public static func save(_ settings: AppSettings) throws {
     let data = try JSONEncoder().encode(settings)
     try data.write(to: settingsURL, options: .atomic)
+    NotificationCenter.default.post(name: didChange, object: nil)
   }
 }
 
