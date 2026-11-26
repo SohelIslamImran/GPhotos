@@ -17,25 +17,31 @@ struct FileViewerPage: View {
   /// The viewer's video controls, given this page's player while it's showing.
   let playback: VideoPlayback
   @State private var image: CGImage?
+  @State private var isLoadingImage = false
+  @State private var didFail = false
   @State private var pixelSize: CGSize = .zero
-  @State private var loadedLongSide: CGFloat = 0
-  @State private var token: ImageRequestToken?
-  @State private var detailToken: ImageRequestToken?
+  @State private var token: ThumbnailTicket?
+  @State private var detailToken: ThumbnailTicket?
   @State private var player: AVPlayer?
 
   /// Above this, zooming shows the most detail a layer can hold without tiling.
   private static let maxPixels: CGFloat = 24_000_000
 
   var body: some View {
-    ZStack {
-      ZoomableImage(
-        image: image, pixelSize: pixelSize, liveText: isCurrent && !item.isVideo, onZoom: loadDetail, onTap: onTap,
-        onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player)
-      if image == nil || (item.isVideo && isCurrent && player == nil) { ProgressView() }
-    }
+    ZoomableImage(
+      image: image, pixelSize: pixelSize, previewIdentity: item.thumbnailIdentity, isCurrent: isCurrent,
+      isLoading: isLoadingImage, didFail: didFail,
+      isBuffering: item.isVideo && (player == nil || (playback.player === player && playback.isBuffering)),
+      liveText: isCurrent && !item.isVideo,
+      onZoom: loadDetail, onTap: onTap, onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player
+    )
     .accessibilityElement(children: .contain)
     .accessibilityLabel(Text(item.fileName))
-    .task { await load() }
+    .task(id: isCurrent ? screenPixels : .zero) {
+      token?.cancel()
+      token = nil
+      if isCurrent, !Task.isCancelled { await load() }
+    }
     .onDisappear(perform: unload)
     .task(id: isCurrent) {
       if isCurrent { startVideo() } else { player?.pause() }
@@ -46,31 +52,45 @@ struct FileViewerPage: View {
     CGSize(width: containerSize.width * displayScale, height: containerSize.height * displayScale)
   }
 
+  private var cachedPreview: CGImage? { ThumbnailPipeline.shared.viewerPreview(for: item.thumbnailIdentity) }
+
   private func load() async {
-    if let cached = ThumbnailPipeline.shared.placeholder(for: ThumbnailKey(id: item.id, bucket: .huge)) { image = cached }
+    let intrinsic = max(pixelSize.width, pixelSize.height)
+    let screenSide = max(screenPixels.width, screenPixels.height)
+    let side = intrinsic > 0 ? min(intrinsic, screenSide) : screenSide
+    if side > 0, !ViewerImage.hasFittedPreview(for: item.thumbnailIdentity, target: CGSize(width: side, height: 0), isFile: true) {
+      request(longSide: side, isDetail: false, joining: CGSize(width: screenSide, height: screenSide))
+    }
+    guard pixelSize == .zero else { return }
     let url = item.url
     let isVideo = item.isVideo
-    pixelSize = await Task.detached(priority: .userInitiated) { await Self.pixelSize(of: url, isVideo: isVideo) }.value
-    request(longSide: max(screenPixels.width, screenPixels.height), isDetail: false)
+    let size = await Self.pixelSize(of: url, isVideo: isVideo)
+    guard !Task.isCancelled else { return }
+    pixelSize = size
   }
 
-  private func request(longSide: CGFloat, isDetail: Bool) {
-    let request = FolderLibrary.shared.thumbnails.requestImage(
-      id: item.id, pixelSize: CGSize(width: longSide, height: longSide), quality: .display
-    ) { cgImage, _ in
-      Task { @MainActor in
-        let side = CGFloat(max(cgImage.width, cgImage.height))
-        guard side >= loadedLongSide else { return }
-        image = cgImage
-        loadedLongSide = side
-      }
+  private func request(longSide: CGFloat, isDetail: Bool, joining: CGSize? = nil) {
+    if !isDetail {
+      isLoadingImage = !item.isVideo
+      didFail = false
     }
+    let request = ViewerImage.request(
+      FolderLibrary.shared.thumbnails, identity: item.thumbnailIdentity, pixels: CGSize(width: longSide, height: longSide),
+      isFile: true, joining: joining, onEnd: { if !isDetail { ended() } },
+      deliver: { candidate, isFinal in
+        if ViewerImage.accepts(candidate, over: image ?? cachedPreview, isFinal: isFinal) { image = candidate }
+      })
     if isDetail {
       detailToken?.cancel()
       detailToken = request
     } else {
       token = request
     }
+  }
+
+  private func ended() {
+    isLoadingImage = false
+    didFail = !item.isVideo && image == nil && cachedPreview == nil
   }
 
   /// Asks for enough pixels for the current zoom, capped at the original size.
@@ -82,17 +102,17 @@ struct FileViewerPage: View {
     wanted = min(wanted, full)
     let aspect = min(pixelSize.width, pixelSize.height) / full
     if wanted * wanted * aspect > Self.maxPixels { wanted = (Self.maxPixels / aspect).squareRoot() }
-    guard wanted > loadedLongSide * 1.25 else { return }
+    guard wanted > CGFloat(ViewerImage.longSide(image ?? cachedPreview)) * 1.25 else { return }
     request(longSide: wanted, isDetail: true)
   }
 
   private func unload() {
+    isLoadingImage = false
     token?.cancel()
     detailToken?.cancel()
     token = nil
     detailToken = nil
     image = nil
-    loadedLongSide = 0
     player?.pause()
     player = nil
   }
@@ -112,7 +132,7 @@ struct FileViewerPage: View {
   }
 
   /// The photo's or video's size in pixels, upright.
-  nonisolated static func pixelSize(of url: URL, isVideo: Bool) async -> CGSize {
+  @concurrent static func pixelSize(of url: URL, isVideo: Bool) async -> CGSize {
     if isVideo {
       guard let track = try? await AVURLAsset(url: url).loadTracks(withMediaType: .video).first,
         let (natural, transform) = try? await track.load(.naturalSize, .preferredTransform)

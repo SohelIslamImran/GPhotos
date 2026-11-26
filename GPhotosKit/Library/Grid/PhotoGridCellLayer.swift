@@ -19,7 +19,24 @@ final class PhotoGridCellLayer: CALayer {
   ]
 
   var itemID: String?
+  var thumbnailIdentity: ThumbnailIdentity?
+  /// The image is the item's older version, kept until the newer one is here.
+  var isStale = false
   var ticket: ThumbnailTicket?
+  var requestedBucket: ThumbnailBucket?
+  var requestQuality: ImageRequestQuality?
+  var requestState: RequestState = .missing
+
+  enum RequestState { case pending, missing, ready }
+
+  /// Its final image is still on its way.
+  var isWaiting: Bool { requestState == .pending || (contents == nil && requestState != .missing) }
+
+  @MainActor func cancelImageRequest() {
+    ticket?.cancel()
+    ticket = nil
+    if requestState == .pending { requestState = .missing }
+  }
   @MainActor var isSelected = false {
     didSet {
       guard isSelected != oldValue else { return }
@@ -71,6 +88,7 @@ final class PhotoGridCellLayer: CALayer {
 
   @MainActor func setImage(_ image: CGImage) {
     contents = image
+    isStale = false
     let width = CGFloat(image.width)
     let height = CGFloat(image.height)
     guard width > 0, height > 0 else { return }
@@ -81,9 +99,13 @@ final class PhotoGridCellLayer: CALayer {
   }
 
   @MainActor func prepareForReuse() {
-    ticket?.cancel()
-    ticket = nil
+    cancelImageRequest()
+    isStale = false
+    requestedBucket = nil
+    requestQuality = nil
+    requestState = .missing
     itemID = nil
+    thumbnailIdentity = nil
     contents = nil
     isSelected = false
     showsSelectionCircle = false
@@ -182,6 +204,7 @@ final class PhotoGridCellLayer: CALayer {
   }
 
   private func layoutBadges() {
+    guard shade != nil || backupLayer != nil || selectionLayer != nil || circleLayer != nil else { return }
     let layout = Self.badgeLayout(side: bounds.width)
     let opacity: Float = layout.shows ? 1 : 0
     shade?.frame = bounds
@@ -204,6 +227,7 @@ final class PhotoGridCellLayer: CALayer {
   /// The badges follow a size change the cell is animating with `animation`, instead of
   /// jumping to where they sit at the new size while the cell is still on its way.
   func animateBadges(fromSide oldSide: CGFloat, animation: (String) -> CABasicAnimation) {
+    guard shade != nil || backupLayer != nil || selectionLayer != nil || circleLayer != nil else { return }
     layoutBadges()
     let old = Self.badgeLayout(side: oldSide)
     let new = Self.badgeLayout(side: bounds.width)

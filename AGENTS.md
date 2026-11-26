@@ -112,6 +112,19 @@ sidebar and glass surfaces don't draw in it). These compile out of Release.
   unless the user asks, or a backup to the account has just finished (one delta at least a
   minute after the last sync, shared by batches close together). The mirror and thumbnail
   cache are deleted with the account.
+- Items in Google's Locked Folder stay behind device authentication (`LockedFolderView`,
+  `LockedItems`). The mirror keeps only what marks and lists one (key, date, kind, shape);
+  nothing else of it reaches disk, shared image caches, the launch snapshot, the search
+  index, Siri/Spotlight, widgets, Recently Viewed, Handoff or sharing. When a sync reports an
+  item as locked, everything kept of it is purged; unknown state fails closed.
+- Matching device and folder copies to Google items by their bytes (`LocalAssetHashes`,
+  `PhotoBackupEvidence`) is display evidence only: it never decides an upload or deletion.
+- Account changes are one serialized transition (`SyncEngine`): work for the old account is
+  drained before the new credential is installed, and a `RemoteCopyVerifier` result counts
+  only if the same credential was installed throughout.
+- "Not Backed Up" lists what backup would upload and hasn't confirmed for the current
+  account; what it leaves out on purpose is in "Not Included in Backup". The two and
+  "Backed Up" never overlap.
 - Performance changes must not trade away functionality: uploads keep working on battery,
   in Low Data Mode and in the background.
 

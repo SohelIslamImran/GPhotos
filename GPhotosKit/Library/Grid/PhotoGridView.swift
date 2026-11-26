@@ -1,4 +1,5 @@
 import AppIntents
+import Combine
 import QuartzCore
 import SwiftUI
 import UniformTypeIdentifiers
@@ -76,17 +77,27 @@ public struct PhotoGridOptions {
   /// The newest items are last, as in Photos: the grid opens at its end, stays there as
   /// items change, and that end is where the tab bar grows back (iOS).
   public var startsAtEnd = false
+  /// Align the last row and keep a visible item in place when reading more of a timeline.
+  public var alignsNewestRow = false
+  var positionOfItem: ((String) -> Int?)?
+  var currentReloadToken: (() -> Int)?
   /// With `startsAtEnd`, the grid reaches or leaves its newest end (iOS).
   public var onAtEndChange: ((Bool) -> Void)?
   /// The first time the grid has items drawn on screen (iOS).
   public var onShowItems: (() -> Void)?
+  /// How many items a saved image of the grid stands in for while it has none: it scrolls
+  /// as far, so the bar over it already looks as it will (iOS).
+  var placeholderCount = 0
+  /// That image. It's drawn in the scroll view, so the system's bar effect covers it as it
+  /// does the cells, and fades out when it's taken away (iOS).
+  var placeholderImage: CGImage?
 
   public init(
     isSelecting: Bool = false, onTopIndexChange: ((Int) -> Void)? = nil,
     menu: ((Set<Int>) -> [PhotoGridMenuItem])? = nil, dragItem: ((Int) -> PhotoGridDragItem?)? = nil,
     proxy: PhotoGridProxy? = nil, onPinchPastDensest: (() -> Void)? = nil,
     onScrolledUnderBarChange: ((Bool) -> Void)? = nil, topPadding: CGFloat = 0, bottomInset: CGFloat? = nil,
-    startsAtEnd: Bool = false, onAtEndChange: ((Bool) -> Void)? = nil, onShowItems: (() -> Void)? = nil
+    startsAtEnd: Bool = false, alignsNewestRow: Bool = false, onAtEndChange: ((Bool) -> Void)? = nil, onShowItems: (() -> Void)? = nil
   ) {
     self.isSelecting = isSelecting
     self.onTopIndexChange = onTopIndexChange
@@ -98,6 +109,7 @@ public struct PhotoGridOptions {
     self.topPadding = topPadding
     self.bottomInset = bottomInset
     self.startsAtEnd = startsAtEnd
+    self.alignsNewestRow = alignsNewestRow
     self.onAtEndChange = onAtEndChange
     self.onShowItems = onShowItems
   }
@@ -257,6 +269,7 @@ public struct PhotoGrid: View {
 final class PhotoGridCoordinator {
   var reloadToken = 0
   var badgeToken = 0
+  var acceptsRowInput: Bool { options.currentReloadToken.map { $0() == reloadToken } ?? true }
   var options = PhotoGridOptions()
   var lastTopIndex: Int?
   var onOpen: (Int) -> Void = { _ in }
@@ -307,11 +320,29 @@ final class PhotoGridCoordinator {
     scheduleReports()
   }
 
-  func reportTop(_ index: Int?) {
-    guard let index, index != lastTopIndex else { return }
+  func reportTop(_ index: Int?, reloaded: Bool = false) {
+    guard let index, reloaded || index != lastTopIndex else { return }
     lastTopIndex = index
     pendingTop = true
     scheduleReports()
+  }
+
+  func offsetPreservingCell(
+    _ previous: [String: PhotoGridCellLayer]?, visible: CGRect, layout: PhotoGridLayout
+  ) -> CGFloat? {
+    guard let previous, let position = options.positionOfItem else { return nil }
+    var best: CGRect?
+    var offset: CGFloat?
+    for (id, cell) in previous {
+      let frame = cell.frame
+      guard frame.intersects(visible),
+        best.map({ frame.minY == $0.minY ? frame.minX < $0.minX : frame.minY < $0.minY }) ?? true,
+        let index = position(id)
+      else { continue }
+      best = frame
+      offset = layout.frame(at: index).minY - (frame.minY - visible.minY)
+    }
+    return offset
   }
 
   /// Native layout can run inside a representable update. Publish SwiftUI state after
@@ -364,13 +395,17 @@ final class PhotoGridCoordinator {
       view.zoomStep = zoomStep
       context.coordinator.zoomStepChanged(to: zoomStep)
       view.setDataSource(dataSource)
+      view.showPlaceholder(options.placeholderImage)
       return view
     }
 
     func updateUIView(_ view: PhotoGridUIView, context: Context) {
       let coordinator = context.coordinator
       let insetChanged = coordinator.options.bottomInset != options.bottomInset
+      let placeholderChanged = coordinator.options.placeholderCount != options.placeholderCount
       coordinator.options = options
+      if placeholderChanged { view.placeholderChanged() }
+      view.showPlaceholder(options.placeholderImage)
       if insetChanged { view.setNeedsLayout() }
       options.proxy?.frameProvider = { [weak view] index, reveal in view?.visibleFrame(of: index, revealing: reveal) }
       options.proxy?.endScroller = { [weak view] in view?.scrollToEnd() }
@@ -415,10 +450,19 @@ final class PhotoGridCoordinator {
   final class PhotoPreviewController: UIViewController {
     private let imageView = UIImageView()
     private var token: ImageRequestToken?
+    private var lockObservation: AnyCancellable?
 
-    init(image: CGImage?, size: CGSize) {
+    init(image: CGImage?, size: CGSize, identity: ThumbnailIdentity) {
       super.init(nibName: nil, bundle: nil)
-      imageView.image = image.map { UIImage(cgImage: $0) }
+      imageView.image = identity.isLocked ? nil : image.map { UIImage(cgImage: $0) }
+      lockObservation = NotificationCenter.default.publisher(for: LockedItems.didLock)
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+          if identity.isLocked {
+            self?.token?.cancel()
+            self?.imageView.image = nil
+          }
+        }
       imageView.contentMode = .scaleAspectFill
       imageView.clipsToBounds = true
       imageView.backgroundColor = .secondarySystemBackground
@@ -429,10 +473,13 @@ final class PhotoGridCoordinator {
 
     override func loadView() { view = imageView }
 
-    func load(id: String, from source: any ThumbnailSource, pixelSize: CGSize) {
-      token = source.requestImage(id: id, pixelSize: pixelSize, quality: .display) { [weak self] image, _ in
+    func load(identity: ThumbnailIdentity, from source: any ThumbnailSource, pixelSize: CGSize) {
+      guard !identity.isLocked else { return }
+      token = source.requestImage(id: identity.id, pixelSize: pixelSize, quality: .display) { [weak self] image, _ in
         let box = UncheckedImage(image)
-        Task { @MainActor in self?.imageView.image = UIImage(cgImage: box.image) }
+        Task { @MainActor in
+          if !identity.isLocked { self?.imageView.image = UIImage(cgImage: box.image) }
+        }
       }
     }
 
@@ -472,6 +519,12 @@ final class PhotoGridCoordinator {
           self?.reportShowingItems()
         }
       }
+      // Posted from whichever thread a sync runs on; on the main one it's handled at once.
+      lockObserver = NotificationCenter.default.addObserver(forName: LockedItems.didLock, object: nil, queue: .main) {
+        [weak self] _ in
+        // The picture may show what was just locked, even while it fades.
+        MainActor.assumeIsolated { self?.endPlaceholder() }
+      }
       addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTap(_:))))
       addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:))))
       let selectPan = UIPanGestureRecognizer(target: self, action: #selector(handleSelectPan(_:)))
@@ -491,6 +544,10 @@ final class PhotoGridCoordinator {
       }
     }
 
+    isolated deinit {
+      if let lockObserver { NotificationCenter.default.removeObserver(lockObserver) }
+    }
+
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     /// Photos under the top bar darken it; not before they're drawn, or the bar goes dark
@@ -501,12 +558,25 @@ final class PhotoGridCoordinator {
     }
 
     private var hasShownItems = false
+    private var shownTime: CFTimeInterval?
+    private var firstPixelsTime: CFTimeInterval?
+    private var isCheckingPixels = false
 
     /// Once, when items are first drawn: right away if their images were cached, else
     /// when the renderer reveals them.
     private func reportShowingItems() {
-      guard !hasShownItems, renderer.isShowing, !renderer.layout.indices(in: bounds).isEmpty else { return }
+      guard !hasShownItems, renderer.hasPixels(in: bounds) else { return }
+      // A saved screen stays until every cell under it has its image, or they'd flash.
+      if placeholderView != nil, !renderer.hasAllPixels(in: bounds) {
+        let now = CACurrentMediaTime()
+        if firstPixelsTime == nil { firstPixelsTime = now }
+        if let first = firstPixelsTime, now - first < 2.5 {
+          checkPixels()
+          return
+        }
+      }
       hasShownItems = true
+      shownTime = CACurrentMediaTime()
       // Layout can run inside a SwiftUI update, which mustn't change state itself.
       DispatchQueue.main.async {
         self.reportScrolledUnderBar()
@@ -514,8 +584,40 @@ final class PhotoGridCoordinator {
       }
     }
 
+    private func checkPixels() {
+      guard !isCheckingPixels else { return }
+      isCheckingPixels = true
+      Task { [weak self] in
+        while let self, !self.hasShownItems, self.placeholderView != nil {
+          try? await Task.sleep(for: .milliseconds(50))
+          if let first = self.firstPixelsTime, CACurrentMediaTime() - first >= 2.5 {
+            self.endPlaceholder()
+          } else {
+            self.reportShowingItems()
+          }
+        }
+        self?.isCheckingPixels = false
+      }
+    }
+
+    /// The user is at the grid itself, or what the image shows mustn't be seen.
+    private func endPlaceholder() {
+      guard let view = placeholderView else { return }
+      view.layer.removeAllAnimations()
+      view.removeFromSuperview()
+      placeholderView = nil
+      isPlaceholderOver = true
+      guard !hasShownItems else { return }
+      hasShownItems = true
+      shownTime = CACurrentMediaTime()
+      DispatchQueue.main.async {
+        self.reportScrolledUnderBar()
+        self.coordinator?.options.onShowItems?()
+      }
+    }
+
     func snapshotImage() -> CGImage? {
-      guard renderer.isShowing, bounds.width > 0, bounds.height > 0 else { return nil }
+      guard renderer.hasPixels(in: bounds), !renderer.hasLockedPixels(in: bounds), bounds.width > 0, bounds.height > 0 else { return nil }
       let format = UIGraphicsImageRendererFormat(for: traitCollection)
       format.opaque = true
       // The renderer's bounds are the visible part of the content, so the cells draw where
@@ -546,26 +648,39 @@ final class PhotoGridCoordinator {
     private var columns: Int { PhotoGridZoom.columnSteps[min(max(zoomStep, 0), PhotoGridZoom.columnSteps.count - 1)] }
 
     func setDataSource(_ dataSource: any PhotoGridDataSource) {
+      cancelRowGestures()
       let fromEnd = pinnedToEnd ? 0 : max(0, endOffset - contentOffset.y)
       // The same library with items added or removed animates; a new one just appears.
-      let animates =
-        renderer.dataSource === dataSource && window != nil && renderer.layout.itemCount > 0
-        && !UIAccessibility.isReduceMotionEnabled
+      let sameSource = renderer.dataSource === dataSource && dataSource.itemCount > 0
+      // What the launch's last reads and first sync change just appears: cells growing in
+      // and shrinking away as the app opens look like a glitch.
+      let isSettled = shownTime.map { CACurrentMediaTime() - $0 > 4 } ?? false
+      let animates = sameSource && isSettled && window != nil && !UIAccessibility.isReduceMotionEnabled
       let oldOffset = contentOffset.y
-      let previous = animates ? renderer.detachCells() : nil
+      let previous = sameSource ? renderer.detachCells() : nil
+      if !sameSource { renderer.tearDown() }
       renderer.dataSource = dataSource
+      renderer.displayScale = traitCollection.displayScale
+      let layout = makeLayout()
+      let anchor = pinnedToEnd ? nil : coordinator?.offsetPreservingCell(previous, visible: bounds, layout: layout)
+      isChangingColumns = true
       keepingEnd {
-        applyLayout(animated: false)
+        contentSize = CGSize(width: bounds.width, height: contentHeight(layout))
         // Items added or removed above stay out of sight: the grid keeps its place
         // counted from the newest end.
-        if startsAtEnd { contentOffset.y = max(-adjustedContentInset.top, endOffset - fromEnd) }
+        if startsAtEnd {
+          contentOffset.y = min(endOffset, max(-adjustedContentInset.top, anchor ?? (endOffset - fromEnd)))
+        }
       }
+      isChangingColumns = false
+      renderer.setLayout(layout, visibleRect: bounds, populate: false)
       if let previous {
-        renderer.reloadData(visibleRect: bounds, previous: previous, shift: contentOffset.y - oldOffset)
+        renderer.reloadData(visibleRect: bounds, previous: previous, shift: contentOffset.y - oldOffset, animated: animates)
       } else {
         renderer.reloadData(visibleRect: bounds)
       }
       accessibilityCache = nil
+      coordinator?.reportTop(renderer.topIndex(atY: contentOffset.y + adjustedContentInset.top), reloaded: true)
     }
 
     func windowFrame(of index: Int, revealing: Bool) -> CGRect? {
@@ -577,6 +692,7 @@ final class PhotoGridCoordinator {
     /// To the newest items with a scroll, as when Library is chosen again in Photos. From
     /// far away it starts a few screens out, so it doesn't race through the library.
     func scrollToEnd() {
+      endPlaceholder()
       let end = endOffset
       guard !UIAccessibility.isReduceMotionEnabled else {
         contentOffset.y = end
@@ -587,9 +703,46 @@ final class PhotoGridCoordinator {
       setContentOffset(CGPoint(x: 0, y: end), animated: true)
     }
 
+    private var placeholderView: UIImageView?
+    private var lockObserver: (any NSObjectProtocol)?
+    private var isPlaceholderOver = false
+
+    func showPlaceholder(_ image: CGImage?) {
+      guard let image else {
+        guard let view = placeholderView else { return }
+        // It fades only into the live grid.
+        guard hasShownItems else { return endPlaceholder() }
+        guard !isPlaceholderOver else { return }
+        isPlaceholderOver = true
+        UIView.animate(withDuration: UIAccessibility.isReduceMotionEnabled ? 0 : 0.3) {
+          view.alpha = 0
+        } completion: { [weak self] _ in
+          view.removeFromSuperview()
+          if self?.placeholderView === view { self?.placeholderView = nil }
+        }
+        return
+      }
+      guard placeholderView == nil, !isPlaceholderOver else { return }
+      let view = UIImageView(image: UIImage(cgImage: image))
+      view.isUserInteractionEnabled = false
+      view.frame = bounds
+      // UIKit's bar effects are the scroll view's first subviews: under them, over the cells.
+      if let effects = subviews.first { insertSubview(view, belowSubview: effects) } else { addSubview(view) }
+      placeholderView = view
+    }
+
+    func placeholderChanged() {
+      guard renderer.layout.itemCount == 0, bounds.width > 0 else { return }
+      keepingEnd {
+        contentSize = CGSize(width: bounds.width, height: contentHeight(makeLayout()))
+        positionAtEndIfPinned()
+      }
+    }
+
     private var startsAtEnd: Bool { coordinator?.options.startsAtEnd == true }
     /// With `startsAtEnd`, whether the grid shows (and keeps showing) its last row.
     private var pinnedToEnd = true
+    private var lastInsets: UIEdgeInsets = .zero
     private var isKeepingEnd = false
     private var isChangingColumns = false
     /// Where the pinch started, in content coordinates: the grid scales about it.
@@ -606,17 +759,18 @@ final class PhotoGridCoordinator {
       isKeepingEnd = false
     }
 
-    private func makeLayout() -> PhotoGridLayout {
-      PhotoGridLayout(
-        columns: columns, spacing: columns >= 7 ? 1 : 2, width: bounds.width,
-        itemCount: renderer.dataSource?.itemCount ?? 0, pixelScale: traitCollection.displayScale)
+    private func contentHeight(_ layout: PhotoGridLayout) -> CGFloat {
+      guard layout.itemCount == 0, let count = coordinator?.options.placeholderCount, count > 0 else { return layout.contentHeight }
+      return makeLayout(itemCount: count).contentHeight
     }
 
-    private func applyLayout(animated: Bool) {
-      renderer.displayScale = traitCollection.displayScale
-      let layout = makeLayout()
-      contentSize = CGSize(width: bounds.width, height: layout.contentHeight)
-      renderer.setLayout(layout, visibleRect: bounds, animated: animated)
+    private func makeLayout() -> PhotoGridLayout { makeLayout(itemCount: renderer.dataSource?.itemCount ?? 0) }
+
+    private func makeLayout(itemCount: Int) -> PhotoGridLayout {
+      PhotoGridLayout(
+        columns: columns, spacing: columns >= 7 ? 1 : 2, width: bounds.width,
+        itemCount: itemCount, pixelScale: traitCollection.displayScale,
+        alignsNewestRow: coordinator?.options.alignsNewestRow == true)
     }
 
     override func layoutSubviews() {
@@ -630,20 +784,52 @@ final class PhotoGridCoordinator {
         }
       }
       super.layoutSubviews()
-      if renderer.layout.width != bounds.width || renderer.displayScale != traitCollection.displayScale {
-        keepingEnd { applyLayout(animated: false) }
-      } else {
-        renderer.update(visibleRect: bounds, velocity: velocity)
+      defer {
+        if let placeholderView {
+          // A picture of another size (rotated, resized) would show other photos than the taps reach.
+          if placeholderView.frame.size != .zero, placeholderView.frame.size != bounds.size { endPlaceholder() }
+          self.placeholderView?.frame = bounds
+        }
       }
-      if let pendingScroll, bounds.width > 0 {
+      guard !isChangingColumns else { return }
+      let changesLayout = renderer.layout.width != bounds.width || renderer.displayScale != traitCollection.displayScale
+      if changesLayout {
+        renderer.displayScale = traitCollection.displayScale
+        let layout = makeLayout()
+        keepingEnd {
+          contentSize = CGSize(width: bounds.width, height: contentHeight(layout))
+          positionAtEndIfPinned()
+        }
+        renderer.setLayout(layout, visibleRect: bounds, populate: pendingScroll == nil)
+      } else {
+        keepingEnd { positionAtEndIfPinned() }
+      }
+      if let pendingScroll, bounds.width > 0, bounds.height > 0 {
         scroll(to: pendingScroll)
-      } else if startsAtEnd, pinnedToEnd, !isTracking, !isDecelerating, contentOffset.y != endOffset {
-        keepingEnd { contentOffset.y = endOffset }
+      } else if !changesLayout {
+        renderer.update(visibleRect: bounds, velocity: velocity)
       }
       reportShowingItems()
     }
 
+    override func adjustedContentInsetDidChange() {
+      super.adjustedContentInsetDidChange()
+      setNeedsLayout()
+    }
+
+    private func positionAtEndIfPinned() {
+      lastInsets = adjustedContentInset
+      if startsAtEnd, pinnedToEnd, !isTracking, !isDecelerating, contentOffset.y != endOffset {
+        contentOffset.y = endOffset
+      }
+    }
+
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+      guard !isChangingColumns else {
+        lastInsets = adjustedContentInset
+        lastOffset = contentOffset.y
+        return
+      }
       let now = CACurrentMediaTime()
       let offset = contentOffset.y
       let elapsed = now - lastScrollTime
@@ -661,9 +847,15 @@ final class PhotoGridCoordinator {
         accessibilityRange = range
         accessibilityCache = nil
       }
-      if !isChangingColumns { coordinator?.reportTop(renderer.topIndex(atY: offset + adjustedContentInset.top)) }
+      coordinator?.reportTop(renderer.topIndex(atY: offset + adjustedContentInset.top))
       reportScrolledUnderBar()
-      if startsAtEnd, !isKeepingEnd {
+      // A new grid gets its safe area late, and UIKit moves the content with it: that isn't
+      // the user leaving the end, so the next layout puts the grid back there.
+      let insetsChanged = adjustedContentInset != lastInsets
+      lastInsets = adjustedContentInset
+      if startsAtEnd, insetsChanged, pinnedToEnd, !isTracking, !isDecelerating {
+        setNeedsLayout()
+      } else if startsAtEnd, !isKeepingEnd {
         pinnedToEnd = offset >= endOffset - 2
         coordinator?.reportAtEnd(pinnedToEnd)
       }
@@ -681,6 +873,8 @@ final class PhotoGridCoordinator {
       if revealing, shown.isNull || shown.height < frame.height / 2 {
         let maxOffset = max(-adjustedContentInset.top, contentSize.height - bounds.height + adjustedContentInset.bottom)
         let target = frame.midY - adjustedContentInset.top - visible.height / 2
+        lastInsets = adjustedContentInset
+        endPlaceholder()
         contentOffset.y = min(maxOffset, max(-adjustedContentInset.top, target))
         settle()
       }
@@ -727,16 +921,21 @@ final class PhotoGridCoordinator {
     private var pendingScroll: Int?
 
     func scroll(to index: Int) {
-      guard bounds.width > 0, renderer.layout.width == bounds.width else {
+      guard bounds.width > 0, bounds.height > 0, renderer.layout.width == bounds.width else {
         pendingScroll = index
         return
       }
       pendingScroll = nil
+      endPlaceholder()
       guard index >= 0, index < renderer.layout.itemCount else { return }
       let maxOffset = max(-adjustedContentInset.top, contentSize.height - bounds.height + adjustedContentInset.bottom)
       let target = min(maxOffset, renderer.layout.frame(at: index).minY - adjustedContentInset.top)
+      lastInsets = adjustedContentInset
       setContentOffset(CGPoint(x: 0, y: max(-adjustedContentInset.top, target)), animated: false)
-      if startsAtEnd { pinnedToEnd = contentOffset.y >= endOffset - 2 }
+      if startsAtEnd {
+        pinnedToEnd = contentOffset.y >= endOffset - 2
+        coordinator?.reportAtEnd(pinnedToEnd)
+      }
       settle()
     }
 
@@ -746,13 +945,20 @@ final class PhotoGridCoordinator {
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) { settle() }
 
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) { settle() }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) { endPlaceholder() }
+
     private func settle() {
       velocity = 0
-      renderer.update(visibleRect: bounds, velocity: 0)
+      renderer.update(visibleRect: bounds, atRest: true)
+      reportScrolledUnderBar()
     }
 
     @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
+      guard placeholderView == nil else { return endPlaceholder() }
       guard let index = renderer.index(at: recognizer.location(in: self)) else { return }
+      guard coordinator?.acceptsRowInput == true else { return }
       if coordinator?.options.isSelecting == true || !renderer.selection.isEmpty {
         var selection = renderer.selection
         if selection.contains(index) { selection.remove(index) } else { selection.insert(index) }
@@ -768,6 +974,7 @@ final class PhotoGridCoordinator {
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
       switch recognizer.state {
       case .began:
+        endPlaceholder()
         startPinch(at: recognizer.location(in: self))
       case .changed:
         pinch(
@@ -842,7 +1049,13 @@ final class PhotoGridCoordinator {
       return abs(velocity.x) > abs(velocity.y) && renderer.index(at: pan.location(in: self)) != nil
     }
 
+    private func cancelRowGestures() {
+      dragSelection = nil
+      stopSelectScroll()
+    }
+
     @objc private func handleSelectPan(_ recognizer: UIPanGestureRecognizer) {
+      guard coordinator?.acceptsRowInput == true else { return cancelRowGestures() }
       let point = recognizer.location(in: self)
       switch recognizer.state {
       case .began:
@@ -851,12 +1064,12 @@ final class PhotoGridCoordinator {
         dragSelection = (start, !base.contains(start), base)
         applyDragSelection(to: start)
       case .changed:
+        guard dragSelection != nil else { return }
         selectPoint = CGPoint(x: point.x, y: point.y - contentOffset.y)
         updateSelectScroll()
         extendDragSelection()
       default:
-        dragSelection = nil
-        stopSelectScroll()
+        cancelRowGestures()
       }
     }
 
@@ -895,7 +1108,7 @@ final class PhotoGridCoordinator {
     }
 
     @objc private func selectScrollTick(_ link: CADisplayLink) {
-      guard dragSelection != nil else { return stopSelectScroll() }
+      guard dragSelection != nil, coordinator?.acceptsRowInput == true else { return cancelRowGestures() }
       let step = selectScrollSpeed * CGFloat(link.targetTimestamp - link.timestamp)
       let next = min(endOffset, max(-adjustedContentInset.top, contentOffset.y + step))
       guard next != contentOffset.y else { return }
@@ -919,7 +1132,9 @@ final class PhotoGridCoordinator {
     func contextMenuInteraction(
       _ interaction: UIContextMenuInteraction, configurationForMenuAtLocation location: CGPoint
     ) -> UIContextMenuConfiguration? {
-      guard let coordinator, let menu = coordinator.options.menu, let index = renderer.index(at: location) else {
+      guard placeholderView == nil, let coordinator, coordinator.acceptsRowInput, let menu = coordinator.options.menu,
+        let index = renderer.index(at: location)
+      else {
         return nil
       }
       let targets = coordinator.menuTargets(for: index, selection: renderer.selection)
@@ -954,7 +1169,10 @@ final class PhotoGridCoordinator {
     /// shows at once and a sharper image replaces it.
     private func makePreview(at index: Int) -> UIViewController? {
       guard let dataSource = renderer.dataSource, index < dataSource.itemCount else { return nil }
-      let cellImage = renderer.cellLayer(at: index)?.contents.flatMap { contents -> CGImage? in
+      let identity = dataSource.thumbnailIdentity(at: index)
+      let cell = renderer.cellLayer(at: index) as? PhotoGridCellLayer
+      guard !identity.isLocked, cell?.thumbnailIdentity?.isLocked != true else { return nil }
+      let cellImage = cell?.contents.flatMap { contents -> CGImage? in
         CFGetTypeID(contents as CFTypeRef) == CGImage.typeID ? (contents as! CGImage) : nil
       }
       let ratio =
@@ -965,9 +1183,9 @@ final class PhotoGridCoordinator {
       let maxHeight = screen.height * 0.55
       var size = CGSize(width: maxWidth, height: maxWidth / max(ratio, 0.01))
       if size.height > maxHeight { size = CGSize(width: maxHeight * ratio, height: maxHeight) }
-      let preview = PhotoPreviewController(image: cellImage, size: size)
+      let preview = PhotoPreviewController(image: cellImage, size: size, identity: identity)
       preview.load(
-        id: dataSource.itemID(at: index), from: dataSource.thumbnailSource,
+        identity: identity, from: dataSource.thumbnailSource,
         pixelSize: CGSize(width: size.width * traitCollection.displayScale, height: size.height * traitCollection.displayScale))
       return preview
     }
@@ -1016,7 +1234,7 @@ final class PhotoGridCoordinator {
       // The old cells stay as they are until the renderer moves them.
       isChangingColumns = true
       keepingEnd {
-        contentSize = CGSize(width: bounds.width, height: layout.contentHeight)
+        contentSize = CGSize(width: bounds.width, height: contentHeight(layout))
         let maxOffset = max(-adjustedContentInset.top, layout.contentHeight - bounds.height + adjustedContentInset.bottom)
         if staysAtEnd {
           contentOffset.y = maxOffset
@@ -1221,30 +1439,31 @@ final class PhotoGridCoordinator {
     @objc private func clipBoundsDidChange() { didScroll() }
 
     @objc private func scrollFrameDidChange() {
-      keepingEnd { applyLayout() }
+      applyLayout()
       reportShowingItems()
     }
 
     override func viewDidChangeBackingProperties() {
       super.viewDidChangeBackingProperties()
-      keepingEnd { applyLayout() }
+      applyLayout()
     }
 
     func setDataSource(_ dataSource: any PhotoGridDataSource) {
-      let animates =
-        renderer.dataSource === dataSource && window != nil && renderer.layout.itemCount > 0
-        && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+      cancelRowGestures()
+      let sameSource = renderer.dataSource === dataSource && dataSource.itemCount > 0
+      let animates = sameSource && window != nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
       let oldY = visibleRect.minY
-      let previous = animates ? renderer.detachCells() : nil
+      let previous = sameSource ? renderer.detachCells() : nil
+      if !sameSource { renderer.tearDown() }
       renderer.dataSource = dataSource
-      isChangingColumns = true
-      keepingEnd { applyLayout() }
-      isChangingColumns = false
+      let anchor = pinnedToEnd ? nil : coordinator?.offsetPreservingCell(previous, visible: visibleRect, layout: makeLayout())
+      applyLayout(populate: false, anchor: anchor)
       if let previous {
-        renderer.reloadData(visibleRect: visibleRect, previous: previous, shift: visibleRect.minY - oldY)
+        renderer.reloadData(visibleRect: visibleRect, previous: previous, shift: visibleRect.minY - oldY, animated: animates)
       } else {
         renderer.reloadData(visibleRect: visibleRect)
       }
+      coordinator?.reportTop(renderer.topIndex(atY: visibleRect.minY), reloaded: true)
       reportShowingItems()
     }
 
@@ -1253,7 +1472,7 @@ final class PhotoGridCoordinator {
     /// Once, when items are first drawn: right away if their images were cached, else
     /// when the renderer reveals them.
     private func reportShowingItems() {
-      guard !hasShownItems, renderer.isShowing, !renderer.layout.indices(in: visibleRect).isEmpty else { return }
+      guard !hasShownItems, renderer.hasPixels(in: visibleRect) else { return }
       hasShownItems = true
       // Layout can run inside a SwiftUI update, which mustn't change state itself.
       DispatchQueue.main.async { self.coordinator?.options.onShowItems?() }
@@ -1262,7 +1481,7 @@ final class PhotoGridCoordinator {
     /// What the scroll view shows, cells only: the gaps stay clear, so the image sits on
     /// whatever background is behind the grid. Nil while the cells wait for their images.
     func snapshotImage() -> CGImage? {
-      guard renderer.isShowing, let scrollView, let window else { return nil }
+      guard renderer.hasPixels(in: visibleRect), !renderer.hasLockedPixels(in: visibleRect), let scrollView, let window else { return nil }
       let size = scrollView.bounds.size
       let scale = window.backingScaleFactor
       let width = Int((size.width * scale).rounded())
@@ -1311,12 +1530,13 @@ final class PhotoGridCoordinator {
 
     /// With `startsAtEnd`, keeps the grid's distance from its newest end through a change
     /// of size or items, so items added or removed above stay out of sight.
-    private func keepingEnd(_ change: () -> Void) {
+    private func keepingEnd(anchor: CGFloat? = nil, _ change: () -> Void) {
       guard startsAtEnd, let clip = scrollView?.contentView else { return change() }
       let fromEnd = pinnedToEnd ? 0 : max(0, frame.height - clip.bounds.maxY)
       isKeepingEnd = true
       change()
-      clip.scroll(to: NSPoint(x: 0, y: max(0, frame.height - clip.bounds.height - fromEnd)))
+      let end = max(0, frame.height - clip.bounds.height)
+      clip.scroll(to: NSPoint(x: 0, y: min(end, max(0, anchor ?? end - fromEnd))))
       scrollView?.reflectScrolledClipView(clip)
       isKeepingEnd = false
     }
@@ -1330,17 +1550,21 @@ final class PhotoGridCoordinator {
       let columns = max(1, Int((width / target).rounded()))
       return PhotoGridLayout(
         columns: columns, spacing: target < 100 ? 1 : 2, width: width,
-        itemCount: renderer.dataSource?.itemCount ?? 0, pixelScale: backingScale)
+        itemCount: renderer.dataSource?.itemCount ?? 0, pixelScale: backingScale,
+        alignsNewestRow: coordinator?.options.alignsNewestRow == true)
     }
 
     private var backingScale: CGFloat { window?.backingScaleFactor ?? 2 }
 
-    func applyLayout(animated: Bool = false) {
+    private func applyLayout(populate: Bool = true, anchor: CGFloat? = nil) {
+      guard !isChangingColumns else { return }
       renderer.displayScale = backingScale
       let layout = makeLayout()
       let height = max(layout.contentHeight, scrollView?.contentView.bounds.height ?? 0)
-      setFrameSize(NSSize(width: layout.width, height: height))
-      renderer.setLayout(layout, visibleRect: visibleRect, animated: animated)
+      isChangingColumns = true
+      keepingEnd(anchor: anchor) { setFrameSize(NSSize(width: layout.width, height: height)) }
+      isChangingColumns = false
+      renderer.setLayout(layout, visibleRect: visibleRect, populate: populate)
     }
 
     private func didScroll() {
@@ -1360,7 +1584,7 @@ final class PhotoGridCoordinator {
         MainActor.assumeIsolated {
           guard let self else { return }
           self.velocity = 0
-          self.renderer.update(visibleRect: self.visibleRect, velocity: 0)
+          self.renderer.update(visibleRect: self.visibleRect, atRest: true)
         }
       }
       settleWork = work
@@ -1446,6 +1670,7 @@ final class PhotoGridCoordinator {
     /// ⇧-click, a click on the circle in a cell's corner, or a drag across empty space
     /// selects; once anything is selected, a click adds or removes items until Escape.
     override func mouseDown(with event: NSEvent) {
+      guard coordinator?.acceptsRowInput == true else { return }
       window?.makeFirstResponder(self)
       keyboardCursor = nil
       let point = convert(event.locationInWindow, from: nil)
@@ -1480,6 +1705,7 @@ final class PhotoGridCoordinator {
     }
 
     override func mouseDragged(with event: NSEvent) {
+      guard coordinator?.acceptsRowInput == true else { return cancelRowGestures() }
       if let press = pressed {
         let point = convert(event.locationInWindow, from: nil)
         guard hypot(point.x - press.origin.x, point.y - press.origin.y) > 4 else { return }
@@ -1516,6 +1742,7 @@ final class PhotoGridCoordinator {
     }
 
     override func mouseUp(with event: NSEvent) {
+      guard coordinator?.acceptsRowInput == true else { return cancelRowGestures() }
       if let press = pressed {
         switch press.release {
         case .open:
@@ -1530,6 +1757,16 @@ final class PhotoGridCoordinator {
           break
         }
       }
+      clearPress()
+    }
+
+    private func cancelRowGestures() {
+      selectionAnchor = nil
+      keyboardCursor = nil
+      clearPress()
+    }
+
+    private func clearPress() {
       pressed = nil
       rubberBand = nil
       rubberBandLayer.isHidden = true
@@ -1568,7 +1805,7 @@ final class PhotoGridCoordinator {
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
-      guard let coordinator, let provider = coordinator.options.menu else { return nil }
+      guard let coordinator, coordinator.acceptsRowInput, let provider = coordinator.options.menu else { return nil }
       let point = convert(event.locationInWindow, from: nil)
       // A menu on an item outside the selection acts on that item alone, and leaves the
       // selection (and the grid out of selecting) as it was.
@@ -1594,6 +1831,7 @@ final class PhotoGridCoordinator {
     }
 
     override func keyDown(with event: NSEvent) {
+      guard coordinator?.acceptsRowInput == true else { return }
       guard let dataSource = renderer.dataSource, dataSource.itemCount > 0 else { return super.keyDown(with: event) }
       let current = keyboardCursor ?? selectionAnchor ?? renderer.selection.min()
       let columns = renderer.layout.columns
@@ -1630,6 +1868,7 @@ final class PhotoGridCoordinator {
     }
 
     override func selectAll(_ sender: Any?) {
+      guard coordinator?.acceptsRowInput == true else { return }
       guard let count = renderer.dataSource?.itemCount, count > 0 else { return }
       updateSelection(Set(0..<count))
     }

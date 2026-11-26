@@ -1,5 +1,8 @@
 import Accelerate
+import CoreLocation
 import Foundation
+import MapKit
+import os
 
 /// Similar-photo groups (bursts, retakes, near duplicates). Similar shots are taken close
 /// together, so each item is compared only with the next few taken within a short window:
@@ -58,8 +61,12 @@ enum FaceClustering {
       for face in groups[index].faces {
         for (table, key) in buckets(face).enumerated() {
           let bucket = Int64(table) * 1024 + key
-          if lookup[bucket, default: []].count < 128, !lookup[bucket, default: []].contains(index) {
-            lookup[bucket, default: []].append(index)
+          if var list = lookup[bucket] {
+            guard list.count < 128, !list.contains(index) else { continue }
+            list.append(index)
+            lookup[bucket] = list
+          } else {
+            lookup[bucket] = [index]
           }
         }
       }
@@ -70,8 +77,11 @@ enum FaceClustering {
       var votes: [Int: Int] = [:]
       for face in faces {
         for (table, key) in buckets(face).enumerated() {
-          for neighbor in [key] + (0..<10).map({ key ^ (1 << $0) }) {
-            for index in lookup[Int64(table) * 1024 + neighbor] ?? [] where !groups[index].faces.isEmpty {
+          let tableOffset = Int64(table) * 1024
+          for bit in -1..<10 {
+            let neighbor = bit < 0 ? key : key ^ (1 << bit)
+            guard let entries = lookup[tableOffset + neighbor] else { continue }
+            for index in entries where !groups[index].faces.isEmpty {
               votes[index, default: 0] += 1
             }
           }
@@ -147,28 +157,62 @@ enum FaceClustering {
     return result
   }
 
-  /// Four independent locality-sensitive hashes shortlist candidates in SQLite, keeping
-  /// vectors bounded even when the library has hundreds of thousands of faces.
-  static func buckets(_ data: Data) -> [Int64] {
-    let vector = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-    guard !vector.isEmpty, vector.allSatisfy({ $0.isFinite }) else { return [] }
+  private struct ProjectionTerm: Sendable {
+    let index: Int
+    let sign: Float
+  }
+
+  /// Cached LCG projection tables by vector dimension so repeated bucket calls don't rerun
+  /// 1,280 LCG steps per face while preserving exact bit compatibility with stored `k0..k3`.
+  private static let projectionTables = OSAllocatedUnfairLock<[Int: [ProjectionTerm]]>(initialState: [:])
+
+  private static func projectionTable(dimension: Int) -> [ProjectionTerm] {
+    if let cached = projectionTables.withLock({ $0[dimension] }) { return cached }
     var state: UInt64 = 0x4d59_5df4_d0f3_3173
     func random() -> UInt64 {
       state = state &* 6_364_136_223_846_793_005 &+ 1
       return state >> 32
     }
-    return (0..<4).map { _ in
+    var terms: [ProjectionTerm] = []
+    terms.reserveCapacity(4 * 10 * 32)
+    for _ in 0..<(4 * 10 * 32) {
+      let index = Int(random() % UInt64(dimension))
+      let sign: Float = random() & 1 == 0 ? -1 : 1
+      terms.append(ProjectionTerm(index: index, sign: sign))
+    }
+    let built = terms
+    projectionTables.withLock { $0[dimension] = built }
+    return built
+  }
+
+  /// Four independent locality-sensitive hashes shortlist candidates in SQLite, keeping
+  /// vectors bounded even when the library has hundreds of thousands of faces.
+  static func buckets(_ data: Data) -> [Int64] {
+    let floatCount = data.count / MemoryLayout<Float>.size
+    guard floatCount > 0 else { return [] }
+    var vector = [Float](repeating: 0, count: floatCount)
+    _ = vector.withUnsafeMutableBytes { buffer in
+      data.copyBytes(to: buffer, count: floatCount * MemoryLayout<Float>.size)
+    }
+    guard vector.allSatisfy(\.isFinite) else { return [] }
+    let terms = projectionTable(dimension: floatCount)
+    var keys: [Int64] = []
+    keys.reserveCapacity(4)
+    var offset = 0
+    for _ in 0..<4 {
       var key: Int64 = 0
       for bit in 0..<10 {
         var projection: Float = 0
         for _ in 0..<32 {
-          let index = Int(random() % UInt64(vector.count))
-          projection += vector[index] * (random() & 1 == 0 ? -1 : 1)
+          let term = terms[offset]
+          projection += vector[term.index] * term.sign
+          offset += 1
         }
         if projection >= 0 { key |= 1 << bit }
       }
-      return key
+      keys.append(key)
     }
+    return keys
   }
 }
 
@@ -180,16 +224,80 @@ enum MemoryFinder {
     let longitude: Double?
   }
 
+  private struct DayWindow {
+    let year: Int
+    let start: TimeInterval
+    let end: TimeInterval
+  }
+
   /// Indices of items taken on today's month and day in earlier years, grouped by year,
   /// most recent year first.
   static func onThisDay(_ moments: [Moment], today: Date, calendar: Calendar = .current) -> [(year: Int, indices: [Int])] {
     let target = calendar.dateComponents([.month, .day, .year], from: today)
+    guard let targetMonth = target.month, let targetDay = target.day, let targetYear = target.year else { return [] }
+    guard let targetYearStart = calendar.date(from: DateComponents(year: targetYear, month: 1, day: 1)) else { return [] }
+    let targetYearCutoff = targetYearStart.timeIntervalSince1970
+    // Precompute the exact local-day timestamp range for each prior year once instead of
+    // running `Calendar.dateComponents` on 100k moments.
+    let earliestCapYear = max(1, targetYear - 200)
+    var earliestTimestamp = targetYearCutoff
+    for moment in moments {
+      let t = moment.date.timeIntervalSince1970
+      if t < earliestTimestamp { earliestTimestamp = t }
+    }
+    guard earliestTimestamp < targetYearCutoff else { return [] }
+    let minYear = max(earliestCapYear, calendar.component(.year, from: Date(timeIntervalSince1970: earliestTimestamp)))
+    var windows: [DayWindow] = []
+    windows.reserveCapacity(max(0, targetYear - minYear))
+    for year in minYear..<targetYear {
+      guard let dayDate = calendar.date(from: DateComponents(year: year, month: targetMonth, day: targetDay)) else {
+        continue
+      }
+      // Reject non-leap-year rollovers (e.g., Feb 29 -> Mar 1).
+      let check = calendar.dateComponents([.month, .day, .year], from: dayDate)
+      guard check.year == year, check.month == targetMonth, check.day == targetDay else { continue }
+      let start = calendar.startOfDay(for: dayDate)
+      guard let end = calendar.date(byAdding: .day, value: 1, to: start) else { continue }
+      windows.append(DayWindow(year: year, start: start.timeIntervalSince1970, end: end.timeIntervalSince1970))
+    }
+    let minWindowStart = windows.first?.start ?? .infinity
+    let maxWindowEnd = windows.last?.end ?? -.infinity
+    let capCutoff =
+      calendar.date(from: DateComponents(year: earliestCapYear, month: 1, day: 1))?.timeIntervalSince1970 ?? -.infinity
+
     var byYear: [Int: [Int]] = [:]
+    var lastWindowIndex = 0
     for (index, moment) in moments.enumerated() {
-      let parts = calendar.dateComponents([.month, .day, .year], from: moment.date)
-      guard parts.month == target.month, parts.day == target.day, let year = parts.year, year < (target.year ?? 0)
-      else { continue }
-      byYear[year, default: []].append(index)
+      let t = moment.date.timeIntervalSince1970
+      if t >= targetYearCutoff { continue }
+      if t < capCutoff {
+        let parts = calendar.dateComponents([.month, .day, .year], from: moment.date)
+        if parts.month == targetMonth, parts.day == targetDay, let year = parts.year, year < targetYear {
+          byYear[year, default: []].append(index)
+        }
+        continue
+      }
+      guard t >= minWindowStart, t < maxWindowEnd else { continue }
+      // Timeline moments are mostly date-ordered, so check the last matched window first.
+      if lastWindowIndex < windows.count, t >= windows[lastWindowIndex].start, t < windows[lastWindowIndex].end {
+        byYear[windows[lastWindowIndex].year, default: []].append(index)
+        continue
+      }
+      var low = 0
+      var high = windows.count - 1
+      while low <= high {
+        let mid = (low + high) / 2
+        let window = windows[mid]
+        if t < window.start {
+          high = mid - 1
+        } else if t >= window.end {
+          low = mid + 1
+        } else {
+          lastWindowIndex = mid
+          byYear[window.year, default: []].append(index)
+          break
+        }
+      }
     }
     return byYear.sorted { $0.key > $1.key }.map { ($0.key, $0.value) }
   }
@@ -198,20 +306,53 @@ enum MemoryFinder {
   static func trips(
     _ moments: [Moment], minimumItems: Int = 12, awayKilometres: Double = 100, maximumGapDays: Double = 2
   ) -> [[Int]] {
-    let located = moments.indices.filter { moments[$0].latitude != nil && moments[$0].longitude != nil }
-    guard located.count >= minimumItems else { return [] }
-    var cells: [String: Int] = [:]
-    for index in located {
-      cells[cell(moments[index]), default: 0] += 1
+    var located: [Int] = []
+    var cells: [Int64: Int] = [:]
+    for index in moments.indices {
+      let moment = moments[index]
+      guard let lat = moment.latitude, let lon = moment.longitude else { continue }
+      located.append(index)
+      cells[cell(latitude: lat, longitude: lon), default: 0] += 1
     }
+    guard located.count >= minimumItems else { return [] }
     guard let home = cells.max(by: { $0.value < $1.value })?.key,
-      let homeIndex = located.first(where: { cell(moments[$0]) == home })
+      let homeIndex = located.first(where: {
+        let m = moments[$0]
+        return cell(latitude: m.latitude ?? 0, longitude: m.longitude ?? 0) == home
+      })
     else { return [] }
     let homeMoment = moments[homeIndex]
-    let away =
-      located
-      .filter { kilometres(moments[$0], homeMoment) > awayKilometres }
-      .sorted { moments[$0].date < moments[$1].date }
+    let homeLat = homeMoment.latitude ?? 0
+    let homeLon = homeMoment.longitude ?? 0
+    // Exact spherical bounds (R * pi / 180 ~= 111.195 km/deg): skip trig for clear home or far points.
+    let minAwayLatDeg = awayKilometres / 111.19
+    let maxNearManhatDeg = awayKilometres / 111.20
+
+    var away: [Int] = []
+    var isSorted = true
+    var previousDate: Date?
+    for index in located {
+      let moment = moments[index]
+      guard let lat = moment.latitude, let lon = moment.longitude else { continue }
+      let dLat = abs(lat - homeLat)
+      let isAway: Bool
+      if dLat > minAwayLatDeg {
+        isAway = true
+      } else {
+        var dLon = abs(lon - homeLon)
+        if dLon > 180 { dLon = 360 - dLon }
+        if dLat + dLon < maxNearManhatDeg {
+          isAway = false
+        } else {
+          isAway = kilometres(moment, homeMoment) > awayKilometres
+        }
+      }
+      guard isAway else { continue }
+      if let previousDate, moment.date < previousDate { isSorted = false }
+      previousDate = moment.date
+      away.append(index)
+    }
+    if !isSorted { away.sort { moments[$0].date < moments[$1].date } }
     var trips: [[Int]] = []
     var current: [Int] = []
     for index in away {
@@ -225,8 +366,10 @@ enum MemoryFinder {
     return trips.reversed()
   }
 
-  private static func cell(_ moment: Moment) -> String {
-    "\(Int(((moment.latitude ?? 0) * 2).rounded())):\(Int(((moment.longitude ?? 0) * 2).rounded()))"
+  private static func cell(latitude: Double, longitude: Double) -> Int64 {
+    let lat = Int64(Int32((latitude * 2).rounded()))
+    let lon = Int64(Int32((longitude * 2).rounded()))
+    return (lat << 32) | (lon & 0xFFFF_FFFF)
   }
 
   static func kilometres(_ a: Moment, _ b: Moment) -> Double {
@@ -236,6 +379,63 @@ enum MemoryFinder {
     let dLon = (lon2 - lon1) * radians
     let h = sin(dLat / 2) * sin(dLat / 2) + cos(lat1 * radians) * cos(lat2 * radians) * sin(dLon / 2) * sin(dLon / 2)
     return 6_371 * 2 * atan2(h.squareRoot(), (1 - h).squareRoot())
+  }
+}
+
+/// Shared in-memory cache of reverse-geocoded city/region names by rounded coordinate (~1 km)
+/// so Search Memories, Widgets and Places don't repeat MapKit lookups on scroll or refresh.
+actor PlaceNameCache {
+  static let shared = PlaceNameCache()
+
+  private struct Key: Hashable, Sendable {
+    let lat: Int
+    let lon: Int
+
+    init(latitude: Double, longitude: Double) {
+      lat = Int((latitude * 100).rounded())
+      lon = Int((longitude * 100).rounded())
+    }
+  }
+
+  private struct Entry: Sendable {
+    let city: String?
+    let region: String?
+  }
+
+  private var entries: [Key: Entry] = [:]
+  private var inFlight: [Key: Task<Entry?, Never>] = [:]
+  private let limit = 512
+
+  func cityName(latitude: Double, longitude: Double) async -> String? {
+    await lookup(latitude: latitude, longitude: longitude)?.city
+  }
+
+  func placeName(latitude: Double, longitude: Double) async -> String? {
+    let entry = await lookup(latitude: latitude, longitude: longitude)
+    return entry?.city ?? entry?.region
+  }
+
+  private func lookup(latitude: Double, longitude: Double) async -> Entry? {
+    let key = Key(latitude: latitude, longitude: longitude)
+    if let cached = entries[key] { return cached }
+    if let existing = inFlight[key] { return await existing.value }
+    let task = Task<Entry?, Never>(priority: .utility) {
+      guard let request = MKReverseGeocodingRequest(location: CLLocation(latitude: latitude, longitude: longitude))
+      else { return nil }
+      let item = try? await request.mapItems.first
+      let city = item?.addressRepresentations?.cityName
+      let region = item?.addressRepresentations?.regionName
+      guard city != nil || region != nil else { return nil }
+      return Entry(city: city, region: region)
+    }
+    inFlight[key] = task
+    let result = await task.value
+    inFlight[key] = nil
+    if let result {
+      if entries.count >= limit { entries.removeAll(keepingCapacity: true) }
+      entries[key] = result
+    }
+    return result
   }
 }
 
@@ -262,7 +462,13 @@ struct StreamingSimilarity {
     ids.append(id)
     scores.append(score)
     parent.append(index)
-    let vector = print.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    let floatCount = print.count / MemoryLayout<Float>.size
+    var vector = [Float](repeating: 0, count: floatCount)
+    if floatCount > 0 {
+      _ = vector.withUnsafeMutableBytes { buffer in
+        print.copyBytes(to: buffer, count: floatCount * MemoryLayout<Float>.size)
+      }
+    }
     recent.removeAll { date.timeIntervalSince($0.date) > window }
     let squaredThreshold = threshold * threshold
     for other in recent where other.vector.count == vector.count {

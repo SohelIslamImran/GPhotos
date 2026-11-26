@@ -17,9 +17,10 @@ struct DeviceViewerPage: View {
   /// The viewer's video controls, given this page's player while it's showing.
   let playback: VideoPlayback
   @State private var image: CGImage?
-  @State private var token: ImageRequestToken?
-  @State private var detailToken: ImageRequestToken?
-  @State private var loadedLongSide: CGFloat = 0
+  @State private var isLoadingImage = false
+  @State private var didFail = false
+  @State private var token: ThumbnailTicket?
+  @State private var detailToken: ThumbnailTicket?
   @State private var player: AVPlayer?
 
   /// Above this, zooming shows the most detail a layer can hold without tiling.
@@ -30,22 +31,28 @@ struct DeviceViewerPage: View {
     ZStack {
       if asset.mediaType == .video {
         ZoomableImage(
-          image: image, pixelSize: pixelSize, onTap: onTap, onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player)
-        if isCurrent, player == nil { ProgressView() }
+          image: image, pixelSize: pixelSize, previewIdentity: identity, isCurrent: isCurrent,
+          isBuffering: player == nil || (playback.player === player && playback.isBuffering), onTap: onTap, onDismiss: onDismiss,
+          onSwipeUp: onSwipeUp, player: player)
       } else {
         ZoomableImage(
-          image: image, pixelSize: pixelSize, liveText: isCurrent && !playsLive, onZoom: loadDetail, onTap: onTap,
+          image: image, pixelSize: pixelSize, previewIdentity: identity, isCurrent: isCurrent, isLoading: isLoadingImage, didFail: didFail,
+          liveText: isCurrent && !playsLive,
+          onZoom: loadDetail, onTap: onTap,
           onDismiss: onDismiss, onSwipeUp: onSwipeUp)
         if playsLive {
           LivePhotoPlayer(asset: asset, pixelSize: screenPixels, onEnd: onLiveEnd)
             .allowsHitTesting(false)
         }
       }
-      if image == nil, asset.mediaType != .video { ProgressView() }
     }
     .accessibilityElement(children: .contain)
     .accessibilityLabel(Text(label))
-    .onAppear(perform: load)
+    .task(id: isCurrent ? screenPixels : .zero) {
+      token?.cancel()
+      token = nil
+      if isCurrent, !Task.isCancelled { load() }
+    }
     .onDisappear(perform: unload)
     .task(id: isCurrent) {
       if isCurrent { await startVideo() } else { player?.pause() }
@@ -53,26 +60,36 @@ struct DeviceViewerPage: View {
   }
 
   private var screenPixels: CGSize {
-    CGSize(width: containerSize.width * displayScale, height: containerSize.height * displayScale)
+    ViewerImage.fittedPixels(
+      CGSize(width: asset.pixelWidth, height: asset.pixelHeight), in: containerSize, scale: displayScale)
   }
 
+  private var identity: ThumbnailIdentity { PhotoKitImageSource.identity(for: asset) }
+  private var cachedPreview: CGImage? { ThumbnailPipeline.shared.viewerPreview(for: identity) }
+
   private func load() {
-    let id = asset.localIdentifier
+    isLoadingImage = false
+    guard screenPixels != .zero, !ViewerImage.hasFittedPreview(for: identity, target: screenPixels) else { return }
+    isLoadingImage = true
+    didFail = false
     PhotoKitImageSource.shared.remember(asset)
-    token = PhotoKitImageSource.shared.requestImage(id: id, pixelSize: screenPixels, quality: .display) { cgImage, _ in
-      Task { @MainActor in
-        // A sharper zoomed image may already be showing.
-        guard CGFloat(max(cgImage.width, cgImage.height)) >= loadedLongSide else { return }
-        image = cgImage
-        loadedLongSide = CGFloat(max(cgImage.width, cgImage.height))
-      }
-    }
+    token = ViewerImage.requestCurrentAsset(
+      PhotoKitImageSource.shared, identity: identity, pixels: screenPixels, onEnd: ended, deliver: receive)
+  }
+
+  private func ended() {
+    isLoadingImage = false
+    didFail = image == nil && cachedPreview == nil
+  }
+
+  private func receive(_ candidate: CGImage, isFinal: Bool) {
+    if ViewerImage.accepts(candidate, over: image ?? cachedPreview, isFinal: isFinal) { image = candidate }
   }
 
   /// Asks for enough pixels for the current zoom, capped at the original size.
   private func loadDetail(_ zoom: CGFloat) {
     guard zoom > 1.2 else { return }
-    let decoded = image.map { CGSize(width: $0.width, height: $0.height) } ?? .zero
+    let decoded = (image ?? cachedPreview).map(ViewerImage.size) ?? .zero
     let full = AspectFit.orientedSize(decoded: decoded, metadata: CGSize(width: asset.pixelWidth, height: asset.pixelHeight))
     let fitted = AspectFit.size(for: full, in: containerSize)
     var wanted = CGSize(width: fitted.width * zoom * displayScale, height: fitted.height * zoom * displayScale)
@@ -82,26 +99,19 @@ struct DeviceViewerPage: View {
       let scale = (Self.maxPixels / pixels).squareRoot()
       wanted = CGSize(width: wanted.width * scale, height: wanted.height * scale)
     }
-    guard max(wanted.width, wanted.height) > loadedLongSide * 1.25 else { return }
+    guard max(wanted.width, wanted.height) > CGFloat(ViewerImage.longSide(image ?? cachedPreview)) * 1.25 else { return }
     detailToken?.cancel()
-    detailToken = PhotoKitImageSource.shared.requestImage(
-      id: asset.localIdentifier, pixelSize: wanted, quality: .display
-    ) { cgImage, _ in
-      Task { @MainActor in
-        guard CGFloat(max(cgImage.width, cgImage.height)) > loadedLongSide else { return }
-        image = cgImage
-        loadedLongSide = CGFloat(max(cgImage.width, cgImage.height))
-      }
-    }
+    detailToken = ViewerImage.request(
+      PhotoKitImageSource.shared, identity: identity, pixels: wanted, deliver: receive)
   }
 
   private func unload() {
+    isLoadingImage = false
     token?.cancel()
     detailToken?.cancel()
     token = nil
     detailToken = nil
     image = nil
-    loadedLongSide = 0
     player?.pause()
     player = nil
   }
@@ -116,10 +126,8 @@ struct DeviceViewerPage: View {
     let options = PHVideoRequestOptions()
     options.isNetworkAccessAllowed = true
     options.deliveryMode = .automatic
-    let item: AVPlayerItem? = await withCheckedContinuation { continuation in
-      PHImageManager.default().requestPlayerItem(forVideo: asset, options: options) { item, _ in
-        continuation.resume(returning: item)
-      }
+    let item: AVPlayerItem? = await ViewerPhotoKitRequest.run { manager, finish in
+      manager.requestPlayerItem(forVideo: asset, options: options) { item, _ in finish(item) }
     }
     guard let item, isCurrent, !Task.isCancelled else { return }
     let player = AVPlayer(playerItem: item)

@@ -9,6 +9,8 @@
 		<string>org.gphotosapp.gphotos.mirror</string>
 		<string>org.gphotosapp.gphotos.continued-upload.*</string>
 	</array>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

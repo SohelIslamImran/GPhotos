@@ -63,6 +63,7 @@ struct FolderCleanupItem: Sendable {
   let record: TransferRecord
   let fileURL: URL
   let pairedFileURL: URL?
+  let root: URL
   let volume: URL?
 
   var bytes: Int64 {
@@ -193,12 +194,18 @@ enum FolderBackup {
   /// Every settled photo and video in the readable folders, each file once even when
   /// folders overlap, less what the user's rules leave out. Callers hold `accesses` for
   /// the duration.
-  static func collectMedia(in accesses: [FolderAccess], excluding exclusions: FolderExclusions = .none) -> MediaScan {
+  static func collectMedia(
+    in accesses: [FolderAccess], excluding exclusions: FolderExclusions = .none,
+    using foregroundRead: FolderMediaScanner.ForegroundRead? = nil
+  ) async -> MediaScan {
     var merged = MediaScan()
     var seen = Set<String>()
     for access in accesses {
       guard !Task.isCancelled, let root = access.readableURL else { continue }
-      let scan = FolderMediaScanner.collectMedia(in: root, skipsUnsettledFiles: true, excluding: exclusions)
+      let scan =
+        if let foregroundRead { await foregroundRead.scan(root, excluding: exclusions) } else {
+          FolderMediaScanner.collectMedia(in: root, skipsUnsettledFiles: true, excluding: exclusions)
+        }
       merged.deferredRecentWrites = merged.deferredRecentWrites || scan.deferredRecentWrites
       // The scan follows no links below the root, so resolving the root once and
       // re-basing each file on it gives every file its resolved path without a stat.
@@ -327,7 +334,8 @@ enum FolderBackup {
         ?? (try? root.resourceValues(forKeys: [.volumeURLKey]))?.volume
         ?? root
       volumeByRoot[root.path] = volume
-      let item = FolderCleanupItem(record: record, fileURL: fileURL, pairedFileURL: pairedFileURL, volume: volume)
+      let item = FolderCleanupItem(
+        record: record, fileURL: fileURL, pairedFileURL: pairedFileURL, root: root, volume: volume)
       if smartDelete {
         if bytesNeededByVolume[volume] == nil {
           bytesNeededByVolume[volume] = TransferManifestStore.bytesNeededToRecover(onVolumeOf: root)

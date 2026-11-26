@@ -7,13 +7,11 @@ public actor TransferManifestStore {
   private var records: [String: TransferRecord] = [:] {
     didSet {
       revision &+= 1
-      valuesCache = nil
       sortedCache = nil
     }
   }
   /// Bumped on every change, so readers can skip copying and comparing an unchanged manifest.
   private var revision = 0
-  private var valuesCache: [TransferRecord]?
   private var sortedCache: [TransferRecord]?
   private var deletionClaims = Set<String>()
   private var deletionClaimSnapshots: [String: Set<String>] = [:]
@@ -45,6 +43,10 @@ public actor TransferManifestStore {
   /// the manifest still holding every version it skipped, so a removal sends the next
   /// one back to reading everything.
   public private(set) var removalCount = 0
+
+  /// Accounts whose records were purged. Whatever read the account before that (a scan, an
+  /// import) must not write it back.
+  private var removedAccounts = Set<String>()
 
   private var needsPersistence: Bool { needsSnapshot || !dirtyIDs.isEmpty }
 
@@ -118,10 +120,7 @@ public actor TransferManifestStore {
     if needsPersistence, flushTask == nil {
       flush()
     }
-    if let valuesCache { return valuesCache }
-    let values = Array(records.values)
-    valuesCache = values
-    return values
+    return sortedCache ?? Array(records.values)
   }
 
   /// Newest first, for display. Internal sweeps use `allRecords()` and skip the sort.
@@ -130,14 +129,16 @@ public actor TransferManifestStore {
   public func sortedRecords() -> [TransferRecord] {
     loadIfNeeded()
     if let sortedCache { return sortedCache }
-    let values = allRecords()
-    let order = values.indices
-      .map { (date: values[$0].creationDate?.timeIntervalSinceReferenceDate ?? -.infinity, index: $0) }
-      .sorted { $0.date != $1.date ? $0.date > $1.date : values[$0.index].id < values[$1.index].id }
-    let sorted = order.map { values[$0.index] }
+    var order: [(id: String, date: Double)] = records.map { id, record in
+      (id, record.creationDate?.timeIntervalSinceReferenceDate ?? -Double.infinity)
+    }
+    order.sort { $0.date != $1.date ? $0.date > $1.date : $0.id < $1.id }
+    let sorted = order.compactMap { records[$0.id] }
     sortedCache = sorted
     return sorted
   }
+
+  public func purgeSortedCache() { sortedCache = nil }
 
   /// `sortedRecords()` with the revision it reflects, or nil while the manifest is still
   /// at `revision`.
@@ -201,36 +202,52 @@ public actor TransferManifestStore {
   private static func deduplicate(
     _ input: [String: TransferRecord]
   ) -> (records: [String: TransferRecord], didDeduplicate: Bool) {
+    enum Location: Hashable {
+      case path(String)
+      case asset(String, AssetResourceRole)
+      case shared
+    }
+    enum Key: Hashable {
+      case fingerprint(account: String, sha1: String, location: Location)
+      case file(account: String, path: String, size: Int64, modified: Int64)
+    }
+    var firstIDs: [Key: String] = [:]
     var groups: [String: [String]] = [:]
     for (id, record) in input {
       let account = TransferRecord.accountEmail(fromScopedID: id) ?? record.sentAccountEmails.sorted().first ?? ""
-      let key: String
+      let key: Key
       if let fingerprint = record.sha1 ?? record.sourceSHA1 {
         // Content alone does not make two records the same file: a folder copy and a
         // share-sheet copy of identical bytes are separate files that both need a
         // record, and so are two library photos with the same bytes. Only shared queue
         // entries may merge on content.
-        let location =
+        let location: Location =
           if let path = record.sourcePath {
             // Case-folded to match `sameResource` and the cleanup path checks, so two
             // spellings of one file still land in the same group.
-            "path:\(standardizedPath(path).lowercased())"
+            .path(standardizedPath(path).lowercased())
           } else if let asset = record.assetLocalIdentifier {
-            "asset:\(asset)|\(record.resourceRole)"
+            .asset(asset, record.resourceRole)
           } else {
-            "no-path"
+            .shared
           }
-        key = "account:\(account)|sha:\(fingerprint)|\(location)"
+        key = .fingerprint(account: account, sha1: fingerprint, location: location)
       } else if let path = record.sourcePath {
         let size = record.sourceFileSize ?? record.byteCount ?? 0
         let modified = record.sourceModifiedAt.map { Int64($0.timeIntervalSince1970 * 1_000) } ?? 0
-        key = "account:\(account)|path:\(standardizedPath(path).lowercased())|\(size)|\(modified)"
+        key = .file(account: account, path: standardizedPath(path).lowercased(), size: size, modified: modified)
       } else {
         continue
       }
-      groups[key, default: []].append(id)
+      if let first = firstIDs[key] {
+        groups[first, default: [first]].append(id)
+      } else {
+        firstIDs[key] = id
+      }
     }
 
+    guard !groups.isEmpty else { return (input, false) }
+    firstIDs.removeAll()
     var result = input
     var changed = false
     for ids in groups.values where ids.count > 1 {
@@ -369,6 +386,7 @@ public actor TransferManifestStore {
   @discardableResult
   public func upsert(_ record: TransferRecord) -> Bool {
     loadIfNeeded()
+    guard let record = withoutRemovedAccounts(record) else { return false }
     if hasDeletionClaim(for: record) {
       invalidateDeletionClaim(for: record)
       return false
@@ -401,6 +419,7 @@ public actor TransferManifestStore {
     _ newRecords: [TransferRecord], ifUnchangedSince snapshot: [String: TransferRecord]? = nil
   ) -> Bool {
     loadIfNeeded()
+    let newRecords = newRecords.compactMap(withoutRemovedAccounts)
     guard !newRecords.isEmpty else { return true }
     if let blocked = newRecords.first(where: { hasDeletionClaim(for: $0) }) {
       invalidateDeletionClaim(for: blocked)
@@ -642,12 +661,16 @@ public actor TransferManifestStore {
     )
   }
 
+  /// `mayRemove` is asked with nothing suspended in between right before each file moves
+  /// and again, on the moved files, before the record is marked deleted: a no puts
+  /// everything back.
   @discardableResult
   public func deleteSourceFiles(
     id: String,
     fileURL: URL,
     pairedFileURL: URL? = nil,
-    releaseClaim: Bool = true
+    releaseClaim: Bool = true,
+    mayRemove: @Sendable ([URL]) -> Bool = { _ in true }
   ) async -> Bool {
     loadIfNeeded()
     defer {
@@ -680,6 +703,10 @@ public actor TransferManifestStore {
     let token = UUID().uuidString
     var moved: [(original: URL, tombstone: URL)] = []
     for side in sides {
+      guard mayRemove(sides.map(\.url).filter { url in !moved.contains { $0.original == url } } + moved.map(\.tombstone)) else {
+        Self.restoreTombstones(moved)
+        return false
+      }
       let tombstone = Self.deletionTombstoneURL(for: side.url, size: side.size, modifiedAt: side.modifiedAt, token: token)
       do {
         try FileManager.default.moveItem(at: side.url, to: tombstone)
@@ -695,7 +722,14 @@ public actor TransferManifestStore {
       verified = await Self.verifyContent(url: entry.tombstone, size: side.size, modifiedAt: side.modifiedAt, sha1: side.sha1)
     }
     // Re-checked after the hashing suspension: the claim may have been invalidated meanwhile.
-    guard verified, deletionClaimIsValid(id: id), markDeleted(id: id) else {
+    guard verified, deletionClaimIsValid(id: id), mayRemove(moved.map(\.tombstone)), markDeleted(id: id) else {
+      Self.restoreTombstones(moved)
+      return false
+    }
+    // Writing the record takes a moment, and a change made meanwhile still puts it back.
+    guard mayRemove(moved.map(\.tombstone)) else {
+      // The files go back even if the record can't: they must never be left hidden.
+      if !restoreSent(ids: [id]) { restoreSent(ids: [id]) }
       Self.restoreTombstones(moved)
       return false
     }
@@ -997,12 +1031,30 @@ public actor TransferManifestStore {
     return remove(id: id)
   }
 
+  /// Nil for a removed account's own record; another's loses what it read of that account.
+  private func withoutRemovedAccounts(_ record: TransferRecord) -> TransferRecord? {
+    guard !removedAccounts.isEmpty else { return record }
+    if let email = TransferRecord.accountEmail(fromScopedID: record.id), removedAccounts.contains(email) { return nil }
+    var record = record
+    record.sentAccountEmails.subtract(removedAccounts)
+    record.foundInAccounts.subtract(removedAccounts)
+    for email in removedAccounts { record.mediaKeysByAccount[email] = nil }
+    return record
+  }
+
+  /// These accounts are configured, so one removed earlier and added again has records again.
+  func acceptRecords(forAccountEmails emails: [String]) {
+    removedAccounts.subtract(emails)
+  }
+
   /// Removes the records scoped to the given account, so it no longer blocks deletion.
   /// With `keepingSent`, its finished copies stay (copying was only switched off), and
-  /// only the unfinished ones, which would hold cleanup back forever, are dropped.
+  /// only the unfinished ones, which would hold cleanup back forever, are dropped. Without
+  /// it the account is gone: no writer adds records for it until it's configured again.
   @discardableResult
   public func removeRecords(forAccountEmail email: String, keepingSent: Bool = false) -> Bool {
     loadIfNeeded()
+    if !keepingSent { removedAccounts.insert(email) }
     let idsToRemove = records.values.compactMap { rec -> String? in
       guard TransferRecord.accountEmail(fromScopedID: rec.id) == email else { return nil }
       if keepingSent, rec.status == .sent || rec.status == .deleted || rec.status == .sending { return nil }
@@ -1086,40 +1138,80 @@ public actor TransferManifestStore {
     // the delay still applies once it is.
     if smartDelete, bytesNeededToRecover() == 0 { return [] }
     let now = Date()
-    let persistedAccounts = Set(records.values.compactMap { TransferRecord.accountEmail(fromScopedID: $0.id) })
-    // An account that no longer receives copies is not waited for.
-    let knownAccounts = Set(accountEmails).union(persistedAccounts).subtracting(excludingAccounts).union([accountEmail])
-
-    return records.values.filter { rec in
-      guard rec.status == .sent, !rec.isSkipped, rec.sentAccountEmails.contains(accountEmail) else { return false }
-      guard let mediaKey = rec.mediaKeysByAccount[accountEmail], !mediaKey.isEmpty else { return false }
-      // A copy this app did not upload may be Storage saver, so it does not stand in for
-      // the original unless the user says their account holds originals.
-      guard includesFoundItems || !rec.foundInAccounts.contains(accountEmail) else { return false }
-      guard !hasCompetingResourceRecord(rec) else { return false }
-      let otherAccounts = knownAccounts.filter { $0 != accountEmail }
-      if !otherAccounts.isEmpty {
-        let mates = resourceMates(of: rec)
-        let hasUnuploadedAccount = otherAccounts.contains { email in
-          let matching = mates.filter {
-            TransferRecord.accountEmail(fromScopedID: $0.id) == email && $0.sentAccountEmails.contains(email)
-          }
-          if matching.isEmpty { return true }
-          if matching.contains(where: { $0.status == .pending || $0.status == .sending || $0.status == .failed }) {
-            return true
-          }
-          return !matching.contains {
-            ($0.mediaKeysByAccount[email]?.isEmpty == false) && sameResourceVersion($0, rec)
-              && ($0.status == .sent || $0.status == .deleted)
-              && (includesFoundItems || !$0.foundInAccounts.contains(email))
-          }
-        }
-        guard !hasUnuploadedAccount else { return false }
-      }
-      guard let deleteAfter = Self.deleteAfterDate(sentAt: rec.sentAt, delay: delay) else { return false }
-      return deleteAfter <= now
+    let knownAccounts = cleanupAccounts(accountEmails, excluding: excludingAccounts, accountEmail: accountEmail)
+    return records.values.filter {
+      isEligible(
+        $0, delay: delay, now: now, accountEmail: accountEmail, knownAccounts: knownAccounts, includesFoundItems: includesFoundItems)
     }
     .sorted { ($0.sentAt ?? .distantPast) < ($1.sentAt ?? .distantPast) }
+  }
+
+  /// An account that no longer receives copies is not waited for.
+  private func cleanupAccounts(_ accounts: Set<String>, excluding: Set<String>, accountEmail: String) -> Set<String> {
+    let persisted = Set(records.values.compactMap { TransferRecord.accountEmail(fromScopedID: $0.id) })
+    return accounts.union(persisted).subtracting(excluding).union([accountEmail])
+  }
+
+  private func isEligible(
+    _ rec: TransferRecord, delay: AutoDeleteDelay, now: Date, accountEmail: String, knownAccounts: Set<String>,
+    includesFoundItems: Bool
+  ) -> Bool {
+    guard rec.status == .sent, !rec.isSkipped, rec.sentAccountEmails.contains(accountEmail) else { return false }
+    guard let mediaKey = rec.mediaKeysByAccount[accountEmail], !mediaKey.isEmpty else { return false }
+    // A copy this app did not upload may be Storage saver, so it does not stand in for
+    // the original unless the user says their account holds originals.
+    guard includesFoundItems || !rec.foundInAccounts.contains(accountEmail) else { return false }
+    guard !hasCompetingResourceRecord(rec) else { return false }
+    let otherAccounts = knownAccounts.filter { $0 != accountEmail }
+    if !otherAccounts.isEmpty {
+      let mates = resourceMates(of: rec)
+      let hasUnuploadedAccount = otherAccounts.contains { email in
+        let matching = mates.filter {
+          TransferRecord.accountEmail(fromScopedID: $0.id) == email && $0.sentAccountEmails.contains(email)
+        }
+        if matching.isEmpty { return true }
+        if matching.contains(where: { $0.status == .pending || $0.status == .sending || $0.status == .failed }) {
+          return true
+        }
+        return !matching.contains {
+          ($0.mediaKeysByAccount[email]?.isEmpty == false) && sameResourceVersion($0, rec)
+            && ($0.status == .sent || $0.status == .deleted)
+            && (includesFoundItems || !$0.foundInAccounts.contains(email))
+        }
+      }
+      guard !hasUnuploadedAccount else { return false }
+    }
+    guard let deleteAfter = Self.deleteAfterDate(sentAt: rec.sentAt, delay: delay) else { return false }
+    return deleteAfter <= now
+  }
+
+  /// Whether a claimed record is still due under the settings as they are now: checked
+  /// last, since confirming and thumbnail work can outlast a change to them.
+  public func isStillDue(id: String, settings: AppSettings, accountEmail: String, accounts: [GoogleAccount]) -> Bool {
+    loadIfNeeded()
+    guard settings.autoDeleteDelay != .never, let record = records[id] else { return false }
+    let known = cleanupAccounts(
+      Set(accounts.map(\.email)), excluding: Set(accounts.filter { !$0.mirrorEnabled && $0.email != accountEmail }.map(\.email)),
+      accountEmail: accountEmail)
+    return isEligible(
+      record, delay: settings.autoDeleteDelay, now: Date(), accountEmail: accountEmail, knownAccounts: known,
+      includesFoundItems: settings.removesItemsAlreadyInGooglePhotos)
+  }
+
+  /// The app's own staged copies that may go now. They're copies of files the user keeps, so
+  /// Delete After Backup doesn't hold them back; everything else that holds back a removal
+  /// does, and `ids` limits it to the copies asked about.
+  public func eligibleStagedCopies(
+    among ids: Set<String>, accountEmail: String, accounts: [GoogleAccount], includesFoundItems: Bool
+  ) -> Set<String> {
+    let eligible = eligibleForDeletion(
+      delay: .immediately,
+      smartDelete: false,
+      accountEmail: accountEmail,
+      accountEmails: Set(accounts.map(\.email)).union([accountEmail]),
+      excludingAccounts: Set(accounts.filter { !$0.mirrorEnabled && $0.email != accountEmail }.map(\.email)),
+      includesFoundItems: includesFoundItems)
+    return ids.intersection(eligible.map(\.id))
   }
 
   /// An asset's RAW and its primary share the asset as a resource, so they compete with
@@ -1243,8 +1335,40 @@ public actor TransferManifestStore {
   /// Records an upload the photo upload extension finished, as the upload pool records its
   /// own: the media key the account received and the hashes cleanup verifies against.
   public func recordBackgroundUpload(_ result: BackgroundUploadResult) -> BackgroundUploadImport {
+    recordBackgroundUploads([result])[0]
+  }
+
+  public func recordBackgroundUploads(_ results: [BackgroundUploadResult]) -> [BackgroundUploadImport] {
     loadIfNeeded()
-    let previous = records[result.recordID]
+    var previous: [String: TransferRecord?] = [:]
+    var outcomes = results.map { result in
+      let original = records[result.recordID]
+      let outcome = applyBackgroundUpload(result, previous: original)
+      if outcome == .recorded, previous[result.recordID] == nil {
+        previous.updateValue(original, forKey: result.recordID)
+      }
+      return outcome
+    }
+    guard !previous.isEmpty else { return outcomes }
+    guard commit(previous.keys, critical: true) else {
+      for (id, record) in previous { records[id] = record }
+      rebuildIndexes()
+      for index in results.indices where previous[results[index].recordID] != nil {
+        outcomes[index] = .deferred
+      }
+      return outcomes
+    }
+    return outcomes
+  }
+
+  private func applyBackgroundUpload(
+    _ result: BackgroundUploadResult, previous: TransferRecord?
+  ) -> BackgroundUploadImport {
+    // Left for the app, which drops an absent account's receipts itself.
+    if removedAccounts.contains(result.accountEmail) { return .deferred }
+    if let email = TransferRecord.accountEmail(fromScopedID: result.recordID), removedAccounts.contains(email) {
+      return .deferred
+    }
     var record =
       previous
       ?? TransferRecord(
@@ -1300,11 +1424,6 @@ public actor TransferManifestStore {
     removeFromIndexes(previous)
     records[record.id] = record
     addToIndexes(record)
-    guard commit([record.id], critical: true) else {
-      if let previous { records[record.id] = previous } else { records.removeValue(forKey: record.id) }
-      rebuildIndexes()
-      return .deferred
-    }
     return .recorded
   }
 
@@ -1356,7 +1475,7 @@ public actor TransferManifestStore {
   private static let snapshotTokenAttribute = "org.gphotosapp.gphotos.manifest-snapshot"
 
   private func writeSnapshot() -> Bool {
-    guard let written = Self.writeSnapshot(valuesCache ?? Array(records.values), to: fileURL, encoder: lineEncoder) else {
+    guard let written = Self.writeSnapshot(sortedCache ?? Array(records.values), to: fileURL, encoder: lineEncoder) else {
       needsSnapshot = true
       return false
     }
@@ -1484,13 +1603,12 @@ public actor TransferManifestStore {
   private static func load(from url: URL, journalURL: URL, quarantinesUnreadable: Bool = true) -> StoredManifest {
     var stored = StoredManifest()
     guard FileManager.default.fileExists(atPath: url.path) else { return stored }
-    guard let data = try? Data(contentsOf: url), let list = decodeSnapshot(data) else {
+    guard let data = try? Data(contentsOf: url), let chunks = decodeSnapshotChunks(data) else {
       if quarantinesUnreadable { quarantine(url) }
       return stored
     }
-    for item in list {
-      stored.records[item.id] = item
-    }
+    stored.records.reserveCapacity(chunks.reduce(0) { $0 + $1.count })
+    for item in chunks.joined() { stored.records[item.id] = item }
     stored.snapshotSize = data.count
     stored.snapshotToken = snapshotToken(of: url)
     guard let token = stored.snapshotToken, let journal = try? Data(contentsOf: journalURL) else { return stored }
@@ -1512,27 +1630,49 @@ public actor TransferManifestStore {
   }
 
   /// The snapshot's records in file order, skipping any that don't decode; nil when it
-  /// isn't a JSON array. A large one is decoded in pieces on every core (it's read before
-  /// the Library can draw), and in one piece if it can't be split cleanly.
+  /// isn't a JSON array.
   static func decodeSnapshot(_ data: Data) -> [TransferRecord]? {
-    let parts = min(ProcessInfo.processInfo.activeProcessorCount, 8)
-    if data.count >= 1_000_000, parts > 1, let pieces = splitArray(data, into: parts), pieces.count > 1 {
+    decodeSnapshotChunks(data)?.flatMap { $0 }
+  }
+
+  private static func decodeSnapshotChunks(_ data: Data) -> [[TransferRecord]]? {
+    if data.count >= 1_000_000, let ranges = snapshotRanges(data, into: 8), ranges.count > 1 {
+      let workers = min(ProcessInfo.processInfo.activeProcessorCount, ranges.count, 4)
       let decoded = OSAllocatedUnfairLock(initialState: [Int: [TransferRecord]]())
-      DispatchQueue.concurrentPerform(iterations: pieces.count) { index in
-        guard let list = try? JSONDecoder().decode([Failable<TransferRecord>].self, from: pieces[index]) else { return }
-        let records = list.compactMap(\.value)
-        decoded.withLock { $0[index] = records }
+      DispatchQueue.concurrentPerform(iterations: workers) { worker in
+        for index in stride(from: worker, to: ranges.count, by: workers) {
+          let piece = snapshotPiece(data, range: ranges[index])
+          guard let list = try? JSONDecoder().decode([Failable<TransferRecord>].self, from: piece) else { return }
+          let records = list.compactMap(\.value)
+          decoded.withLock { $0[index] = records }
+        }
       }
       let results = decoded.withLock { $0 }
-      if results.count == pieces.count { return (0..<pieces.count).flatMap { results[$0] ?? [] } }
+      if results.count == ranges.count { return ranges.indices.map { results[$0] ?? [] } }
     }
-    return try? JSONDecoder().decode([Failable<TransferRecord>].self, from: data).compactMap(\.value)
+    guard let list = try? JSONDecoder().decode([Failable<TransferRecord>].self, from: data) else { return nil }
+    return [list.compactMap(\.value)]
   }
 
   /// A top-level JSON array cut into about `count` smaller arrays at the commas between
   /// its elements, so each can be decoded alone. Nil when it isn't one array.
   static func splitArray(_ data: Data, into count: Int) -> [Data]? {
-    data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> [Data]? in
+    snapshotRanges(data, into: count)?.map { snapshotPiece(data, range: $0) }
+  }
+
+  private static func snapshotPiece(_ data: Data, range: Range<Int>) -> Data {
+    data.withUnsafeBytes { bytes in
+      var piece = Data()
+      piece.reserveCapacity(range.count + 2)
+      piece.append(UInt8(ascii: "["))
+      piece.append(UnsafeBufferPointer(rebasing: bytes.bindMemory(to: UInt8.self)[range]))
+      piece.append(UInt8(ascii: "]"))
+      return piece
+    }
+  }
+
+  private static func snapshotRanges(_ data: Data, into count: Int) -> [Range<Int>]? {
+    data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> [Range<Int>]? in
       let bytes = bytes.bindMemory(to: UInt8.self)
       var start = 0
       while start < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[start]) { start += 1 }
@@ -1571,16 +1711,7 @@ public actor TransferManifestStore {
         }
       }
       guard depth == 0, !inString else { return nil }
-      var pieces: [Data] = []
-      var pieceStart = start + 1
-      for cut in cuts + [end] {
-        var piece = Data([UInt8(ascii: "[")])
-        piece.append(UnsafeBufferPointer(rebasing: bytes[pieceStart..<cut]))
-        piece.append(UInt8(ascii: "]"))
-        pieces.append(piece)
-        pieceStart = cut + 1
-      }
-      return pieces
+      return zip([start] + cuts, cuts + [end]).map { ($0 + 1)..<$1 }
     }
   }
 

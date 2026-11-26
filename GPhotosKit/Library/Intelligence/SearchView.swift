@@ -2,6 +2,12 @@ import MapKit
 import Photos
 import SwiftUI
 
+#if canImport(UIKit)
+  import UIKit
+#else
+  import AppKit
+#endif
+
 /// Where Search navigates.
 /// A list of item ids passed between screens, compared by identity so navigation
 /// doesn't hash tens of thousands of strings.
@@ -64,12 +70,25 @@ public struct SearchView: View {
   @State private var typedSuggestions: [SearchSuggestion] = []
   @State private var people: [Person] = []
   @State private var memories: [Memory] = []
+  @State private var isVisible = false
+  @State private var lastDiscoveryRevision = -1
+  @State private var lastMemoriesToken = -1
   /// The Search tab's stack. The people, memories and things tapped sit several to a list
   /// row, where links would all open at once, so buttons push them here; a destination of
   /// its own (`navigationDestination(item:)`) pushed itself again whenever the screen it
   /// showed pushed another.
   @Binding private var path: NavigationPath
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  private struct DiscoveryTrigger: Equatable {
+    let visible: Bool
+    let revision: Int
+  }
+
+  private struct MemoriesTrigger: Equatable {
+    let visible: Bool
+    let reloadToken: Int
+  }
 
   public init(
     library: UnifiedLibraryModel, indexer: LibraryIndexer, cloud: CloudLibrary?, records: [TransferRecord],
@@ -105,6 +124,8 @@ public struct SearchView: View {
     }
     .animation(reduceMotion ? nil : .smooth(duration: 0.25), value: searchText.isEmpty)
     .navigationTitle("Search")
+    .onAppear { isVisible = true }
+    .onDisappear { isVisible = false }
     .task(id: isEditing) {
       // Cancel also leaves the field, and clears it just after: only a search that's
       // still there a moment later is kept.
@@ -128,7 +149,12 @@ public struct SearchView: View {
       do { try await Task.sleep(for: .seconds(3)) } catch { return }
       if !found.isEmpty { SiriLibrary.donateSearch(text) }
     }
-    .task(id: indexer.contentRevision) { await loadDiscovery() }
+    .task(id: DiscoveryTrigger(visible: isVisible, revision: indexer.contentRevision)) {
+      guard isVisible, lastDiscoveryRevision != indexer.contentRevision else { return }
+      let revision = indexer.contentRevision
+      await loadDiscovery()
+      if !Task.isCancelled { lastDiscoveryRevision = revision }
+    }
     .task(id: query) {
       let text = searchText
       guard !text.isEmpty else {
@@ -148,14 +174,20 @@ public struct SearchView: View {
       library.setCloudLibrary(cloud)
       await library.start(records: records)
     }
-    .task(id: library.reloadToken) {
+    .task(id: MemoriesTrigger(visible: isVisible, reloadToken: library.reloadToken)) {
+      guard isVisible else { return }
       indexer.update(from: library)
+      guard lastMemoriesToken != library.reloadToken else { return }
+      let token = library.reloadToken
       // A sync reloads the library every few seconds; Memories follow once it pauses.
       if !memories.isEmpty {
         do { try await Task.sleep(for: .seconds(1)) } catch { return }
       }
       let found = await Memory.find(in: library)
-      if !Task.isCancelled { memories = found }
+      if !Task.isCancelled {
+        memories = found
+        lastMemoriesToken = token
+      }
     }
     // Places' pins push collection routes.
     .navigationDestination(for: CollectionRoute.self) { route in
@@ -190,13 +222,23 @@ public struct SearchView: View {
   /// they do for Siri. Other searches, and words that only look like a filter (a person
   /// named May), use plain matching.
   private func matches(for text: String) async -> [String] {
+    await Self.matches(
+      for: text,
+      named: { (try? await indexer.store.search(personNamed: text))?.isEmpty == false },
+      structured: { completing in await SiriLibrary.shared.search(text, limit: .max, completingLastWord: completing) },
+      plain: { await indexer.search(text) })
+  }
+
+  static func matches(
+    for text: String, named: () async -> Bool, structured: (Bool) async -> [String], plain: () async -> [String]
+  ) async -> [String] {
     let parsed = SiriSearchQuery(text)
-    let filters = parsed.period != nil || parsed.videosOnly || parsed.favoritesOnly
-    guard filters, (try? await indexer.store.search(personNamed: text))?.isEmpty != false else {
-      return await indexer.search(text)
+    guard parsed.period != nil || parsed.videosOnly || parsed.favoritesOnly, !(await named()) else {
+      return await plain()
     }
-    let found = await SiriLibrary.shared.search(text, limit: .max)
-    return found.isEmpty ? await indexer.search(text) : found
+    let found = await structured(text.last?.isWhitespace != true)
+    if found.isEmpty, !parsed.terms.isEmpty { return await plain() }
+    return found
   }
 
   private func loadDiscovery() async {
@@ -307,21 +349,14 @@ public struct SearchView: View {
     Section {
       sectionTitle("Places")
       NavigationLink(value: SearchRoute.places) {
-        Map(initialPosition: .automatic, interactionModes: []) {
-          ForEach(memories) { memory in
-            if case .trip(let latitude, let longitude) = memory.kind {
-              Marker(memory.title, coordinate: CLLocationCoordinate2D(latitude: latitude, longitude: longitude))
-            }
+        PlacesPreviewMap(memories: memories)
+          .frame(height: 160)
+          .overlay(alignment: .bottomLeading) {
+            Label("Explore the Map", systemImage: "map")
+              .font(.headline).padding(10).glassEffect(in: .capsule).padding(12)
           }
-        }
-        .mapStyle(.standard(pointsOfInterest: .excludingAll))
-        .frame(height: 160)
-        .overlay(alignment: .bottomLeading) {
-          Label("Explore the Map", systemImage: "map")
-            .font(.headline).padding(10).glassEffect(in: .capsule).padding(12)
-        }
-        .clipShape(.rect(cornerRadius: 18))
-        .allowsHitTesting(false)
+          .clipShape(.rect(cornerRadius: 18))
+          .allowsHitTesting(false)
       }
       .buttonStyle(.plain)
       .navigationLinkIndicatorVisibility(.hidden)
@@ -400,34 +435,61 @@ public struct SearchView: View {
     finishSearch()
   }
 
-  /// Named people among the typed suggestions, with their faces for the row.
-  private var suggestedPeople: [Person] {
-    typedSuggestions.filter { $0.kind == .person }.compactMap { suggestion in
-      people.first { $0.name == suggestion.query }
+  private struct ResolvedSuggestions {
+    var people: [Person] = []
+    var categories: [SearchCategory] = []
+    var words: [SearchSuggestion] = []
+  }
+
+  /// Resolves typed suggestions into people, categories and word rows once per render using
+  /// dictionary/set lookups instead of repeated quadratic scans.
+  private func resolveSuggestions() -> ResolvedSuggestions {
+    var peopleByName: [String: Person] = [:]
+    for person in people {
+      if let name = person.name, peopleByName[name] == nil { peopleByName[name] = person }
     }
-  }
+    var categoriesByLabel: [String: SearchCategory] = [:]
+    for category in categories where categoriesByLabel[category.label] == nil {
+      categoriesByLabel[category.label] = category
+    }
 
-  private var suggestedCategories: [SearchCategory] {
-    let labels = typedSuggestions.filter { $0.kind == .category }.map { SearchVocabulary.canonical($0.query) }
-    return labels.compactMap { label in categories.first { $0.label == label } }
-  }
+    var matchedPeople: [Person] = []
+    var matchedCategories: [SearchCategory] = []
+    var shownPeopleNames = Set<String>()
+    var shownCategoryLabels = Set<String>()
+    for suggestion in typedSuggestions {
+      switch suggestion.kind {
+      case .person:
+        if let person = peopleByName[suggestion.query] {
+          matchedPeople.append(person)
+          shownPeopleNames.insert(suggestion.query)
+        }
+      case .category:
+        let canonical = SearchVocabulary.canonical(suggestion.query)
+        if let category = categoriesByLabel[canonical] {
+          matchedCategories.append(category)
+          shownCategoryLabels.insert(category.label)
+        }
+      case .metadata, .text:
+        break
+      }
+    }
 
-  /// Places, dates, captions and text in photos: searching for them runs the query.
-  private var suggestedWords: [SearchSuggestion] {
-    let shown = Set(suggestedCategories.map(\.label))
-    return typedSuggestions.filter { suggestion in
+    let words = typedSuggestions.filter { suggestion in
       // The first row already searches for exactly what was typed.
       guard suggestion.query.localizedCaseInsensitiveCompare(searchText) != .orderedSame else { return false }
       return switch suggestion.kind {
       case .metadata, .text: true
-      case .category: !shown.contains(SearchVocabulary.canonical(suggestion.query))
-      case .person: !suggestedPeople.contains { $0.name == suggestion.query }
+      case .category: !shownCategoryLabels.contains(SearchVocabulary.canonical(suggestion.query))
+      case .person: !shownPeopleNames.contains(suggestion.query)
       }
     }
+    return ResolvedSuggestions(people: matchedPeople, categories: matchedCategories, words: words)
   }
 
   private var suggestions: some View {
-    List {
+    let resolved = resolveSuggestions()
+    return List {
       Section {
         Button {
           submitSearch(searchText)
@@ -438,9 +500,9 @@ public struct SearchView: View {
         }
         .foregroundStyle(.primary)
       }
-      if !suggestedPeople.isEmpty {
+      if !resolved.people.isEmpty {
         Section("People") {
-          ForEach(suggestedPeople) { person in
+          ForEach(resolved.people) { person in
             NavigationLink(value: SearchRoute.person(id: person.id, name: person.name)) {
               HStack(spacing: 12) {
                 PersonChip(library: library, person: person, side: 44, showsCaption: false)
@@ -452,13 +514,13 @@ public struct SearchView: View {
           }
         }
       }
-      if !suggestedCategories.isEmpty {
+      if !resolved.categories.isEmpty {
         Section("Things") {
-          ForEach(suggestedCategories.prefix(8)) { category in
+          ForEach(resolved.categories.prefix(8)) { category in
             NavigationLink(value: SearchRoute.label(category.label)) {
               HStack(spacing: 12) {
                 LibraryThumbnail(
-                  id: library.positions(of: [category.sampleID]).first.map(library.itemID(at:)),
+                  id: library.position(ofIndexID: category.sampleID).map(library.itemID(at:)),
                   bucket: .small, source: library.thumbnailSource
                 )
                 .frame(width: 44, height: 44).clipShape(.rect(cornerRadius: 8))
@@ -470,9 +532,9 @@ public struct SearchView: View {
           }
         }
       }
-      if !suggestedWords.isEmpty {
+      if !resolved.words.isEmpty {
         Section("Suggestions") {
-          ForEach(suggestedWords) { suggestion in
+          ForEach(resolved.words) { suggestion in
             Button {
               submitSearch(suggestion.query)
             } label: {
@@ -538,10 +600,186 @@ public struct SearchView: View {
   }
 }
 
+/// Static map preview rendered asynchronously by `MKMapSnapshotter` so the Search discovery
+/// list doesn't keep a live Metal `MKMapView` alive on every visit.
+private struct PlacesPreviewMap: View {
+  let memories: [Memory]
+  @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.displayScale) private var displayScale
+  @State private var width: CGFloat = 0
+  @State private var image: CGImage?
+
+  private struct SnapshotKey: Hashable {
+    let widthBucket: Int
+    let scale: Int
+    let isDark: Bool
+    let coords: [Int]
+  }
+
+  private var tripPoints: [PlacePoint] {
+    memories.compactMap { memory in
+      guard case .trip(let latitude, let longitude) = memory.kind else { return nil }
+      return PlacePoint(id: memory.id, latitude: latitude, longitude: longitude)
+    }
+  }
+
+  private var snapshotKey: SnapshotKey {
+    let bucket = max(0, Int((width / 16).rounded()) * 16)
+    var coords: [Int] = []
+    coords.reserveCapacity(tripPoints.count * 2)
+    for point in tripPoints {
+      coords.append(Int((point.latitude * 100).rounded()))
+      coords.append(Int((point.longitude * 100).rounded()))
+    }
+    return SnapshotKey(widthBucket: bucket, scale: Int(displayScale.rounded()), isDark: colorScheme == .dark, coords: coords)
+  }
+
+  var body: some View {
+    ZStack {
+      Rectangle().fill(.quaternary)
+      if let image {
+        Image(decorative: image, scale: displayScale)
+          .resizable()
+          .scaledToFill()
+      }
+    }
+    .onGeometryChange(for: CGFloat.self) {
+      $0.size.width
+    } action: { newWidth in
+      if abs(newWidth - width) >= 16 || (width == 0 && newWidth > 0) { width = newWidth }
+    }
+    .task(id: snapshotKey) {
+      let key = snapshotKey
+      guard key.widthBucket > 0 else { return }
+      let cacheID = "\(key.widthBucket)|\(key.scale)|\(key.isDark ? "d" : "l")|\(key.coords)" as NSString
+      if let cached = PlacesPreviewCache.shared.object(forKey: cacheID) {
+        image = cached
+        return
+      }
+      let rendered = await renderSnapshot(
+        width: CGFloat(key.widthBucket), height: 160, scale: displayScale, isDark: key.isDark, points: tripPoints)
+      guard !Task.isCancelled, let rendered else { return }
+      PlacesPreviewCache.shared.setObject(rendered, forKey: cacheID, cost: rendered.bytesPerRow * rendered.height)
+      image = rendered
+    }
+  }
+
+  private func renderSnapshot(
+    width: CGFloat, height: CGFloat, scale: CGFloat, isDark: Bool, points: [PlacePoint]
+  ) async -> CGImage? {
+    let options = MKMapSnapshotter.Options()
+    options.size = CGSize(width: width, height: height)
+    options.pointOfInterestFilter = .excludingAll
+    if var region = PlaceClusters.region(containing: points) {
+      region.span.latitudeDelta = max(region.span.latitudeDelta, 0.5)
+      region.span.longitudeDelta = max(region.span.longitudeDelta, 0.5)
+      options.region = region
+    } else {
+      options.region = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 20, longitude: 0),
+        span: MKCoordinateSpan(latitudeDelta: 90, longitudeDelta: 140))
+    }
+    #if os(iOS)
+      options.scale = scale
+      options.traitCollection = UITraitCollection(userInterfaceStyle: isDark ? .dark : .light)
+    #else
+      options.appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+    #endif
+    let snapshotter = MKMapSnapshotter(options: options)
+    let box = SnapshotterBox(snapshotter)
+    let snapshot: MKMapSnapshotter.Snapshot
+    do {
+      snapshot = try await withTaskCancellationHandler {
+        try await snapshotter.start()
+      } onCancel: {
+        box.cancel()
+      }
+    } catch {
+      return nil
+    }
+    guard !Task.isCancelled else { return nil }
+    #if os(iOS)
+      guard let base = snapshot.image.cgImage else { return nil }
+      let pixelScale = snapshot.image.scale
+    #else
+      guard let base = snapshot.image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+      let pixelScale = width > 0 ? CGFloat(base.width) / width : scale
+    #endif
+    guard !points.isEmpty else { return base }
+    let pinCenters: [CGPoint] = points.map { point in
+      let pt = snapshot.point(for: CLLocationCoordinate2D(latitude: point.latitude, longitude: point.longitude))
+      #if os(iOS)
+        return CGPoint(x: pt.x * pixelScale, y: CGFloat(base.height) - pt.y * pixelScale)
+      #else
+        return CGPoint(x: pt.x * pixelScale, y: pt.y * pixelScale)
+      #endif
+    }
+    return await Task.detached(priority: .utility) {
+      Self.drawPins(pinCenters, on: base, scale: pixelScale)
+    }.value
+  }
+
+  private nonisolated static func drawPins(_ centers: [CGPoint], on base: CGImage, scale: CGFloat) -> CGImage? {
+    let space = base.colorSpace ?? CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+    guard
+      let context = CGContext(
+        data: nil, width: base.width, height: base.height, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+    else { return base }
+    context.draw(base, in: CGRect(x: 0, y: 0, width: base.width, height: base.height))
+    let radius = 6 * scale
+    let stroke = 2 * scale
+    let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+    let pinFill = CGColor(colorSpace: p3, components: [0.95, 0.25, 0.22, 1]) ?? CGColor(red: 0.95, green: 0.25, blue: 0.22, alpha: 1)
+    let ringColor = CGColor(gray: 1, alpha: 1)
+    for center in centers {
+      let outerSide = (radius + stroke) * 2
+      let outer = CGRect(
+        x: center.x - radius - stroke, y: center.y - radius - stroke, width: outerSide, height: outerSide)
+      let inner = CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)
+      context.setFillColor(ringColor)
+      context.fillEllipse(in: outer)
+      context.setFillColor(pinFill)
+      context.fillEllipse(in: inner)
+    }
+    return context.makeImage() ?? base
+  }
+}
+
+private final class SendableImageCache: @unchecked Sendable {
+  private let cache = NSCache<NSString, CGImage>()
+
+  init(countLimit: Int, totalCostLimit: Int) {
+    cache.countLimit = countLimit
+    cache.totalCostLimit = totalCostLimit
+  }
+
+  func object(forKey key: NSString) -> CGImage? { cache.object(forKey: key) }
+  func setObject(_ image: CGImage, forKey key: NSString, cost: Int) { cache.setObject(image, forKey: key, cost: cost) }
+  func removeAllObjects() { cache.removeAllObjects() }
+}
+
+private enum PlacesPreviewCache {
+  static let shared = SendableImageCache(countLimit: 16, totalCostLimit: 16 * 1024 * 1024)
+}
+
+private final class SnapshotterBox: @unchecked Sendable {
+  private let snapshotter: MKMapSnapshotter
+  init(_ snapshotter: MKMapSnapshotter) { self.snapshotter = snapshotter }
+  func cancel() { snapshotter.cancel() }
+}
+
 /// Screenshots, receipts and documents, found by the aesthetics model.
 private struct UtilityLink: View {
   let indexer: LibraryIndexer
   @State private var count = 0
+  @State private var isVisible = false
+  @State private var loadedRevision = -1
+
+  private struct Trigger: Equatable {
+    let visible: Bool
+    let revision: Int
+  }
 
   var body: some View {
     NavigationLink(value: SearchRoute.utility) {
@@ -551,7 +789,17 @@ private struct UtilityLink: View {
         Label("Screenshots & Documents", systemImage: "doc.text.viewfinder")
       }
     }
-    .task(id: indexer.contentRevision) { count = (try? await indexer.store.utilityIDs().count) ?? 0 }
+    .onAppear { isVisible = true }
+    .onDisappear { isVisible = false }
+    .task(id: Trigger(visible: isVisible, revision: indexer.contentRevision)) {
+      guard isVisible, loadedRevision != indexer.contentRevision else { return }
+      let revision = indexer.contentRevision
+      let found = (try? await indexer.store.utilityCount()) ?? 0
+      if !Task.isCancelled {
+        count = found
+        loadedRevision = revision
+      }
+    }
   }
 }
 
@@ -563,11 +811,8 @@ private struct IndexedResults: View {
   @State private var ids: [String]?
 
   var body: some View {
-    Group {
-      if let ids { ResultsGridView(title: title, library: library, ids: ids) } else { ProgressView() }
-    }
-    .navigationTitle(title)
-    .task { ids = await load() }
+    ResultsGridView(title: title, library: library, ids: ids)
+      .task { ids = await load() }
   }
 }
 
@@ -584,7 +829,7 @@ private struct CategoryTile: View {
     Button(action: open) {
       ZStack(alignment: .bottomLeading) {
         LibraryThumbnail(
-          id: library.positions(of: [category.sampleID]).first.map(library.itemID(at:)), bucket: .medium,
+          id: library.position(ofIndexID: category.sampleID).map(library.itemID(at:)), bucket: .medium,
           source: library.thumbnailSource)
         LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .center, endPoint: .bottom)
         Text(title).font(.caption.weight(.semibold)).foregroundStyle(.white).lineLimit(1).padding(8)
@@ -619,28 +864,30 @@ struct Memory: Identifiable, Sendable, Hashable {
     }
   }
 
-  /// Runs off the main actor from the library's snapshot: at 100,000 items the moments
-  /// alone are a large array.
+  /// Runs off the main actor from the library's unfiltered snapshot: at 100,000 items the
+  /// moments alone are a large array, and active Library filters must not hide memories.
   @MainActor
   static func find(in library: UnifiedLibraryModel) async -> [Memory] {
     let snapshot = library.indexSnapshot()
     return await Task.detached(priority: .utility) {
-      let moments = snapshot.moments()
+      let unfiltered = snapshot.unfiltered()
+      let moments = unfiltered.moments()
       let days = MemoryFinder.onThisDay(moments, today: Date())
       let trips = MemoryFinder.trips(moments)
       let currentYear = Calendar.current.component(.year, from: Date())
       var memories: [Memory] = days.map { day in
         Memory(
-          kind: .onThisDay(yearsAgo: currentYear - day.year), idList: ItemIDs(day.indices.compactMap(snapshot.indexID(at:))),
+          kind: .onThisDay(yearsAgo: currentYear - day.year), idList: ItemIDs(day.indices.compactMap(unfiltered.indexID(at:))),
           date: moments[day.indices[0]].date)
       }
       for trip in trips.prefix(12) {
         let located = trip.filter { moments[$0].latitude != nil }
+        guard !located.isEmpty else { continue }
         let middle = located[located.count / 2]
         memories.append(
           Memory(
             kind: .trip(latitude: moments[middle].latitude ?? 0, longitude: moments[middle].longitude ?? 0),
-            idList: ItemIDs(trip.reversed().compactMap(snapshot.indexID(at:))), date: moments[trip[0]].date))
+            idList: ItemIDs(trip.reversed().compactMap(unfiltered.indexID(at:))), date: moments[trip[0]].date))
       }
       return memories
     }.value
@@ -655,7 +902,7 @@ private struct MemoryCard: View {
   var body: some View {
     ZStack(alignment: .bottomLeading) {
       LibraryThumbnail(
-        id: library.positions(of: [memory.idList.values.first ?? ""]).first.map(library.itemID(at:)), bucket: .large,
+        id: memory.idList.values.first.flatMap(library.position(ofIndexID:)).map(library.itemID(at:)), bucket: .large,
         source: library.thumbnailSource)
       LinearGradient(colors: [.clear, .black.opacity(0.6)], startPoint: .center, endPoint: .bottom)
       VStack(alignment: .leading, spacing: 2) {
@@ -670,10 +917,8 @@ private struct MemoryCard: View {
     .contentShape(.rect(cornerRadius: 18))
     .accessibilityElement(children: .combine)
     .task {
-      guard case .trip(let latitude, let longitude) = memory.kind,
-        let request = MKReverseGeocodingRequest(location: CLLocation(latitude: latitude, longitude: longitude))
-      else { return }
-      place = try? await request.mapItems.first?.addressRepresentations?.cityName
+      guard case .trip(let latitude, let longitude) = memory.kind else { return }
+      place = await PlaceNameCache.shared.cityName(latitude: latitude, longitude: longitude)
     }
   }
 
@@ -687,13 +932,31 @@ private struct MemoryCard: View {
 
 // MARK: - People
 
+enum FaceCropCache {
+  private static let cache = SendableImageCache(countLimit: 128, totalCostLimit: 16 * 1024 * 1024)
+
+  static func object(forKey key: NSString) -> CGImage? { cache.object(forKey: key) }
+  static func setObject(_ image: CGImage, forKey key: NSString, identity: ThumbnailIdentity) {
+    let store = { cache.setObject(image, forKey: key, cost: image.bytesPerRow * image.height) }
+    if let mediaKey = RemoteThumbnailID(identity.id)?.mediaKey {
+      LockedItems.whileUnlocked(mediaKey, accountEmail: identity.accountEmail, store)
+    } else {
+      store()
+    }
+  }
+  static func removeAll() { cache.removeAllObjects() }
+}
+
 /// A face cut out of its photo.
 struct PersonChip: View {
   let library: UnifiedLibraryModel
   let person: Person
   let side: CGFloat
   var showsCaption = true
+  @Environment(\.displayScale) private var displayScale
   @State private var image: CGImage?
+  @State private var loadedKey: String?
+  @State private var loadedIdentity: ThumbnailIdentity?
   @State private var token: ImageRequestToken?
 
   var body: some View {
@@ -720,29 +983,71 @@ struct PersonChip: View {
     .frame(width: showsCaption ? side + 12 : side)
     .accessibilityElement(children: .combine)
     .onAppear(perform: load)
-    // Search can open before the library has loaded.
+    .onReceive(NotificationCenter.default.publisher(for: LockedItems.didLock).receive(on: DispatchQueue.main)) { _ in
+      if loadedIdentity?.isLocked == true {
+        token?.cancel()
+        token = nil
+        image = nil
+      }
+    }
+    // Search can open before the library has loaded, or the person's cover can update.
     .onChange(of: library.reloadToken) { load() }
-    .onDisappear { token?.cancel() }
+    .onChange(of: person.cover?.id) { load() }
+    .onDisappear {
+      token?.cancel()
+      token = nil
+    }
   }
 
   private func load() {
-    // The cover may be a photo that's only in Google Photos now.
-    guard let face = person.cover, image == nil, let position = library.positions(of: [face.itemID]).first else { return }
+    // The cover may be a photo that's only in Google Photos now; drop pixels if it left the library.
+    let identity = person.cover.flatMap { library.position(ofIndexID: $0.itemID) }.map(library.thumbnailIdentity(at:))
+    guard let face = person.cover, let identity, !identity.isLocked else {
+      token?.cancel()
+      token = nil
+      loadedKey = nil
+      loadedIdentity = nil
+      image = nil
+      return
+    }
+    loadedIdentity = identity
+    let itemID = identity.id
+    let targetFacePixels = side * displayScale * 1.6
+    let faceFraction = max(min(face.rect.width, face.rect.height), 0.05)
+    let requestSide = min(max(ceil(targetFacePixels / faceFraction), side * displayScale), 600)
+    let account = library.cloud?.library.accountEmail ?? ""
+    let key =
+      "\(account)|\(itemID)|\(face.id)|\(Int((face.rect.minX * 1_000).rounded())),\(Int((face.rect.minY * 1_000).rounded())),\(Int((face.rect.width * 1_000).rounded())),\(Int((face.rect.height * 1_000).rounded()))|\(Int(requestSide))"
+    if loadedKey == key, image != nil { return }
+    if let cached = FaceCropCache.object(forKey: key as NSString) {
+      token?.cancel()
+      token = nil
+      loadedKey = key
+      image = cached
+      return
+    }
+    token?.cancel()
+    loadedKey = key
     token = library.thumbnailSource.requestImage(
-      id: library.itemID(at: position), pixelSize: CGSize(width: 600, height: 600), quality: .display
-    ) { full, _ in
+      id: itemID, pixelSize: CGSize(width: requestSide, height: requestSide), quality: .uncroppedThumbnail
+    ) { full, isFinal in
       // Face coordinates refer to the whole photo, so request aspect-fit before cropping.
       let width = CGFloat(full.width)
       let height = CGFloat(full.height)
       let faceRect = CGRect(
         x: face.rect.minX * width, y: face.rect.minY * height,
         width: face.rect.width * width, height: face.rect.height * height)
-      let side = min(max(faceRect.width, faceRect.height) * 1.6, min(width, height))
+      let cropSide = min(max(faceRect.width, faceRect.height) * 1.6, min(width, height))
       let rect = CGRect(
-        x: min(max(0, faceRect.midX - side / 2), width - side),
-        y: min(max(0, faceRect.midY - side / 2), height - side), width: side, height: side)
-      let crop = full.cropping(to: rect.integral)
-      Task { @MainActor in image = crop ?? full }
+        x: min(max(0, faceRect.midX - cropSide / 2), width - cropSide),
+        y: min(max(0, faceRect.midY - cropSide / 2), height - cropSide), width: cropSide, height: cropSide)
+      let result = full.cropping(to: rect.integral) ?? full
+      if isFinal {
+        FaceCropCache.setObject(result, forKey: key as NSString, identity: identity)
+      }
+      Task { @MainActor in
+        if loadedKey == key, !identity.isLocked { image = result }
+      }
     }
   }
 }
@@ -782,12 +1087,12 @@ struct PersonView: View {
   let indexer: LibraryIndexer
   let personID: Int64
   @State private var name: String?
-  @State private var ids: [String] = []
+  @State private var ids: [String]?
   @State private var isNaming = false
   @State private var draft = ""
   @State private var isChoosingMerge = false
   /// Another person already called the name just given, offered for a merge.
-  @State private var sameName: Person?
+  @State private var sameName: LibraryIndexStore.NamedPerson?
   @Environment(\.dismiss) private var dismiss
 
   init(library: UnifiedLibraryModel, indexer: LibraryIndexer, personID: Int64, name: String?) {
@@ -836,9 +1141,9 @@ struct PersonView: View {
             indexer.peopleDidChange()
             // Photos asks the same: a second person with this name is usually a duplicate.
             guard let name else { return }
-            let others = (try? await indexer.store.people(minimumFaces: 1)) ?? []
+            let others = (try? await indexer.store.namedPeople()) ?? []
             sameName = others.first {
-              $0.id != personID && $0.name?.localizedCaseInsensitiveCompare(name) == .orderedSame
+              $0.id != personID && $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
             }
           }
         }
@@ -850,7 +1155,7 @@ struct PersonView: View {
         isPresented: Binding(get: { sameName != nil }, set: { if !$0 { sameName = nil } }),
         presenting: sameName
       ) { other in
-        Button("Merge") { merge(other) }
+        Button("Merge") { merge(personID: other.id, otherName: other.name) }
         Button("Keep Separate", role: .cancel) {}
       } message: { _ in
         Text("If they’re the same person, their photos are combined here.")
@@ -858,16 +1163,16 @@ struct PersonView: View {
       .sheet(isPresented: $isChoosingMerge) {
         MergePersonPicker(library: library, indexer: indexer, excluding: personID) { other in
           isChoosingMerge = false
-          merge(other)
+          merge(personID: other.id, otherName: other.name)
         }
       }
       .task(id: indexer.contentRevision) { ids = (try? await indexer.store.ids(ofPerson: personID)) ?? [] }
   }
 
-  private func merge(_ other: Person) {
+  private func merge(personID otherID: Int64, otherName: String?) {
     Task {
-      let merged = (try? await indexer.store.merge(person: other.id, into: personID)) ?? false
-      if merged, name == nil { name = other.name }
+      let merged = (try? await indexer.store.merge(person: otherID, into: personID)) ?? false
+      if merged, name == nil { name = otherName }
       indexer.peopleDidChange()
     }
   }

@@ -50,6 +50,15 @@ enum AspectFit {
 struct ZoomableImage: View {
   let image: CGImage?
   let pixelSize: CGSize
+  var previewIdentity: ThumbnailIdentity?
+  var isCurrent = false
+  var showsProgress = true
+  /// A sharper image is on its way.
+  var isLoading = false
+  /// The request ended with nothing to show.
+  var didFail = false
+  /// A video that can't play on yet.
+  var isBuffering = false
   /// Offers Live Text on the image once it's on screen and settled.
   var liveText = false
   var onZoom: (CGFloat) -> Void = { _ in }
@@ -62,15 +71,40 @@ struct ZoomableImage: View {
   var player: AVPlayer?
   @Environment(\.viewerZoom) private var zoom
   @Environment(\.viewerItemID) private var itemID
+  @Environment(\.viewerThumbnailIdentity) private var thumbnailIdentity
+  @Environment(\.viewerNeighbors) private var neighbors
+  #if os(iOS)
+    @Environment(\.filmstripLink) private var filmstripLink
+    @State private var firstFrame: CGImage?
+  #endif
   @State private var videoSize = CGSize.zero
 
   var body: some View {
-    let displayed = image ?? ThumbnailPipeline.shared.viewerPreview(for: itemID)
-    let decoded = displayed.map { CGSize(width: $0.width, height: $0.height) } ?? .zero
-    let size = AspectFit.orientedSize(decoded: videoSize == .zero ? decoded : videoSize, metadata: pixelSize)
+    // The pager can build a neighbour before its prefetch has delivered.
+    let _ = neighbors?.revision
+    let cacheIdentity = previewIdentity ?? thumbnailIdentity
+    #if os(iOS)
+      let handoff = filmstripLink?.handoffImage(for: itemID)
+      let slice = handoff ?? firstFrame
+    #else
+      let slice: CGImage? = nil
+    #endif
+    let firstPreview =
+      ViewerImage.preview(for: cacheIdentity, pixels: pixelSize, slice: slice)
+      ?? (cacheIdentity == thumbnailIdentity ? nil : ViewerImage.preview(for: thumbnailIdentity, pixels: pixelSize))
+    let preview = firstPreview?.image
+    let previewIsCropped = firstPreview?.cropped == true
+    let sharper = image.flatMap { image in
+      previewIsCropped || ViewerImage.accepts(image, over: preview, isFinal: true) ? image : nil
+    }
+    let displayed = sharper ?? preview
+    let decoded = displayed.map(ViewerImage.size) ?? .zero
+    let cropped = sharper == nil && previewIsCropped
+    let size = AspectFit.orientedSize(
+      decoded: videoSize == .zero ? (cropped ? pixelSize : decoded) : videoSize, metadata: pixelSize)
     ZoomableImageRepresentable(
-      image: displayed, pixelSize: size, liveText: liveText, onZoom: onZoom, onTap: onTap, onDismiss: onDismiss,
-      onSwipeUp: onSwipeUp, player: player,
+      image: displayed, pixelSize: size, cropped: cropped, liveText: liveText, onZoom: onZoom, onTap: onTap,
+      onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player,
       onPull: zoom.map { zoom in
         { pull, frame in
           zoom.pull = pull
@@ -78,9 +112,26 @@ struct ZoomableImage: View {
         }
       }
     )
-    .onChange(of: image, initial: true) {
-      if let image { ThumbnailPipeline.shared.rememberViewerPreview(image, for: itemID) }
+    .overlay {
+      if didFail, displayed == nil, isCurrent, player == nil {
+        Label("Couldn't Load", systemImage: "exclamationmark.triangle").foregroundStyle(.secondary)
+      }
     }
+    .overlay {
+      ViewerLoadingIndicator(
+        isLoading: isCurrent && showsProgress
+          && (isBuffering || (player == nil && isLoading)))
+    }
+    #if os(iOS)
+      .onChange(of: handoff, initial: true) {
+        if let handoff { firstFrame = handoff }
+      }
+      .onChange(of: isCurrent && displayed != nil ? itemID : nil, initial: true) { _, readyID in
+        guard let readyID else { return }
+        // Let the native image view finish this update before taking down the scrub overlay.
+        DispatchQueue.main.async { filmstripLink?.pageImageReady(readyID) }
+      }
+    #endif
     .onReceive(presentationSize.removeDuplicates().receive(on: DispatchQueue.main)) { videoSize = $0 }
   }
 
@@ -92,6 +143,11 @@ struct ZoomableImage: View {
 
 extension EnvironmentValues {
   @Entry var viewerItemID = ""
+  @Entry var viewerThumbnailIdentity = ThumbnailIdentity(id: "")
+  @Entry var viewerNeighbors: ViewerNeighborRequests?
+  #if os(iOS)
+    @Entry var filmstripLink: FilmstripLink?
+  #endif
 }
 
 #if os(iOS)
@@ -100,6 +156,7 @@ extension EnvironmentValues {
   private struct ZoomableImageRepresentable: UIViewRepresentable {
     let image: CGImage?
     let pixelSize: CGSize
+    let cropped: Bool
     let liveText: Bool
     let onZoom: (CGFloat) -> Void
     let onTap: () -> Void
@@ -117,8 +174,8 @@ extension EnvironmentValues {
       view.onTap = onTap
       view.onDismiss = onDismiss
       view.onSwipeUp = onSwipeUp
-      view.setContent(image: image, pixelSize: pixelSize)
-      view.setLiveText(liveText)
+      view.setContent(image: image, pixelSize: pixelSize, cropped: cropped)
+      view.setLiveText(liveText && !cropped)
     }
   }
 
@@ -183,6 +240,7 @@ extension EnvironmentValues {
       alwaysBounceVertical = true
       isDirectionalLockEnabled = true
       imageView.contentMode = .scaleAspectFit
+      imageView.clipsToBounds = true
       imageView.accessibilityIgnoresInvertColors = true
       addSubview(imageView)
       let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
@@ -195,14 +253,9 @@ extension EnvironmentValues {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func setContent(image: CGImage?, pixelSize: CGSize) {
+    func setContent(image: CGImage?, pixelSize: CGSize, cropped: Bool = false) {
+      imageView.contentMode = cropped ? .scaleAspectFill : .scaleAspectFit
       if image !== currentImage {
-        if currentImage != nil, image != nil, !UIAccessibility.isReduceMotionEnabled {
-          let fade = CATransition()
-          fade.type = .fade
-          fade.duration = 0.18
-          imageView.layer.add(fade, forKey: "imageDelivery")
-        }
         currentImage = image
         imageView.image = image.map { UIImage(cgImage: $0) }
         scheduleAnalysis()
@@ -492,6 +545,7 @@ extension EnvironmentValues {
   private struct ZoomableImageRepresentable: NSViewRepresentable {
     let image: CGImage?
     let pixelSize: CGSize
+    let cropped: Bool
     let liveText: Bool
     let onZoom: (CGFloat) -> Void
     let onTap: () -> Void
@@ -505,8 +559,8 @@ extension EnvironmentValues {
     func updateNSView(_ view: ZoomingImageScrollView, context: Context) {
       view.setPlayer(player)
       view.onZoom = onZoom
-      view.setContent(image: image, pixelSize: pixelSize)
-      view.setLiveText(liveText)
+      view.setContent(image: image, pixelSize: pixelSize, cropped: cropped)
+      view.setLiveText(liveText && !cropped)
     }
   }
 
@@ -598,14 +652,13 @@ extension EnvironmentValues {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func setContent(image: CGImage?, pixelSize: CGSize) {
+    func setContent(image: CGImage?, pixelSize: CGSize, cropped: Bool = false) {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      imageView.layer?.contentsGravity = cropped ? .resizeAspectFill : .resizeAspect
+      imageView.layer?.masksToBounds = cropped
+      defer { CATransaction.commit() }
       if image !== currentImage {
-        if currentImage != nil, image != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-          let fade = CATransition()
-          fade.type = .fade
-          fade.duration = 0.18
-          imageView.layer?.add(fade, forKey: "imageDelivery")
-        }
         currentImage = image
         imageView.layer?.contents = image
         scheduleAnalysis()

@@ -1,9 +1,41 @@
+import Foundation
 import Testing
 
 @testable import GPhotosKit
 
 @Suite("Batch upload progress")
 struct BatchUploadProgressTests {
+  @Test("Byte callbacks publish both slots on one flush and phase changes publish immediately")
+  @MainActor
+  func coalescedWorkerProgress() {
+    let client = GooglePhotosMobileClient(authService: GoogleAuthService())
+    let manifest = TransferManifestStore(fileURL: TestTemporaryDirectory.root.appendingPathComponent(UUID().uuidString))
+    let pool = UploadWorkerPool(client: client, manifestStore: manifest)
+    pool.setConcurrency(2)
+    for (slot, id) in ["a", "b"].enumerated() {
+      pool.prepareWorker(slot, for: UploadQueueItem(id: id, fileURL: URL(fileURLWithPath: "/p.jpg"), fileSize: 100))
+      pool.applyProgress(workerID: slot, itemID: id, phase: .uploading) {
+        $0.message = "Uploading"
+        $0.bytesUploaded = 10
+      }
+      #expect(pool.workers[slot].status == "uploading")
+      #expect(pool.workers[slot].bytesUploaded == 10)
+    }
+    pool.applyProgress(workerID: 0, itemID: "a", phase: .uploading) { $0.bytesUploaded = 25 }
+    pool.applyProgress(workerID: 1, itemID: "b", phase: .uploading) { $0.bytesUploaded = 60 }
+    pool.applyProgress(workerID: 0, itemID: "a", phase: .uploading) { $0.bytesUploaded += 10 }
+    #expect(pool.workers.map(\.bytesUploaded) == [10, 10])
+
+    pool.flushWorkerProgress()
+    #expect(pool.workers.map(\.bytesUploaded) == [35, 60])
+
+    pool.applyProgress(workerID: 0, itemID: "a", phase: .uploading) { $0.bytesUploaded = 90 }
+    pool.prepareWorker(0, for: UploadQueueItem(id: "new", fileURL: URL(fileURLWithPath: "/n.jpg"), fileSize: 100))
+    pool.flushWorkerProgress()
+    #expect(pool.workers[0].itemID == "new")
+    #expect(pool.workers[0].bytesUploaded == 0)
+  }
+
   @Test("Concurrent files are weighted by bytes, retries never double count, and commit gates completion")
   func concurrentRetries() {
     var progress = BatchUploadProgress()

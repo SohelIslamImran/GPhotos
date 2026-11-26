@@ -19,9 +19,11 @@ public enum UnifiedShareItem: Transferable, Sendable {
 
   func export() async throws -> URL {
     switch self {
-    case .device(let shared): try await shared.export()
-    case .cloud(let shared): try await shared.export()
-    case .file(let shared): shared.item.url
+    case .device(let shared): return try await shared.export()
+    case .cloud(let shared): return try await shared.export()
+    case .file(let shared):
+      guard LocalFirstThumbnailSource.fileAliasIsCurrent(shared.item) else { throw CocoaError(.fileNoSuchFile) }
+      return shared.item.url
     }
   }
 
@@ -42,8 +44,15 @@ public struct UnifiedLibraryView: View {
   let records: [TransferRecord]
   let recordsRevision: Int?
   let accountsLoaded: Bool
+  let isActive: Bool
   @State private var zoomStep: Int
-  @State private var selection: Set<Int> = []
+  @State private var selectedIDs: Set<UnifiedLibraryModel.SelectionID> = []
+  @State private var selectedPositions: Set<Int> = []
+  @State private var selectionToken = -1
+  private var selection: Set<Int> {
+    selectionToken == model.reloadToken ? selectedPositions : model.selectionPositions(selectedIDs)
+  }
+  @State private var filterAnchors: [LibraryFilter: String] = [:]
   @State private var isSelecting = false
   @State private var opened: Int?
   @State private var status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -53,7 +62,7 @@ public struct UnifiedLibraryView: View {
   /// lives in its own object and only the title reads it; the screen doesn't re-render.
   @State private var top = TopOfGrid()
   /// Photos are under the bar: it darkens and the title turns white, as in Photos.
-  @State private var isScrolledUnderBar = false
+  @State private var isScrolledUnderBar = LibrarySnapshot.ready?.info.isScrolledUnderBar ?? false
   /// The grid shows its newest photos: the title says how many items there are, as in
   /// Photos; anywhere else it shows the day at the top.
   @State private var isAtNewest = true
@@ -78,45 +87,47 @@ public struct UnifiedLibraryView: View {
   /// How the grid looked at the last launch's end, drawn until the grid itself has.
   @State private var snapshot = LibrarySnapshot.ready
   @State private var showsSnapshot = true
+  @State private var lastCapture: (time: ContinuousClock.Instant, snapshot: LibrarySnapshot)?
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.displayScale) private var displayScale
-  #if os(iOS)
-    @Environment(\.scenePhase) private var scenePhase
-  #endif
+  @Environment(\.scenePhase) private var scenePhase
 
   private struct PendingDelete {
-    let device: [PHAsset]
-    let cloud: [RemoteItemSummary]
-    /// The Google Photos copies of `device`.
-    let cloudCopies: [RemoteItemSummary]
-    var count: Int { device.count + cloud.count }
+    let ids: Set<UnifiedLibraryModel.SelectionID>
+    let reviewed: UnifiedLibraryModel.Picked
+    let deviceOnly: Bool
+
+    var count: Int { reviewed.device.count + (deviceOnly ? 0 : reviewed.cloud.count) }
+
+    func matches(_ fresh: UnifiedLibraryModel.Picked, includingCopies: Bool) -> Bool {
+      Set(reviewed.device.map(\.localIdentifier)) == Set(fresh.device.map(\.localIdentifier))
+        && (deviceOnly || reviewed.cloud.map(\.dedupKey).sorted() == fresh.cloud.map(\.dedupKey).sorted())
+        && (!includingCopies || reviewed.cloudCopies.map(\.dedupKey).sorted() == fresh.cloudCopies.map(\.dedupKey).sorted())
+    }
   }
 
   private struct AlbumTargets: Identifiable {
     let id = UUID()
-    let assets: [PHAsset]
+    let rows: Set<UnifiedLibraryModel.SelectionID>
   }
 
   public init(
     model: UnifiedLibraryModel, cloudLibrary: CloudLibrary?, records: [TransferRecord], recordsRevision: Int?,
-    accountsLoaded: Bool
+    accountsLoaded: Bool, isActive: Bool = true
   ) {
     self.model = model
     self.accountsLoaded = accountsLoaded
+    self.isActive = isActive
     self.cloudLibrary = cloudLibrary
     self.records = records
     self.recordsRevision = recordsRevision
-    #if os(iOS)
-      _zoomStep = State(initialValue: Self.defaultZoomStep)
-      // The bar starts as it was over the snapshot.
-      _isScrolledUnderBar = State(initialValue: LibrarySnapshot.ready?.info.isScrolledUnderBar ?? false)
-    #else
-      _zoomStep = State(initialValue: PhotoGridZoom.defaultStep)
-    #endif
+    _zoomStep = State(initialValue: Self.defaultZoomStep)
   }
 
   #if os(iOS)
     private static let defaultZoomStep = PhotoGridZoom.columnSteps.firstIndex(of: PhotoGridZoom.defaultColumns) ?? 3
+  #else
+    private static let defaultZoomStep = PhotoGridZoom.defaultStep
   #endif
 
   /// Read live: access granted from the system prompt or Settings shows up here too.
@@ -124,6 +135,13 @@ public struct UnifiedLibraryView: View {
     _ = status
     return PhotoLibraryGridModel.hasAccess
   }
+  private func refreshPhotoAccess() {
+    let updated = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+    guard status != updated else { return }
+    status = updated
+    Task { await model.startLocal() }
+  }
+
   private var showsModes: Bool { model.showsModes }
 
   public var body: some View {
@@ -132,60 +150,48 @@ public struct UnifiedLibraryView: View {
         dialogs(
           lifecycle(
             content.navigationTitle("Library").toolbarTitleDisplayMode(.inline)
-              .toolbarColorScheme(isOverPhotos ? .dark : nil, for: .navigationBar)
+              .toolbarColorScheme(isOverPhotos ? .dark : colorScheme, for: .navigationBar)
           )))
     #else
-      presentations(dialogs(lifecycle(content.gridTitle(String(localized: "Library"), subtitle: subtitle, zoom: zoom))))
+      presentations(dialogs(lifecycle(content)))
+        .background {
+          if isActive {
+            Color.clear.gridTitle(String(localized: "Library"), subtitle: subtitle, zoom: zoom)
+          }
+        }
+        .onChange(of: isActive) { _, active in
+          if !active { opened = nil }
+        }
     #endif
   }
 
-  private func lifecycle(_ view: some View) -> some View {
+  private var cloudSyncFailed: Bool {
+    if case .failed = cloudLibrary?.status { return true }
+    return false
+  }
+
+  private func loadLibrary(_ view: some View) -> some View {
     view
-      .toolbar { toolbar }
-      .task { await model.preload(firstScreen: firstScreen) }
+      .task { await model.startLocal(firstScreen: firstScreen) }
+      .task {
+        // Thumbnails may never come (offline): the saved screen can't stay over the grid.
+        try? await Task.sleep(for: .seconds(10))
+        if !Task.isCancelled { hideSnapshot() }
+      }
+      .onReceive(NotificationCenter.default.publisher(for: LockedItems.didLock).receive(on: DispatchQueue.main)) { _ in
+        // It may show what was just locked.
+        snapshot = nil
+      }
       .task(id: accountsLoaded) {
         guard accountsLoaded else { return }
         model.setCloudLibrary(cloudLibrary)
         cloudLibrary?.refresh()
         await model.start(records: records)
         #if DEBUG
-          switch UserDefaults.standard.string(forKey: "UIScreen") {
-          case "viewer":
-            for _ in 0..<40 where model.itemCount == 0 { try? await Task.sleep(for: .milliseconds(250)) }
-            if model.itemCount > 0 { zoom.open(0, in: model) { opened = 0 } }
-          case "cloudGridStress", "cloudPinchStress":
-            // Waits for the 100,000-item library, then flings through it and logs frame times.
-            for _ in 0..<600 where cloudLibrary?.isSyncing != false || model.itemCount < 90_000 {
-              try? await Task.sleep(for: .milliseconds(500))
-            }
-            try? await Task.sleep(for: .seconds(3))
-            if UserDefaults.standard.string(forKey: "UIScreen") == "cloudPinchStress" {
-              zoom.proxy.runPinchStress(seconds: 12)
-            } else {
-              zoom.proxy.runStress(seconds: 6)
-            }
-          case "cloudFilmstripStress":
-            for _ in 0..<600 where cloudLibrary?.isSyncing != false || model.itemCount < 90_000 {
-              try? await Task.sleep(for: .milliseconds(500))
-            }
-            zoom.open(50_000, in: model) { opened = 50_000 }
-          case "cloudViewer":
-            // Local folder items can arrive first; this hook must open a cloud photo.
-            for _ in 0..<40 {
-              if let index = model.entries.firstIndex(where: {
-                if case .cloud(let index) = $0 { return model.cloud?.item(at: index)?.kind == .photo }
-                return false
-              }) {
-                zoom.open(index, in: model) { opened = index }
-                break
-              }
-              try? await Task.sleep(for: .milliseconds(250))
-            }
-          default: break
-          }
+          await runReviewHook()
         #endif
       }
-      .onChange(of: cloudLibrary?.accountEmail) { previous, _ in
+      .onChange(of: cloudLibrary.map(ObjectIdentifier.init)) { previous, _ in
         if previous != nil {
           snapshot = nil
           hideSnapshot()
@@ -197,29 +203,105 @@ public struct UnifiedLibraryView: View {
         Task { await model.start(records: records) }
       }
       .onChange(of: cloudLibrary?.revision) { Task { await model.cloudChanged() } }
+      .onChange(of: cloudLibrary?.isSyncing) { Task { await model.contentProbeConditionsChanged() } }
+      .onReceive(NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange).receive(on: DispatchQueue.main)) { _ in
+        Task { await model.contentProbeConditionsChanged() }
+      }
+      .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification).receive(on: DispatchQueue.main)) {
+        _ in
+        Task { await model.contentProbeConditionsChanged() }
+      }
+      .onChange(of: cloudSyncFailed) { Task { await model.rebuild() } }
+      .onChange(of: cloudLibrary?.syncState.initialSyncDone) { Task { await model.rebuild() } }
       .onChange(of: recordsRevision) { Task { await model.recordsChanged(records) } }
-      .onChange(of: model.device.reloadToken) { Task { await model.rebuild() } }
-      .onChange(of: model.device.badgeToken) { if model.filter != .all { Task { await model.rebuild() } } }
+      .onReceive(NotificationCenter.default.publisher(for: AppSettingsStore.didChange).receive(on: DispatchQueue.main)) { _ in
+        Task { await model.recordsChanged(records) }
+      }
+      .onChange(of: model.hasResolvedFilter) { _, complete in
+        if complete, model.itemCount == 0 { hideSnapshot() }
+      }
+      .onChange(of: scenePhase) { Task { await model.contentProbeConditionsChanged() } }
+      .onChange(of: model.device.reloadToken) { Task { await model.startLocal() } }
+  }
+
+  #if DEBUG
+    private func runReviewHook() async {
+      switch UserDefaults.standard.string(forKey: "UIScreen") {
+      case "viewer":
+        for _ in 0..<40 where model.itemCount == 0 { try? await Task.sleep(for: .milliseconds(250)) }
+        if model.itemCount > 0 { zoom.open(0, in: model) { opened = 0 } }
+      case "cloudGridStress", "cloudPinchStress":
+        // Waits for the 100,000-item library, then flings through it and logs frame times.
+        for _ in 0..<600 where cloudLibrary?.isSyncing != false || model.itemCount < 90_000 {
+          try? await Task.sleep(for: .milliseconds(500))
+        }
+        try? await Task.sleep(for: .seconds(3))
+        if UserDefaults.standard.string(forKey: "UIScreen") == "cloudPinchStress" {
+          zoom.proxy.runPinchStress(seconds: 12)
+        } else {
+          zoom.proxy.runStress(seconds: 6)
+        }
+      case "cloudFilmstripStress":
+        for _ in 0..<600 where cloudLibrary?.isSyncing != false || model.itemCount < 90_000 {
+          try? await Task.sleep(for: .milliseconds(500))
+        }
+        zoom.open(50_000, in: model) { opened = 50_000 }
+      case "cloudViewer":
+        // Local folder items can arrive first; this hook must open a cloud photo.
+        for _ in 0..<40 {
+          if let index = model.entries.firstIndex(where: {
+            if case .cloud(let index) = $0 { return model.cloud?.item(at: index)?.kind == .photo }
+            return false
+          }) {
+            zoom.open(index, in: model) { opened = index }
+            break
+          }
+          try? await Task.sleep(for: .milliseconds(250))
+        }
+      default: break
+      }
+    }
+  #endif
+
+  private func lifecycle(_ view: some View) -> some View {
+    loadLibrary(view.toolbar { toolbar })
       // Tried again as the Library loads, until the item is there.
       .task(id: [model.openRequest?.token ?? -1, model.reloadToken]) { await openRequested() }
       // Positions shift when items arrive or leave, so the selection follows its items.
+      #if os(iOS)
+        .task(
+          id: SnapshotTrigger(
+            rows: model.reloadToken, badges: model.badgeToken, zoom: zoomStep,
+            canTake: !showsSnapshot && opened == nil && model.isAtNewest && !isSelecting && mode == .all
+              && model.filter == .all)
+        ) {
+          guard !showsSnapshot, opened == nil, model.isAtNewest else { return }
+          do { try await Task.sleep(for: .seconds(2)) } catch { return }
+          if scenePhase == .active { saveSnapshot() }
+        }
+      #endif
       .onChange(of: model.reloadToken) {
-        guard !selection.isEmpty else { return }
-        if picked.device.count + picked.cloud.count + picked.files.count == selection.count {
-          let ids =
-            picked.device.map(\.localIdentifier) + picked.cloud.map { LibraryIndexer.searchID(cloudMediaKey: $0.mediaKey) }
-            + picked.files.map(\.id)
-          selection = Set(model.positions(of: ids))
-        } else {
-          selection = selection.filter { $0 < model.itemCount }
+        if let id = top.periodID { top.period = model.position(ofIndexID: id) }
+        select(model.selectionPositions(selectedIDs))
+      }
+      .onChange(of: model.displayedFilter) { old, filter in
+        filterAnchors[old] = model.isAtNewest ? nil : top.anchorID
+        if let id = filterAnchors[filter], let index = model.position(ofIndexID: id) {
+          scrollTarget = index
+        } else if model.itemCount > 0 {
+          scrollTarget = model.itemCount - 1
         }
       }
       // Back to All from Years or Months, at the period that was showing.
       .onChange(of: model.timelineMode) { old, mode in
-        if old == .all { top.period = top.index }
+        if old == .all {
+          top.period = top.index
+          top.periodID = top.anchorID
+        }
         if mode == .all {
           if scrollTarget == nil, let index = top.period { scrollTarget = index }
           top.period = nil
+          top.periodID = nil
         }
         // The next view opens at its newest end, then moves to the period that was showing
         // and says so.
@@ -228,19 +310,36 @@ public struct UnifiedLibraryView: View {
       .onChange(of: model.showNewestRequest) { showNewest() }
       .onChange(of: isSelecting) { _, selecting in
         model.isSelecting = selecting
-        if !selecting { selection = [] }
+        if !selecting { select([]) }
       }
-      .onChange(of: selection) { _, selection in
+      .onChange(of: SelectionRevision(ids: selectedIDs, reload: model.reloadToken, badges: model.badgeToken)) { _, revision in
         pickTask?.cancel()
+        picked = .init()
         pickTask = Task {
           // Drag-selecting changes the selection per row; resolve once it pauses.
           try? await Task.sleep(for: .milliseconds(80))
           guard !Task.isCancelled else { return }
-          let resolved = await model.picked(selection)
-          if !Task.isCancelled { picked = resolved }
+          let resolved = await model.picked(model.selectionPositions(revision.ids))
+          if !Task.isCancelled, model.reloadToken == revision.reload, model.badgeToken == revision.badges,
+            selectedIDs == revision.ids
+          {
+            picked = resolved
+          }
         }
       }
       .refreshable { cloudLibrary?.refresh(force: true) }
+  }
+
+  private struct SelectionRevision: Equatable {
+    let ids: Set<UnifiedLibraryModel.SelectionID>
+    let reload: Int
+    let badges: Int
+  }
+
+  private func select(_ indices: Set<Int>) {
+    selectedPositions = indices
+    selectionToken = model.reloadToken
+    selectedIDs = Set(indices.compactMap(model.selectionID(at:)))
   }
 
   /// The cells the grid shows when it opens, at the zoom it opens at.
@@ -276,18 +375,24 @@ public struct UnifiedLibraryView: View {
       ) {
         if let pending = pendingDelete {
           // As in Google Photos: a backed-up item goes from both places unless asked otherwise.
-          Button(pending.cloudCopies.isEmpty ? "Delete" : "Delete Everywhere", role: .destructive) {
-            delete(pending, includingCopies: true)
+          Button(
+            pending.deviceOnly || pending.reviewed.cloudCopies.isEmpty ? "Delete" : "Delete Everywhere",
+            role: .destructive
+          ) {
+            delete(pending, deviceOnly: pending.deviceOnly)
           }
-          if !pending.cloudCopies.isEmpty {
-            Button("Delete from This Device", role: .destructive) { delete(pending, includingCopies: false) }
+          if !pending.deviceOnly, !pending.reviewed.cloudCopies.isEmpty {
+            Button("Delete from This Device", role: .destructive) { delete(pending, deviceOnly: true) }
           }
         }
       } message: {
         Text(deleteMessage)
       }
       .sheet(item: $albumTargets) { targets in
-        AlbumPickerSheet(assets: targets.assets) {
+        AlbumPickerSheet(
+          assets: [], count: model.selectionPositions(targets.rows).count,
+          resolve: { await model.resolveSelection(targets.rows).device }
+        ) {
           albumTargets = nil
           isSelecting = false
         }
@@ -337,14 +442,13 @@ public struct UnifiedLibraryView: View {
         }
         .photoViewer(index: $opened, source: model, zoom: zoom)
         .task {
-          guard snapshot == nil, showsSnapshot, let loaded = await LibrarySnapshot.load(), showsSnapshot,
-            !hasDrawnGrid
-          else { return }
+          guard snapshot == nil, showsSnapshot, let loaded = await LibrarySnapshot.load(), showsSnapshot else { return }
           snapshot = loaded
           isScrolledUnderBar = loaded.info.isScrolledUnderBar
         }
         .onChange(of: scenePhase) { _, phase in
           if phase == .background { saveSnapshot() }
+          if phase == .active { refreshPhotoAccess() }
         }
     #else
       view.photoViewer(index: $opened, source: model, zoom: zoom)
@@ -355,6 +459,9 @@ public struct UnifiedLibraryView: View {
         // A Mac app quits from anywhere, often without going to the background first.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
           saveSnapshot()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+          refreshPhotoAccess()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
           if let window = zoom.proxy.window, note.object as? NSWindow === window { saveSnapshot() }
@@ -390,11 +497,13 @@ public struct UnifiedLibraryView: View {
     model.finishOpenRequest(token: token)
   }
 
-  /// Photos scrolled under the bar turn it dark with white text, as in Photos; at the top
-  /// edge the grid starts below the title on the plain background.
-  private var isOverPhotos: Bool { (model.itemCount > 0 || showsSnapshotImage) && isScrolledUnderBar }
+  #if os(iOS)
+    /// Photos scrolled under the bar turn it dark with white text, as in Photos; at the top
+    /// edge the grid starts below the title on the plain background.
+    private var isOverPhotos: Bool { (model.itemCount > 0 || showsSnapshotImage) && isScrolledUnderBar }
 
-  private var showsSnapshotImage: Bool { shownSnapshot != nil }
+    private var showsSnapshotImage: Bool { shownSnapshot != nil }
+  #endif
 
   /// As in Photos, Years and Months have no title or buttons over their cards. The bar
   /// itself stays, so nothing under it moves or changes color on the way.
@@ -407,13 +516,14 @@ public struct UnifiedLibraryView: View {
         return selection.isEmpty ? String(localized: "Select Items") : String(localized: "\(selection.count) Selected")
       }
     #endif
+    if model.displayedFilter != model.filter { return " " }
     if case .syncing(let progress) = cloudLibrary?.status, cloudLibrary?.syncState.initialSyncDone == false {
       return String(localized: "Syncing \(progress.updated.formatted()) items…")
     }
     // On iPhone the day at the top of the grid is drawn by the title itself (see `top`).
     #if os(macOS)
       // The timeline runs oldest first; the grid opens at its newest end.
-      if mode == .all, let month = top.title ?? model.monthTitle(at: model.itemCount - 1) { return month }
+      if mode == .all, model.filter == .all, let month = top.title ?? model.monthTitle(at: model.itemCount - 1) { return month }
     #endif
     #if os(iOS)
       // The snapshot's count, until the library has loaded.
@@ -426,11 +536,26 @@ public struct UnifiedLibraryView: View {
 
   /// The device's items first: if the system's own prompt is declined, nothing is
   /// trashed in Google Photos either.
-  private func delete(_ pending: PendingDelete, includingCopies: Bool) {
+  private func delete(_ pending: PendingDelete, deviceOnly: Bool) {
+    let library = model.cloud?.library
     run(nil) {
-      if !pending.device.isEmpty { try await LibraryActions.delete(pending.device) }
-      let cloud = pending.cloud + (includingCopies ? pending.cloudCopies : [])
-      if !cloud.isEmpty, let cloudLibrary { try await cloudLibrary.trash(cloud) }
+      let fresh = await model.resolveSelection(pending.ids)
+      let reviewed = PendingDelete(ids: pending.ids, reviewed: fresh, deviceOnly: deviceOnly)
+      guard reviewed.count > 0 else { return }
+      let changedCount = pending.count != reviewed.count
+      if changedCount || !pending.matches(fresh, includingCopies: !deviceOnly) {
+        pendingDelete = reviewed
+        return
+      }
+
+      if !fresh.device.isEmpty { try await LibraryActions.delete(fresh.device) }
+      if !deviceOnly, library === model.cloud?.library, let library {
+        var seen = Set<String>()
+        let cloud = (fresh.cloud + fresh.cloudCopies).filter {
+          !LockedItems.contains($0.mediaKey, accountEmail: library.accountEmail) && seen.insert($0.mediaKey).inserted
+        }
+        if !cloud.isEmpty { try await library.trash(cloud) }
+      }
       isSelecting = false
     }
   }
@@ -443,18 +568,18 @@ public struct UnifiedLibraryView: View {
   private var deleteMessage: String {
     guard let pending = pendingDelete else { return "" }
     var parts: [String] = []
-    if !pending.device.isEmpty {
+    if !pending.reviewed.device.isEmpty {
       parts.append(String(localized: "Items on this device are also removed from iCloud Photos, if you use it."))
     }
-    if !pending.cloudCopies.isEmpty {
+    if !pending.deviceOnly, !pending.reviewed.cloudCopies.isEmpty {
       parts.append(
         String(
           localized:
             "Delete Everywhere also moves their Google Photos copies to its Trash for 60 days."))
-    } else if !pending.cloud.isEmpty {
+    } else if !pending.deviceOnly, !pending.reviewed.cloud.isEmpty {
       parts.append(String(localized: "Items only in Google Photos move to its Trash for 60 days."))
     }
-    if !picked.files.isEmpty, isSelecting {
+    if !pending.reviewed.files.isEmpty {
       parts.append(String(localized: "Files in backed-up folders stay in their folders."))
     }
     return parts.joined(separator: " ")
@@ -465,7 +590,7 @@ public struct UnifiedLibraryView: View {
   @ViewBuilder private var content: some View {
     // Backed-up folders have photos to show without photo access, so it's asked for only
     // once the first merge has found nothing.
-    if !hasAccess, accountsLoaded, cloudLibrary == nil, model.hasMerged, model.itemCount == 0 {
+    if !hasAccess, accountsLoaded, cloudLibrary == nil, model.hasResolvedFilter, model.itemCount == 0, model.filter == .all {
       ContentUnavailableView {
         Label("Allow Photo Access", systemImage: "photo.badge.exclamationmark")
       } description: {
@@ -490,38 +615,65 @@ public struct UnifiedLibraryView: View {
         }
         .buttonStyle(.glassProminent)
       }
-    } else if model.isLoaded, model.itemCount == 0 {
+    } else if model.hasResolvedFilter, model.itemCount == 0, model.mirrorRetry == nil {
       emptyState
     } else {
       // One stack, so the farther view (Years over Months over All) is always the one on
       // top, and the one that fades.
-      ZStack { timelineContent }
-        .overlay { launchSnapshot }
+      ZStack {
+        timelineContent
+          .opacity(model.displayedFilter == model.filter ? 1 : 0)
+          .allowsHitTesting(model.displayedFilter == model.filter)
+          .accessibilityHidden(model.displayedFilter != model.filter)
+        launchFeedback
+        if showsLoadingIndicator, model.launchIsStillEmpty, shownSnapshot == nil {
+          ContentUnavailableView("Library Is Still Loading", systemImage: "photo.on.rectangle")
+        }
+        if model.mirrorRetry == .empty {
+          ContentUnavailableView {
+            Label("Couldn’t Load Library", systemImage: "photo.badge.exclamationmark")
+          } actions: {
+            Button("Try Again") { Task { await model.cloudChanged() } }
+          }
+        }
+      }
+      .safeAreaInset(edge: .bottom) {
+        if model.mirrorRetry == .banner {
+          HStack(spacing: 12) {
+            Text("Couldn't Load New Items")
+            Button("Try Again") { Task { await model.cloudChanged() } }
+              .buttonStyle(.glass)
+          }
+          .padding(12)
+          .glassEffect()
+          .padding(.bottom, 8)
+        }
+      }
     }
+  }
+
+  private var showsLoadingIndicator: Bool {
+    (model.displayedFilter != model.filter || model.itemCount == 0) && !model.mirrorReadFailed
   }
 
   #if os(iOS)
     /// The last launch's grid, for the moments before this one's has drawn; it fades out
     /// over the live grid. Only where it would look the same: same size, scale and
     /// appearance.
-    @ViewBuilder private var launchSnapshot: some View {
-      if let snapshot = shownSnapshot {
-        Image(decorative: snapshot.image, scale: snapshot.info.scale).resizable()
-          .ignoresSafeArea()
+    @ViewBuilder private var launchFeedback: some View {
+      // The grid itself draws the snapshot, under the bar's own effect.
+      if shownSnapshot != nil {
+        Color.clear
           .allowsHitTesting(false)
-          .accessibilityHidden(true)
-          .transition(.opacity)
-          .task {
-            // In case the grid never says it has drawn. A large library can take a few
-            // seconds to merge, and white in the meantime is what this is here to avoid.
-            try? await Task.sleep(for: .seconds(10))
-            hideSnapshot()
-          }
+          .onAppear { model.showsSavedScreen = true }
+          .onDisappear { model.showsSavedScreen = false }
+      } else if showsLoadingIndicator, !model.launchIsStillEmpty {
+        LateProgressView(title: "Loading Library…")
       }
     }
 
     private var shownSnapshot: LibrarySnapshot? {
-      guard let snapshot, showsSnapshot, mode == .all, !isSelecting, snapshot.info.scale == displayScale,
+      guard let snapshot, canShowSnapshot(snapshot), mode == .all, !isSelecting, snapshot.info.scale == displayScale,
         snapshot.info.isDark == (colorScheme == .dark),
         let screen = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds.size,
         abs(screen.width - snapshot.info.width) < 1, abs(screen.height - snapshot.info.height) < 1
@@ -529,103 +681,133 @@ public struct UnifiedLibraryView: View {
       return snapshot
     }
 
-    private func hideSnapshot() {
-      guard showsSnapshot else { return }
-      withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) { showsSnapshot = false }
-    }
-
-    /// Saved for the next launch as the app leaves, if the grid shows what a launch opens
-    /// to: All at its newest row, at the default zoom.
-    private func saveSnapshot() {
-      guard mode == .all, model.filter == .all, !isSelecting, opened == nil, model.isAtNewest, model.isLoaded,
-        model.itemCount > 0, zoomStep == Self.defaultZoomStep, let image = zoom.proxy.snapshot()
-      else { return }
-      let info = LibrarySnapshot.Info(
-        width: CGFloat(image.width) / displayScale, height: CGFloat(image.height) / displayScale, scale: displayScale,
-        isDark: colorScheme == .dark, itemCount: model.itemCount, isScrolledUnderBar: isScrolledUnderBar)
-      LibrarySnapshot.save(image, info: info)
-    }
   #else
-    /// The grid as the app last left it, for the moments before this launch's has drawn
-    /// (it waits for accounts and upload records); it fades out over the live grid. Only
-    /// where it would look the same: same size, scale and appearance.
-    @ViewBuilder private var launchSnapshot: some View {
-      if let snapshot = shownSnapshot {
+    /// The saved grid uses the current layout and appearance while live pixels load.
+    @ViewBuilder private var launchFeedback: some View {
+      let candidate = shownSnapshot
+      if candidate != nil || (showsLoadingIndicator && !model.launchIsStillEmpty) {
         GeometryReader { proxy in
-          if abs(proxy.size.width - snapshot.info.width) < 1, abs(proxy.size.height - snapshot.info.height) < 1 {
+          if let snapshot = candidate,
+            abs(proxy.size.width - snapshot.info.width) < 1, abs(proxy.size.height - snapshot.info.height) < 1
+          {
             Image(decorative: snapshot.image, scale: snapshot.info.scale)
+              .onAppear { model.showsSavedScreen = true }
+              .onDisappear { model.showsSavedScreen = false }
+              .onTapGesture { hideSnapshot() }
+              .accessibilityHidden(true)
+              .transition(.opacity)
+          } else if showsLoadingIndicator, !model.launchIsStillEmpty {
+            ProgressView("Loading Library…")
+              .frame(maxWidth: .infinity, maxHeight: .infinity)
           }
         }
         .ignoresSafeArea(edges: [.top, .bottom])
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-        .transition(.opacity)
-        .task {
-          // In case the grid never says it has drawn.
-          try? await Task.sleep(for: .seconds(10))
-          hideSnapshot()
-        }
+        .allowsHitTesting(candidate != nil)
       }
     }
 
     private var shownSnapshot: LibrarySnapshot? {
-      guard let snapshot, showsSnapshot, mode == .all, !isSelecting, selection.isEmpty,
+      guard let snapshot, canShowSnapshot(snapshot), mode == .all, !isSelecting, selection.isEmpty,
         zoomStep == PhotoGridZoom.defaultStep, snapshot.info.scale == displayScale,
         snapshot.info.isDark == (colorScheme == .dark)
       else { return nil }
       return snapshot
     }
 
-    private func hideSnapshot() {
-      guard showsSnapshot else { return }
-      withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) { showsSnapshot = false }
-    }
-
-    /// Saved for the next launch, if the grid shows what a launch opens to: All at its
-    /// newest row, at the default zoom. `now` writes it before returning, as the app quits.
-    private func saveSnapshot(now: Bool = false) {
-      guard mode == .all, model.filter == .all, !isSelecting, selection.isEmpty, opened == nil, model.isAtNewest,
-        model.isLoaded, model.itemCount > 0, zoomStep == PhotoGridZoom.defaultStep, let image = zoom.proxy.snapshot()
-      else { return }
-      let info = LibrarySnapshot.Info(
-        width: CGFloat(image.width) / displayScale, height: CGFloat(image.height) / displayScale, scale: displayScale,
-        isDark: colorScheme == .dark, itemCount: model.itemCount, isScrolledUnderBar: false)
-      if now { LibrarySnapshot.saveNow(image, info: info) } else { LibrarySnapshot.save(image, info: info) }
-    }
   #endif
+
+  private func canShowSnapshot(_ snapshot: LibrarySnapshot) -> Bool {
+    showsSnapshot && snapshot.generation == LibrarySnapshot.currentGeneration
+      && model.filter == .all && status == .authorized
+      // On the first frames, before the accounts are read: signing out, switching account and
+      // locking an item all delete it.
+      && (!accountsLoaded || snapshot.info.accountEmail == cloudLibrary?.accountEmail)
+  }
+
+  private func hideSnapshot() {
+    guard showsSnapshot else { return }
+    withAnimation(reduceMotion ? nil : .smooth(duration: 0.3)) { showsSnapshot = false }
+  }
+
+  /// What the next launch's first frame would show. It's saved again a moment after any
+  /// of it changes (items added or removed, the viewer closed, back at the newest photos),
+  /// not only on the way out: the app may leave from somewhere it can't be taken, or be
+  /// stopped in the foreground, and an older picture would move once the grid is live.
+  private struct SnapshotTrigger: Hashable {
+    let rows: Int
+    let badges: Int
+    let zoom: Int
+    let canTake: Bool
+  }
+
+  private func saveSnapshot(now: Bool = false) {
+    guard status == .authorized, accountsLoaded, mode == .all, model.filter == .all, !isSelecting,
+      selection.isEmpty, opened == nil, model.isAtNewest, model.isLoaded, model.itemCount > 0,
+      zoomStep == Self.defaultZoomStep
+    else { return }
+    let generation = LibrarySnapshot.currentGeneration
+    let time = ContinuousClock.now
+    if let recent = lastCapture, recent.snapshot.generation == generation,
+      recent.snapshot.info.accountEmail == cloudLibrary?.accountEmail,
+      recent.time.duration(to: time) < .milliseconds(500)
+    {
+      if now { LibrarySnapshot.saveNow(recent.snapshot.image, info: recent.snapshot.info, generation: generation) }
+      return
+    }
+    guard let image = zoom.proxy.snapshot() else { return }
+    let info = LibrarySnapshot.Info(
+      width: CGFloat(image.width) / displayScale, height: CGFloat(image.height) / displayScale, scale: displayScale,
+      isDark: colorScheme == .dark, itemCount: model.itemCount, isScrolledUnderBar: isScrolledUnderBar,
+      accountEmail: cloudLibrary?.accountEmail)
+    lastCapture = (time, LibrarySnapshot(image: image, info: info, generation: generation))
+    if now {
+      LibrarySnapshot.saveNow(image, info: info, generation: generation)
+    } else {
+      LibrarySnapshot.save(image, info: info, generation: generation)
+    }
+  }
+
+  private var gridOptions: PhotoGridOptions {
+    var options = PhotoGridOptions(
+      isSelecting: isSelecting,
+      onTopIndexChange: { index in
+        #if os(iOS)
+          let title = model.dayTitle(at: index)
+        #else
+          let title = model.monthTitle(at: index)
+        #endif
+        top.index = index
+        top.anchorID = model.indexID(at: index)
+        if title != top.title { top.title = title }
+      }, menu: { menuItems(for: $0) },
+      dragItem: { model.dragItem(at: $0) }, proxy: zoom.proxy,
+      onPinchPastDensest: showsModes
+        ? { withAnimation(reduceMotion ? nil : .smooth(duration: 0.35)) { mode = .months } } : nil,
+      onScrolledUnderBarChange: { scrolled in
+        let animates = hasDrawnGrid && !reduceMotion
+        hasDrawnGrid = true
+        withAnimation(animates ? .smooth(duration: 0.25) : nil) { isScrolledUnderBar = scrolled }
+      },
+      topPadding: 14, startsAtEnd: true, alignsNewestRow: true,
+      onAtEndChange: { atEnd in
+        withAnimation(reduceMotion ? nil : .smooth(duration: 0.25)) { isAtNewest = atEnd }
+        model.isAtNewest = atEnd
+      },
+      onShowItems: { hideSnapshot() })
+    options.positionOfItem = { model.index(ofItemID: $0, near: 0) }
+    options.currentReloadToken = { model.reloadToken }
+    #if os(iOS)
+      options.placeholderCount = model.itemCount == 0 ? shownSnapshot?.info.itemCount ?? 0 : 0
+      options.placeholderImage = shownSnapshot?.image
+    #endif
+    return options
+  }
 
   @ViewBuilder private var timelineContent: some View {
     if mode == .all || !showsModes {
       PhotoGrid(
         dataSource: model, reloadToken: model.reloadToken, badgeToken: model.badgeToken, zoomStep: $zoomStep,
-        selection: $selection, scrollTarget: $scrollTarget,
-        options: PhotoGridOptions(
-          isSelecting: isSelecting,
-          onTopIndexChange: { index in
-            #if os(iOS)
-              let title = model.dayTitle(at: index)
-            #else
-              let title = model.monthTitle(at: index)
-            #endif
-            top.index = index
-            if title != top.title { top.title = title }
-          }, menu: { menuItems(for: $0) },
-          dragItem: { model.viewerItem(at: $0)?.dragItem }, proxy: zoom.proxy,
-          onPinchPastDensest: showsModes
-            ? { withAnimation(reduceMotion ? nil : .smooth(duration: 0.35)) { mode = .months } } : nil,
-          onScrolledUnderBarChange: { scrolled in
-            // The first report comes with the first drawn grid: the bar starts dark with it.
-            let animates = hasDrawnGrid && !reduceMotion
-            hasDrawnGrid = true
-            withAnimation(animates ? .smooth(duration: 0.25) : nil) { isScrolledUnderBar = scrolled }
-          },
-          // The large title's subtitle hangs below the bar; this keeps the first row clear of it.
-          topPadding: 14, startsAtEnd: true,
-          onAtEndChange: { atEnd in
-            withAnimation(reduceMotion ? nil : .smooth(duration: 0.25)) { isAtNewest = atEnd }
-            model.isAtNewest = atEnd
-          },
-          onShowItems: { hideSnapshot() })
+        selection: Binding(get: { selection }, set: select), scrollTarget: $scrollTarget, options: gridOptions
       ) { index in
         zoom.open(index, in: model) { opened = index }
       }
@@ -643,7 +825,10 @@ public struct UnifiedLibraryView: View {
         // Back in All, the grid opens at the period scrolled to here; at the same place
         // as before if that's still the one.
         onTopChange: { range in
-          if !(top.period.map(range.contains) ?? false) { top.period = range.lowerBound }
+          if !(top.period.map(range.contains) ?? false) {
+            top.period = range.lowerBound
+            top.periodID = model.indexID(at: range.lowerBound)
+          }
         }
       ) { index in
         scrollTarget = index
@@ -659,7 +844,7 @@ public struct UnifiedLibraryView: View {
   @ViewBuilder private var emptyState: some View {
     if model.filter != .all {
       ContentUnavailableView {
-        Label("No \(model.filter.title)", systemImage: model.filter.symbol)
+        Label(model.filter.emptyTitle, systemImage: model.filter.symbol)
       } actions: {
         Button("Show All Items") { Task { await model.setFilter(.all) } }
       }
@@ -679,7 +864,8 @@ public struct UnifiedLibraryView: View {
       if showsBarItems {
         ToolbarItem(placement: .topBarLeading) {
           LargeBarTitle(
-            title: String(localized: "Library"), subtitle: subtitle, top: mode == .all && !isAtNewest ? top : nil,
+            title: String(localized: "Library"), subtitle: subtitle,
+            top: mode == .all && model.filter == .all && !isAtNewest ? top : nil,
             isOverContent: isOverPhotos)
         }
         .sharedBackgroundVisibility(.hidden)
@@ -702,10 +888,10 @@ public struct UnifiedLibraryView: View {
       }
     #else
       // The viewer puts its own controls in the toolbar while it's open.
-      if showsModes, opened == nil {
+      if isActive, showsModes, opened == nil {
         ToolbarItem(placement: .principal) { LibraryModePicker(model: model) }
       }
-      if opened == nil {
+      if isActive, opened == nil {
         ToolbarItemGroup {
           if !selection.isEmpty { selectionButtons }
           Button {
@@ -762,16 +948,18 @@ public struct UnifiedLibraryView: View {
 
   // MARK: Selection
 
-  private var shareItems: [UnifiedShareItem] {
-    var items = picked.device.map { UnifiedShareItem.device(SharedAsset($0)) }
-    if let cloudLibrary {
-      items += picked.cloud.map { UnifiedShareItem.cloud(RemoteSharedItem(library: cloudLibrary, item: $0)) }
+  private func share(_ rows: Set<UnifiedLibraryModel.SelectionID>) {
+    withFreshSelection(rows) { fresh in
+      var items = fresh.device.map { UnifiedShareItem.device(SharedAsset($0)) }
+      var identities = fresh.device.map(PhotoKitImageSource.identity(for:))
+      if let library = model.cloud?.library {
+        items += fresh.cloud.map { .cloud(RemoteSharedItem(library: library, item: $0)) }
+        identities += fresh.cloud.map { library.localFirstThumbnails.thumbnailIdentity(for: $0.thumbnailID) }
+      }
+      items += fresh.files.map { .file(FileSharedItem(item: $0)) }
+      identities += fresh.files.map(\.thumbnailIdentity)
+      SharePresenter.share(items, identities: identities, videoCount: items.filter(\.isVideo).count)
     }
-    return items + picked.files.map { .file(FileSharedItem(item: $0)) }
-  }
-
-  private var shareIDs: [String] {
-    picked.device.map(\.localIdentifier) + picked.cloud.map(\.thumbnailID) + picked.files.map(\.id)
   }
 
   /// Folder files can only be shared, so a selection of just those still can be.
@@ -780,21 +968,21 @@ public struct UnifiedLibraryView: View {
   @ViewBuilder private var selectionButtons: some View {
     let cloud = picked.cloud
     Button {
-      selection = []
+      select([])
     } label: {
       Label("Deselect All", systemImage: "xmark.circle")
     }
     .help("Deselect All (Esc)")
     let empty = picked.isEmpty || selection.isEmpty
     let allFavorites = picked.allFavorites
-    PhotoShareButton(
-      items: shareItems, ids: shareIDs, videoCount: shareItems.filter(\.isVideo).count
-    ) {
+    Button {
+      share(selectedIDs)
+    } label: {
       Label("Share", systemImage: "square.and.arrow.up")
     }
     .disabled(cannotShare)
     Button {
-      withFreshSelection { toggleFavorite(device: $0.device, cloud: $0.cloud) }
+      withFreshSelection(selectedIDs) { toggleFavorite(device: $0.device, cloud: $0.cloud) }
     } label: {
       Label(allFavorites ? "Unfavorite" : "Favorite", systemImage: allFavorites ? "heart.slash" : "heart")
     }
@@ -802,20 +990,20 @@ public struct UnifiedLibraryView: View {
     .disabled(empty)
     if cloud.isEmpty {
       Button {
-        withFreshSelection { albumTargets = AlbumTargets(assets: $0.device) }
+        openAlbumPicker(selectedIDs)
       } label: {
         Label("Add to Album", systemImage: "rectangle.stack.badge.plus")
       }
       .disabled(empty)
     } else {
       Button {
-        withFreshSelection { save($0.cloud) }
+        withFreshSelection(selectedIDs) { save($0.cloud) }
       } label: {
         Label("Save to Device", systemImage: "arrow.down.circle")
       }
     }
     Button(role: .destructive) {
-      withFreshSelection { pendingDelete = PendingDelete(device: $0.device, cloud: $0.cloud, cloudCopies: $0.cloudCopies) }
+      requestDelete(selectedIDs)
     } label: {
       Label("Delete", systemImage: "trash")
     }
@@ -823,13 +1011,31 @@ public struct UnifiedLibraryView: View {
     .disabled(empty)
   }
 
-  /// Actions use the selection as it is now, not the summary resolved a moment ago.
-  private func withFreshSelection(_ action: @escaping @MainActor (UnifiedLibraryModel.Picked) -> Void) {
-    let selection = selection
+  private func withFreshSelection(
+    _ rows: Set<UnifiedLibraryModel.SelectionID>, _ action: @escaping @MainActor (UnifiedLibraryModel.Picked) -> Void
+  ) {
     Task {
-      let fresh = await model.picked(selection)
-      guard !fresh.isEmpty else { return }
+      let fresh = await model.resolveSelection(rows)
+      guard !fresh.isEmpty || !fresh.files.isEmpty else { return }
       action(fresh)
+    }
+  }
+
+  private func requestDelete(_ rows: Set<UnifiedLibraryModel.SelectionID>) {
+    withFreshSelection(rows) { fresh in
+      guard !fresh.isEmpty else { return }
+      pendingDelete = PendingDelete(ids: rows, reviewed: fresh, deviceOnly: false)
+    }
+  }
+
+  private func openAlbumPicker(_ rows: Set<UnifiedLibraryModel.SelectionID>) {
+    let devices = rows.filter {
+      if case .device = $0 { return true }
+      return false
+    }
+    withFreshSelection(devices) { fresh in
+      guard !fresh.device.isEmpty else { return }
+      albumTargets = AlbumTargets(rows: Set(fresh.device.map { .device($0.localIdentifier) }))
     }
   }
 
@@ -839,9 +1045,9 @@ public struct UnifiedLibraryView: View {
       let empty = picked.isEmpty || selection.isEmpty
       return GlassEffectContainer {
         HStack {
-          PhotoShareButton(
-            items: shareItems, ids: shareIDs, videoCount: shareItems.filter(\.isVideo).count
-          ) {
+          Button {
+            share(selectedIDs)
+          } label: {
             Image(systemName: "square.and.arrow.up").font(.title3).frame(width: 36, height: 36)
           }
           .accessibilityLabel("Share")
@@ -857,7 +1063,7 @@ public struct UnifiedLibraryView: View {
             .glassEffect(.regular, in: .capsule)
           Spacer()
           Button(role: .destructive) {
-            withFreshSelection { pendingDelete = PendingDelete(device: $0.device, cloud: $0.cloud, cloudCopies: $0.cloudCopies) }
+            requestDelete(selectedIDs)
           } label: {
             Image(systemName: "trash").font(.title3).frame(width: 36, height: 36)
           }
@@ -878,26 +1084,26 @@ public struct UnifiedLibraryView: View {
           selection.count == model.itemCount ? "Deselect All" : "Select All",
           systemImage: selection.count == model.itemCount ? "circle" : "checkmark.circle"
         ) {
-          selection = selection.count == model.itemCount ? [] : Set(0..<model.itemCount)
+          select(selection.count == model.itemCount ? [] : Set(0..<model.itemCount))
         }
         Section {
           Button(
             picked.allFavorites ? "Unfavorite" : "Favorite", systemImage: picked.allFavorites ? "heart.slash" : "heart"
           ) {
-            withFreshSelection { toggleFavorite(device: $0.device, cloud: $0.cloud) }
+            withFreshSelection(selectedIDs) { toggleFavorite(device: $0.device, cloud: $0.cloud) }
           }
           .disabled(empty)
           if picked.cloud.isEmpty {
             Button("Add to Album", systemImage: "rectangle.stack.badge.plus") {
-              withFreshSelection { albumTargets = AlbumTargets(assets: $0.device) }
+              openAlbumPicker(selectedIDs)
             }
             .disabled(empty)
             Button("Hide", systemImage: "eye.slash") {
-              withFreshSelection { picked in run(nil) { try await LibraryActions.setHidden(picked.device, hidden: true) } }
+              withFreshSelection(selectedIDs) { picked in run(nil) { try await LibraryActions.setHidden(picked.device, hidden: true) } }
             }
             .disabled(empty)
           } else {
-            Button("Save to Device", systemImage: "arrow.down.circle") { withFreshSelection { save($0.cloud) } }
+            Button("Save to Device", systemImage: "arrow.down.circle") { withFreshSelection(selectedIDs) { save($0.cloud) } }
           }
         }
       } label: {
@@ -909,84 +1115,59 @@ public struct UnifiedLibraryView: View {
   /// Laid out as in Photos: quick actions as icons, then share and favorite, then
   /// organizing, then delete. Tapping the preview opens the item.
   private func menuItems(for indices: Set<Int>) -> [PhotoGridMenuItem] {
-    // A menu on the selection uses what the toolbar already resolved off the main actor.
-    let usesPicked =
-      indices.count > 1 && indices == selection && picked.device.count + picked.cloud.count == indices.count
+    let rows = Set(indices.compactMap(model.selectionID(at:)))
+    let usesPicked = indices.count > 1 && indices == selection && picked.device.count + picked.cloud.count == indices.count
     let (device, cloud) = usesPicked ? (picked.device, picked.cloud) : model.split(indices)
-    let copies = usesPicked ? picked.cloudCopies : model.cloudCopies(indices)
-    guard !device.isEmpty || !cloud.isEmpty else { return fileMenuItems(model.files(at: indices)) }
     var items: [PhotoGridMenuItem] = []
-    if device.count == 1, cloud.isEmpty, let asset = device.first, asset.mediaType == .image {
+    if device.count == 1, cloud.isEmpty, device.first?.mediaType == .image {
       items.append(
         PhotoGridMenuItem(String(localized: "Copy"), systemImage: "doc.on.doc", group: .quick) {
-          run(nil) { try await LibraryActions.copy(asset) }
+          withFreshSelection(rows) { fresh in
+            if let asset = fresh.device.first { run(nil) { try await LibraryActions.copy(asset) } }
+          }
         })
     }
-    if cloud.isEmpty {
+    if !device.isEmpty && cloud.isEmpty {
       items.append(
         PhotoGridMenuItem(String(localized: "Hide"), systemImage: "eye.slash", group: .quick) {
-          run(nil) { try await LibraryActions.setHidden(device, hidden: true) }
+          withFreshSelection(rows) { fresh in run(nil) { try await LibraryActions.setHidden(fresh.device, hidden: true) } }
         })
-    } else {
+    } else if !cloud.isEmpty {
       items.append(
         PhotoGridMenuItem(String(localized: "Save to Device"), systemImage: "arrow.down.circle", group: .quick) {
-          save(cloud)
+          withFreshSelection(rows) { save($0.cloud) }
         })
       if device.isEmpty, let cloudLibrary {
         items.append(
           PhotoGridMenuItem(String(localized: "Archive"), systemImage: "archivebox", group: .quick) {
-            run(nil) { try await cloudLibrary.setArchived(cloud, archived: true) }
+            withFreshSelection(rows) { fresh in run(nil) { try await cloudLibrary.setArchived(fresh.cloud, archived: true) } }
           })
       }
     }
     #if os(iOS)
-      items.append(
-        PhotoGridMenuItem(String(localized: "Share"), systemImage: "square.and.arrow.up") {
-          share(device: device, cloud: cloud)
-        })
+      if !rows.isEmpty {
+        items.append(PhotoGridMenuItem(String(localized: "Share"), systemImage: "square.and.arrow.up") { share(rows) })
+      }
     #endif
+    guard !device.isEmpty || !cloud.isEmpty else { return items }
     let allFavorites = device.allSatisfy(\.isFavorite) && cloud.allSatisfy(\.isFavorite)
     items.append(
       PhotoGridMenuItem(
         allFavorites ? String(localized: "Unfavorite") : String(localized: "Favorite"),
         systemImage: allFavorites ? "heart.slash" : "heart"
-      ) { toggleFavorite(device: device, cloud: cloud) })
+      ) { withFreshSelection(rows) { toggleFavorite(device: $0.device, cloud: $0.cloud) } })
     if cloud.isEmpty {
       items.append(
         PhotoGridMenuItem(String(localized: "Add to Album"), systemImage: "rectangle.stack.badge.plus", group: .organize) {
-          albumTargets = AlbumTargets(assets: device)
+          openAlbumPicker(rows)
         })
     }
     items.append(
       PhotoGridMenuItem(String(localized: "Delete"), systemImage: "trash", isDestructive: true) {
-        pendingDelete = PendingDelete(device: device, cloud: cloud, cloudCopies: copies)
+        requestDelete(rows)
       })
     return items
   }
-
-  /// Folder files on their own: they can be shared, nothing more.
-  private func fileMenuItems(_ files: [FolderItemInfo]) -> [PhotoGridMenuItem] {
-    #if os(iOS)
-      guard !files.isEmpty else { return [] }
-      return [
-        PhotoGridMenuItem(String(localized: "Share"), systemImage: "square.and.arrow.up") {
-          let items = files.map { UnifiedShareItem.file(FileSharedItem(item: $0)) }
-          SharePresenter.share(items, ids: files.map(\.id), videoCount: items.filter(\.isVideo).count)
-        }
-      ]
-    #else
-      return []
-    #endif
-  }
-
-  #if os(iOS)
-    private func share(device: [PHAsset], cloud: [RemoteItemSummary]) {
-      var items = device.map { UnifiedShareItem.device(SharedAsset($0)) }
-      if let cloudLibrary { items += cloud.map { .cloud(RemoteSharedItem(library: cloudLibrary, item: $0)) } }
-      SharePresenter.share(
-        items, ids: device.map(\.localIdentifier) + cloud.map(\.thumbnailID), videoCount: items.filter(\.isVideo).count)
-    }
-  #endif
 
   private func toggleFavorite(device: [PHAsset], cloud: [RemoteItemSummary]) {
     let favorite = !(device.allSatisfy(\.isFavorite) && cloud.allSatisfy(\.isFavorite))
@@ -1142,8 +1323,26 @@ final class TopOfGrid {
   var title: String?
   /// Read only from actions and closures, never from a view body.
   @ObservationIgnored var index: Int?
+  @ObservationIgnored var anchorID: String?
+  @ObservationIgnored var periodID: String?
   /// In Years and Months, the item All goes back to: where the grid was, or the period
   /// scrolled to since. The grid reports its own top as soon as it's made again, so this
   /// is kept apart.
   @ObservationIgnored var period: Int?
+}
+
+/// A wait worth mentioning: a quick one shows nothing.
+private struct LateProgressView: View {
+  let title: LocalizedStringKey
+  @State private var isLate = false
+
+  var body: some View {
+    ZStack {
+      if isLate { ProgressView(title) }
+    }
+    .task {
+      do { try await Task.sleep(for: .milliseconds(600)) } catch { return }
+      isLate = true
+    }
+  }
 }

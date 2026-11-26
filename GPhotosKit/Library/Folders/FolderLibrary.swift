@@ -33,6 +33,15 @@ public struct FolderItemInfo: Sendable, Hashable {
   public let size: Int64
   public let isVideo: Bool
   public let isLivePhoto: Bool
+  var modifiedAt: Date?
+  var motion: FileVersion?
+
+  struct FileVersion: Codable, Hashable, Sendable {
+    let path: String
+    let size: Int64
+    let modifiedAt: Date
+  }
+
   /// A video's length, for its cell.
   public var duration: TimeInterval?
 
@@ -49,6 +58,13 @@ public struct FolderItemInfo: Sendable, Hashable {
 
   /// The id grids and the thumbnail cache know the file by.
   public var id: String { Self.idPrefix + path }
+  var thumbnailIdentity: ThumbnailIdentity {
+    var hasher = Hasher()
+    hasher.combine(modifiedAt)
+    hasher.combine(size)
+    return ThumbnailIdentity(id: id, version: Int64(hasher.finalize()))
+  }
+
   public var url: URL { URL(fileURLWithPath: path) }
   public var fileName: String { (path as NSString).lastPathComponent }
   public var folderName: String { ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent }
@@ -100,7 +116,7 @@ public final class FolderLibrary: Sendable {
     }
     var isStale = false
     #if os(macOS)
-      let options: URL.BookmarkResolutionOptions = [.withSecurityScope, .withoutUI]
+      let options: URL.BookmarkResolutionOptions = [.withSecurityScope, .withoutUI, .withoutMounting]
     #else
       let options: URL.BookmarkResolutionOptions = []
     #endif
@@ -109,20 +125,36 @@ public final class FolderLibrary: Sendable {
     return Access(folder: folder, url: url, started: url.startAccessingSecurityScopedResource())
   }
 
-  /// Every photo and video in the folders, newest first. Files still being written and
-  /// iCloud placeholders wait for a later read, as the backup does. Only file attributes
-  /// are read, so it's quick; video lengths come separately from `durations(of:)`.
-  public func scan() -> [FolderItemInfo] {
-    let roots = accesses.withLock { $0.values.compactMap { access in access.url.map { ($0, access.folder.exclusions) } } }
-    var seen = Set<String>()
-    var files: [LocalMediaFile] = []
-    for (root, exclusions) in roots {
-      for file in FolderMediaScanner.collectMedia(in: root, skipsUnsettledFiles: true, excluding: exclusions).files
-      where seen.insert(file.url.standardizedFileURL.path).inserted {
-        files.append(file)
+  func resolvedPaths(excluding disabledIDs: Set<String>) -> [String] {
+    accesses.withLock { current in
+      current.values.compactMap { access in
+        guard !disabledIDs.contains(access.folder.id), let url = access.url else { return nil }
+        let path = url.standardizedFileURL.path
+        return path.hasSuffix("/") ? path : path + "/"
       }
     }
-    return Self.items(from: files)
+  }
+
+  /// Every photo and video in the folders, newest first. Files still being written and
+  /// iCloud placeholders wait for a later read, as the backup does.
+  public func scan(
+    using foregroundRead: FolderMediaScanner.ForegroundRead? = nil,
+    pairLivePhotos: Bool = AppSettingsStore.load().pairLivePhotos,
+    records: [String: [TransferRecord]] = [:], accountEmail: String? = nil
+  ) async -> [FolderItemInfo] {
+    let roots = accesses.withLock { $0.values.compactMap { access in access.url.map { ($0, access.folder.exclusions) } } }
+    var seen = Set<String>()
+    var items: [FolderItemInfo] = []
+    for (root, exclusions) in roots {
+      guard !Task.isCancelled else { break }
+      let scan =
+        if let foregroundRead { await foregroundRead.scan(root, excluding: exclusions) } else {
+          FolderMediaScanner.collectMedia(in: root, skipsUnsettledFiles: true, excluding: exclusions)
+        }
+      let files = scan.files.filter { seen.insert($0.url.standardizedFileURL.path).inserted }
+      items.append(contentsOf: Self.items(from: files, pairLivePhotos: pairLivePhotos, records: records, accountEmail: accountEmail))
+    }
+    return items.sorted(by: Self.newerFirst)
   }
 
   /// Each video's length, read from its file's header, by path.
@@ -136,36 +168,54 @@ public final class FolderLibrary: Sendable {
     return durations
   }
 
-  /// A still and a video sharing a name in one folder are a Live Photo: the still stands
-  /// for both.
-  static func items(from files: [LocalMediaFile]) -> [FolderItemInfo] {
-    var stills = Set<String>()
-    for file in files where !SupportedMediaFormats.isVideo(filename: file.url.lastPathComponent) {
-      stills.insert(file.url.deletingPathExtension().standardizedFileURL.path.lowercased())
+  static func items(
+    from files: [LocalMediaFile], pairLivePhotos: Bool = true,
+    records: [String: [TransferRecord]] = [:], accountEmail: String? = nil
+  ) -> [FolderItemInfo] {
+    let metadata = Dictionary(files.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
+    let byPath = Dictionary(
+      files.map { ($0.url.standardizedFileURL.path, $0) }, uniquingKeysWith: { first, _ in first })
+    var motions: [URL: FolderItemInfo.FileVersion] = [:]
+    var consumed = Set<URL>()
+    if pairLivePhotos {
+      if let accountEmail {
+        // The backup scanner also reserves unchanged pairs it already sent.
+        for file in files {
+          let path = file.url.standardizedFileURL.path
+          for record in records[path] ?? [] where record.isTerminalSuccess && record.sentAccountEmails.contains(accountEmail) {
+            guard let motionPath = record.pairedSourcePath.map(TransferManifestStore.standardizedPath),
+              let motion = byPath[motionPath], !consumed.contains(motion.url), motions[file.url] == nil
+            else { continue }
+            let version = FolderItemInfo.FileVersion(path: motionPath, size: motion.size, modifiedAt: motion.modified)
+            guard UnifiedLibraryModel.matchesFile(record, size: file.size, modified: file.modified, motion: version, isLivePhoto: true)
+            else { continue }
+            motions[file.url] = version
+            consumed.insert(motion.url)
+          }
+        }
+      }
+      let urls = files.map(\.url).filter { motions[$0] == nil && !consumed.contains($0) }
+      for pair in LivePhotoManager.findLivePhotoPairs(in: urls, metadata: metadata).pairs {
+        motions[pair.photoURL] = .init(
+          path: pair.videoURL.standardizedFileURL.path, size: pair.videoSize, modifiedAt: pair.videoModificationDate)
+        consumed.insert(pair.videoURL)
+      }
     }
-    var motions = Set<String>()
-    var items: [FolderItemInfo] = []
-    items.reserveCapacity(files.count)
-    for file in files {
+    return files.filter { !consumed.contains($0.url) }.map { file in
       let url = file.url.standardizedFileURL
-      let stem = url.deletingPathExtension().path.lowercased()
-      let isVideo = SupportedMediaFormats.isVideo(filename: url.lastPathComponent)
-      if isVideo, url.pathExtension.lowercased() == "mov", stills.contains(stem) {
-        motions.insert(stem)
-        continue
-      }
-      let date =
-        FilenameDateParser.parseDate(from: url.lastPathComponent) ?? min(file.created, file.modified)
-      items.append(FolderItemInfo(path: url.path, date: date, size: file.size, isVideo: isVideo))
-    }
-    if !motions.isEmpty {
-      items = items.map { item in
-        guard !item.isVideo, motions.contains((item.path as NSString).deletingPathExtension.lowercased()) else { return item }
-        return FolderItemInfo(path: item.path, date: item.date, size: item.size, isVideo: false, isLivePhoto: true)
-      }
-    }
-    items.sort { $0.date > $1.date }
-    return items
+      let motion = motions[file.url]
+      let date = FilenameDateParser.parseDate(from: url.lastPathComponent) ?? min(file.created, file.modified)
+      var item = FolderItemInfo(
+        path: url.path, date: date, size: file.size,
+        isVideo: SupportedMediaFormats.isVideo(filename: url.lastPathComponent), isLivePhoto: motion != nil)
+      item.modifiedAt = file.modified
+      item.motion = motion
+      return item
+    }.sorted(by: newerFirst)
+  }
+
+  private static func newerFirst(_ lhs: FolderItemInfo, _ rhs: FolderItemInfo) -> Bool {
+    lhs.date == rhs.date ? lhs.path < rhs.path : lhs.date > rhs.date
   }
 
   public let thumbnails = FolderThumbnailSource()
@@ -175,25 +225,28 @@ public final class FolderLibrary: Sendable {
   /// The last read of these folders, as it was saved: the Library draws it at launch
   /// while the folders are read again (a large folder in iCloud Drive takes seconds).
   /// Nil when there's none, or it was of other folders.
-  public static func cachedItems(for folders: [LibraryFolder]) -> [FolderItemInfo]? {
+  public static func cachedItems(for folders: [LibraryFolder], pairLivePhotos: Bool = true) -> [FolderItemInfo]? {
     guard let data = try? Data(contentsOf: cacheURL), let cache = try? JSONDecoder().decode(Cache.self, from: data),
-      cache.folders == cacheKey(folders)
+      cache.folders == cacheKey(folders, pairLivePhotos: pairLivePhotos)
     else { return nil }
     return cache.items.map {
-      FolderItemInfo(
+      var item = FolderItemInfo(
         path: $0.path, date: $0.date, size: $0.size, isVideo: $0.isVideo, isLivePhoto: $0.isLivePhoto,
         duration: $0.duration)
-    }
+      item.modifiedAt = $0.modifiedAt
+      item.motion = $0.motion
+      return item
+    }.sorted(by: newerFirst)
   }
 
   /// Keeps this read of the folders for the next launch.
-  public static func saveCache(_ items: [FolderItemInfo], for folders: [LibraryFolder]) {
+  public static func saveCache(_ items: [FolderItemInfo], for folders: [LibraryFolder], pairLivePhotos: Bool = true) {
     let cache = Cache(
-      folders: cacheKey(folders),
+      folders: cacheKey(folders, pairLivePhotos: pairLivePhotos),
       items: items.map {
         Cache.Item(
           path: $0.path, date: $0.date, size: $0.size, isVideo: $0.isVideo, isLivePhoto: $0.isLivePhoto,
-          duration: $0.duration)
+          duration: $0.duration, modifiedAt: $0.modifiedAt, motion: $0.motion)
       })
     guard let data = try? JSONEncoder().encode(cache) else { return }
     try? FileManager.default.createDirectory(
@@ -209,13 +262,16 @@ public final class FolderLibrary: Sendable {
       let isVideo: Bool
       let isLivePhoto: Bool
       let duration: TimeInterval?
+      let modifiedAt: Date?
+      let motion: FolderItemInfo.FileVersion?
     }
     let folders: [String]
     let items: [Item]
   }
 
-  private static func cacheKey(_ folders: [LibraryFolder]) -> [String] {
-    folders.map { $0.id + "|" + $0.path + "|" + $0.exclusions.key }.sorted()
+  private static func cacheKey(_ folders: [LibraryFolder], pairLivePhotos: Bool) -> [String] {
+    [pairLivePhotos ? "paired-by-identifier" : "singles"]
+      + folders.map { $0.id + "|" + $0.path + "|" + $0.exclusions.key }.sorted()
   }
 
   private static var cacheURL: URL {
@@ -233,33 +289,40 @@ public final class FolderLibrary: Sendable {
 /// The grid's memory cache keeps them; nothing is written to disk.
 public final class FolderThumbnailSource: ThumbnailSource, Sendable {
   private let limiter = DownloadLimiter(slots: 4)
+  private let displayLimiter = DownloadLimiter(slots: 2)
 
   public func requestImage(
-    id: String, pixelSize: CGSize, quality: ImageRequestQuality, deliver: @escaping @Sendable (CGImage, Bool) -> Void
+    id: String, pixelSize: CGSize, quality: ImageRequestQuality,
+    onUnavailable: @escaping @Sendable () -> Void, deliver: @escaping @Sendable (CGImage, Bool) -> Void
   ) -> ImageRequestToken {
-    requestImage(id: id, pixelSize: pixelSize, quality: quality, onUnavailable: nil, deliver: deliver)
+    requestImage(id: id, pixelSize: pixelSize, quality: quality, alias: nil, onUnavailable: onUnavailable, deliver: deliver)
   }
 
   func requestImage(
-    id: String, pixelSize: CGSize, quality: ImageRequestQuality, onUnavailable: (@Sendable () -> Void)?,
-    deliver: @escaping @Sendable (CGImage, Bool) -> Void
+    id: String, pixelSize: CGSize, quality: ImageRequestQuality, alias: FolderItemInfo?,
+    onUnavailable: @escaping @Sendable () -> Void, deliver: @escaping @Sendable (CGImage, Bool) -> Void
   ) -> ImageRequestToken {
     guard let path = FolderItemInfo.path(fromID: id) else {
-      onUnavailable?()
+      onUnavailable()
       return .none
     }
     let side = max(pixelSize.width, pixelSize.height, 64)
-    let task = Task.detached(priority: .userInitiated) { [limiter] in
+    let limiter = quality == .display ? displayLimiter : limiter
+    let task = Task.detached(priority: .userInitiated) {
       guard await limiter.acquire() else { return }
       defer { limiter.release() }
       // A cell scrolled away while waiting for a slot.
       guard !Task.isCancelled else { return }
+      if let alias, !LocalFirstThumbnailSource.fileAliasIsCurrent(alias) {
+        onUnavailable()
+        return
+      }
       let url = URL(fileURLWithPath: path)
       let image =
         SupportedMediaFormats.isVideo(filename: url.lastPathComponent)
         ? await Self.videoFrame(url, side: side) : Self.image(url, side: side)
       guard !Task.isCancelled else { return }
-      if let image { deliver(image, true) } else { onUnavailable?() }
+      if let image { deliver(image, true) } else { onUnavailable() }
     }
     return ImageRequestToken { task.cancel() }
   }
@@ -268,18 +331,23 @@ public final class FolderThumbnailSource: ThumbnailSource, Sendable {
     guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
     else { return nil }
     func thumbnail(fromFullImage: Bool) -> CGImage? {
-      let options: [CFString: Any] = [
-        fromFullImage ? kCGImageSourceCreateThumbnailFromImageAlways : kCGImageSourceCreateThumbnailFromImageIfAbsent:
-          true,
+      var options: [CFString: Any] = [
         kCGImageSourceCreateThumbnailWithTransform: true,
         kCGImageSourceShouldCacheImmediately: true,
         kCGImageSourceThumbnailMaxPixelSize: Int(side.rounded(.up)),
       ]
+      if fromFullImage { options[kCGImageSourceCreateThumbnailFromImageAlways] = true }
       return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
     }
+    let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+    let longest = max(
+      properties?[kCGImagePropertyPixelWidth] as? CGFloat ?? side,
+      properties?[kCGImagePropertyPixelHeight] as? CGFloat ?? side)
     // A preview stored in the file (most camera photos and RAWs have one) saves decoding
     // the whole image, when it's big enough.
-    if let preview = thumbnail(fromFullImage: false), CGFloat(max(preview.width, preview.height)) >= side * 0.9 {
+    if let preview = thumbnail(fromFullImage: false),
+      CGFloat(max(preview.width, preview.height)) >= min(side, longest) * 0.9
+    {
       return preview
     }
     return thumbnail(fromFullImage: true)

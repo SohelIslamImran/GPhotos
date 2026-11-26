@@ -4,6 +4,12 @@ import Observation
 import Photos
 import os
 
+#if os(iOS)
+  import UIKit
+#else
+  import AppKit
+#endif
+
 /// Routes thumbnail requests to the photo library or Google Photos by id.
 final class CompositeThumbnailSource: ThumbnailSource, Sendable {
   private let device: any ThumbnailSource
@@ -26,30 +32,18 @@ final class CompositeThumbnailSource: ThumbnailSource, Sendable {
   }
 
   func requestImage(
-    id: String, pixelSize: CGSize, quality: ImageRequestQuality, deliver: @escaping @Sendable (CGImage, Bool) -> Void
+    id: String, pixelSize: CGSize, quality: ImageRequestQuality,
+    onUnavailable: @escaping @Sendable () -> Void, deliver: @escaping @Sendable (CGImage, Bool) -> Void
   ) -> ImageRequestToken {
-    source(for: id)?.requestImage(id: id, pixelSize: pixelSize, quality: quality, deliver: deliver) ?? .none
-  }
-
-  func startCaching(ids: [String], pixelSize: CGSize) {
-    let (cloudIDs, deviceIDs) = split(ids)
-    if !deviceIDs.isEmpty { device.startCaching(ids: deviceIDs, pixelSize: pixelSize) }
-    if !cloudIDs.isEmpty { cloud.withLock { $0 }?.startCaching(ids: cloudIDs, pixelSize: pixelSize) }
-  }
-
-  func stopCaching(ids: [String], pixelSize: CGSize) {
-    let (cloudIDs, deviceIDs) = split(ids)
-    if !deviceIDs.isEmpty { device.stopCaching(ids: deviceIDs, pixelSize: pixelSize) }
-    if !cloudIDs.isEmpty { cloud.withLock { $0 }?.stopCaching(ids: cloudIDs, pixelSize: pixelSize) }
-  }
-
-  private func split(_ ids: [String]) -> (cloud: [String], device: [String]) {
-    var cloud: [String] = []
-    var device: [String] = []
-    for id in ids where !id.hasPrefix(FolderItemInfo.idPrefix) {
-      if id.hasPrefix("g:") { cloud.append(id) } else { device.append(id) }
+    guard let source = source(for: id) else {
+      onUnavailable()
+      return .none
     }
-    return (cloud, device)
+    return source.requestImage(id: id, pixelSize: pixelSize, quality: quality, onUnavailable: onUnavailable, deliver: deliver)
+  }
+
+  func cachingTarget(for id: String) -> ThumbnailCachingTarget? {
+    source(for: id)?.cachingTarget(for: id)
   }
 }
 
@@ -63,10 +57,26 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   public private(set) var entries: [UnifiedEntry] = []
   public private(set) var filter: LibraryFilter = .all
   public private(set) var reloadToken = 0
+  /// Advances when the merged snapshot includes a new device or Google Photos revision.
+  public private(set) var indexMetadataToken = 0
+  @ObservationIgnored private var indexedMetadataSource: (device: Int, cloud: Int?) = (-1, nil)
   public private(set) var timeline = TimelineIndex()
   public private(set) var isLoaded = false
-  /// The first merge has finished: what the Library has is known, even without photo access.
+  /// The full snapshot is ready for indexing and pruning.
   public private(set) var hasMerged = false
+  private(set) var hasResolvedFilter = false
+  private(set) var displayedFilter: LibraryFilter = .all
+  private(set) var hasPublishedCompleteTimeline = false
+  public private(set) var mirrorReadFailed = false
+
+  enum MirrorRetry {
+    case empty, banner
+  }
+
+  var mirrorRetry: MirrorRetry? {
+    guard mirrorReadFailed else { return nil }
+    return itemCount == 0 ? .empty : .banner
+  }
   /// An item Siri asked to show, by index id; the counter repeats a request for the same item.
   public private(set) var openRequest: (id: String, token: Int, madeAt: ContinuousClock.Instant)?
   @ObservationIgnored private var openRequestToken = 0
@@ -110,13 +120,33 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   private var mergeBadgeToken = 0
   @ObservationIgnored private let composite = CompositeThumbnailSource(device: PhotoKitImageSource.shared)
   @ObservationIgnored private var deviceInfos: [DeviceItemInfo] = []
+  @ObservationIgnored private var mergedDevice: [DeviceItemInfo] = []
+  @ObservationIgnored private var mergedFetch: PHFetchResult<PHAsset>?
+  @ObservationIgnored private var mergedFetchIndices: [Int]?
   @ObservationIgnored private var deviceInfosToken = -1
+  @ObservationIgnored private var hasFullPhotoAccess = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
   @ObservationIgnored private var preloadTask: Task<Void, Never>?
   @ObservationIgnored private var uploadedMediaKeys: [String: Set<String>] = [:]
   @ObservationIgnored private var uploadedSHA1s: [String: Set<Data>] = [:]
-  @ObservationIgnored private var localSHA1s: [String: Set<Data>] = [:]
+  @ObservationIgnored private var backup = PhotoBackupEvidence()
+  @ObservationIgnored private var recordsGeneration = 0
+  @ObservationIgnored private var hasRecords = false
+  @ObservationIgnored private var primaryRecords: [TransferRecord] = []
+  @ObservationIgnored private var accountReady = false
+  @ObservationIgnored private var folderRecords: [String: [TransferRecord]] = [:]
+  @ObservationIgnored private var mirrorKeys: Set<String> = []
+  @ObservationIgnored private var mirrorHashes: Set<Data> = []
+  @ObservationIgnored private var preparedHashKey: MatchInput?
+  @ObservationIgnored private var backupIsActive = false
+  @ObservationIgnored private var hasActiveTransfers = false
+  @ObservationIgnored private var matchReceiptRevision = 0
+  @ObservationIgnored private var localEvidence = LocalAssetHashes.Evidence()
+  @ObservationIgnored private var fileSHA1s: [String: Set<Data>] = [:]
   @ObservationIgnored private var contentHashTask: Task<Void, Never>?
-  @ObservationIgnored private var contentHashKey: String?
+  @ObservationIgnored private var matchRequest: MatchRequest?
+  @ObservationIgnored private var probedHashKey: MatchInput?
+  @ObservationIgnored private var contentHashKey: MatchInput?
+  @ObservationIgnored private var probingContent = false
   @ObservationIgnored private var generation = 0
   @ObservationIgnored private var keyIndexCache: [Int: Int] = [:]
   @ObservationIgnored private var dayTitleCache: (day: Date, title: String)?
@@ -125,6 +155,9 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   /// Index ids (device local identifiers, `g:` media keys) to timeline positions.
   @ObservationIgnored private var positions: [String: Int] = [:]
   @ObservationIgnored private var folders: [LibraryFolder] = []
+  @ObservationIgnored private var pairFolderLivePhotos = AppSettingsStore.load().pairLivePhotos
+  @ObservationIgnored private var disabledFolderIDs: Set<String> = []
+  @ObservationIgnored private var foldersAreSettled = true
   /// The latest folder read; the next merge takes it in.
   @ObservationIgnored private var folderItems: [FolderItemInfo] = []
   /// The folder and Google Photos lists the current `entries` index into. A newer list
@@ -136,8 +169,10 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   @ObservationIgnored private var mergedInputs = MergeInputs()
   /// Google Photos media keys of backed-up folder files, by path.
   @ObservationIgnored private var uploadedFileKeys: [String: String] = [:]
+  @ObservationIgnored private var additionalFileKeys: [String: Set<String>] = [:]
   /// Upload state of folder files not (yet) in Google Photos, by path.
   @ObservationIgnored private var fileStates: [String: PhotoGridBadges.Backup] = [:]
+  @ObservationIgnored private var confirmedFileIDs = Set<String>()
   /// How many folder files the upload records know, to read the folders again when the
   /// backup finds new ones.
   @ObservationIgnored private var recordedFileCount = -1
@@ -149,16 +184,46 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   /// A folder list (read now or saved from before) is in `folderItems`.
   @ObservationIgnored private var hasFolderItems = false
   @ObservationIgnored private var folderGeneration = 0
+  @ObservationIgnored private var folderContentRevision = 0
   @ObservationIgnored private var durationRead: Task<[String: TimeInterval], Never>?
-  /// Set by `start`: until then nothing merges, so the first timeline drawn is the whole
-  /// one (a merge of what loaded first would draw, then animate everything else in).
+  /// Set when the view can publish local rows.
   @ObservationIgnored private var hasStarted = false
+  @ObservationIgnored private var launchFallback: Task<Void, Never>?
+  @ObservationIgnored private(set) var launchWaitExpired = false
+  /// The launch's local rows were tried too and there are none yet.
+  private(set) var launchIsStillEmpty = false
+  /// The view is showing the last session's screen.
+  @ObservationIgnored var showsSavedScreen = false
+  @ObservationIgnored private var waitsForFolders: Bool
 
-  public init(device: PhotoLibraryGridModel = PhotoLibraryGridModel(buildsTimeline: false)) {
+  // PhotoKit and the cached sources start together. Give them one short window to
+  // produce the first screen before opening the grid on whatever is available.
+  private static let launchWait: Duration = .milliseconds(500)
+
+  public init(device: PhotoLibraryGridModel = PhotoLibraryGridModel(buildsTimeline: false), waitsForInitialFolders: Bool = false) {
     self.device = device
+    waitsForFolders = waitsForInitialFolders
   }
 
-  isolated deinit { contentHashTask?.cancel() }
+  isolated deinit {
+    contentHashTask?.cancel()
+    launchFallback?.cancel()
+  }
+
+  #if DEBUG
+    @ObservationIgnored private(set) var mergeCount = 0
+    @ObservationIgnored private var tracedTail: [String] = []
+    @ObservationIgnored private var tailPublishCount = 0
+
+    private func traceLaunchPublish() {
+      guard UserDefaults.standard.bool(forKey: "UITraceLibraryLaunch") else { return }
+      let tail = (max(0, itemCount - 12)..<itemCount).map { itemID(at: $0) }
+      let changed = tracedTail != tail
+      if changed { tailPublishCount += 1 }
+      tracedTail = tail
+      NSLog("LIBRARY_LAUNCH rows=%d tailChanges=%d changed=%d complete=%d", itemCount, tailPublishCount, changed ? 1 : 0, hasMerged ? 1 : 0)
+    }
+  #endif
 
   public var badgeToken: Int { mergeBadgeToken &+ device.badgeToken &+ (cloud?.badgeToken ?? 0) }
   public var itemCount: Int { entries.count }
@@ -181,64 +246,104 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   }
 
   public func setCloudLibrary(_ library: CloudLibrary?) {
-    guard library?.accountEmail != cloud?.library.accountEmail else { return }
+    // Signing in again replaces the library of the same account; the old one is retired.
+    guard library !== cloud?.library else { return }
+    generation &+= 1
+    hasResolvedFilter = false
+    accountReady = false
     if cloud != nil {
+      launchWaitExpired = true
+      ThumbnailPipeline.shared.invalidateRemoteImages(where: { _ in true })
       // Another account (or none): the old account's items mustn't stay on screen while
       // thumbnails now come from the new one, so the timeline clears until the next merge.
-      generation &+= 1
       entries = []
       positions = [:]
       timeline = TimelineIndex()
       keyIndexCache = [:]
       isLoaded = false
+      hasMerged = false
+      mergedCloud = []
       reloadToken &+= 1
     }
+    recordsGeneration &+= 1
+    hasRecords = false
+    primaryRecords = []
+    hasActiveTransfers = false
+    backup = PhotoBackupEvidence(accountEmail: library?.accountEmail)
     uploadedMediaKeys = [:]
     uploadedSHA1s = [:]
-    localSHA1s = [:]
-    contentHashTask?.cancel()
-    contentHashTask = nil
-    contentHashKey = nil
-    cloud = library.map { RemoteLibraryGridModel(library: $0, scope: .library) }
+    uploadedFileKeys = [:]
+    additionalFileKeys = [:]
+    skippedFilePaths = []
+    fileStates = [:]
+    confirmedFileIDs = []
+    mirrorKeys = []
+    mirrorHashes = []
+    mirrorReadFailed = false
+    preparedHashKey = nil
+    localEvidence = .init()
+    fileSHA1s = [:]
+    resetContentMatching()
+    indexedMetadataSource.cloud = nil
+    cloud = library.map { RemoteLibraryGridModel(library: $0, scope: .library, buildsTimeline: false) }
     composite.setCloud(library?.localFirstThumbnails)
     if library == nil, filter == .cloudOnly { filter = .all }
   }
 
   /// The backed-up folders whose photos and videos join the timeline.
-  public func setFolders(_ folders: [LibraryFolder]) async {
-    guard folders != self.folders else { return }
+  public func setFolders(_ folders: [LibraryFolder], disabledFolderIDs: Set<String> = []) async {
+    let wasWaiting = waitsForFolders
+    waitsForFolders = false
+    let changed = folders != self.folders
+    guard changed || disabledFolderIDs != self.disabledFolderIDs || wasWaiting else { return }
     self.folders = folders
-    await refreshFolders()
+    self.disabledFolderIDs = disabledFolderIDs
+    if changed {
+      hasFolderItems = false
+      foldersAreSettled = false
+      await refreshFolders()
+    } else if wasWaiting || filter.dependsOnBackup {
+      await rebuild()
+    }
   }
 
   /// Reads the backed-up folders again (on launch, when the app comes back, when the
   /// backup finds new files) and re-merges if their files changed.
-  public func refreshFolders() async {
+  public func refreshFolders(using foregroundRead: FolderMediaScanner.ForegroundRead? = nil) async {
     folderRead?.cancel()
+    foldersAreSettled = false
     folderGeneration &+= 1
     let generation = folderGeneration
     let folders = folders
+    let pairLivePhotos = AppSettingsStore.load().pairLivePhotos
+    if pairLivePhotos != pairFolderLivePhotos {
+      pairFolderLivePhotos = pairLivePhotos
+      hasFolderItems = false
+      guard generation == folderGeneration else { return }
+    }
+    let records = folderRecords
+    let email = cloud?.library.accountEmail
     if !hasFolderItems {
+      let revision = folderContentRevision
       folderCacheRead = Task { [weak self] in
         let cached = await Task.detached(priority: .userInitiated) { () -> [FolderItemInfo]? in
-          // Thumbnails of the saved files need the folders' access too.
-          FolderLibrary.shared.setFolders(folders)
-          return FolderLibrary.cachedItems(for: folders)
+          FolderLibrary.cachedItems(for: folders, pairLivePhotos: pairLivePhotos)
         }.value
-        guard let self, let cached, generation == self.folderGeneration, !self.hasFolderItems else { return }
-        self.hasFolderItems = true
-        await self.applyFolderItems(cached)
+        guard let self, let cached, generation == self.folderGeneration, !self.hasFolderItems, self.folderContentRevision == revision else {
+          return
+        }
+        await self.applyFolderItems(cached, generation: generation)
       }
     }
     let read = Task { [weak self] in
       let items = await Task.detached(priority: .userInitiated) { () -> [FolderItemInfo]? in
         FolderLibrary.shared.setFolders(folders)
-        let items = FolderLibrary.shared.scan()
+        let items = await FolderLibrary.shared.scan(
+          using: foregroundRead, pairLivePhotos: pairLivePhotos, records: records, accountEmail: email)
         return Task.isCancelled ? nil : items
       }.value
       guard let self, let items, generation == self.folderGeneration else { return }
-      self.hasFolderItems = true
-      await self.applyFolderItems(items)
+      await self.applyFolderItems(items, generation: generation, authoritative: true)
     }
     folderRead = read
     await read.value
@@ -250,17 +355,40 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   private func saveFolderCache() {
     let items = folderItems
     let folders = folders
-    Task.detached(priority: .utility) { FolderLibrary.saveCache(items, for: folders) }
+    let pairLivePhotos = pairFolderLivePhotos
+    Task.detached(priority: .utility) { FolderLibrary.saveCache(items, for: folders, pairLivePhotos: pairLivePhotos) }
   }
 
   /// New folder files keep the lengths already read for videos that were there before.
-  private func applyFolderItems(_ scanned: [FolderItemInfo]) async {
+  private func applyFolderItems(_ scanned: [FolderItemInfo], generation: Int, authoritative: Bool = false) async {
     var known: [String: TimeInterval] = [:]
     for item in folderItems { if let duration = item.duration { known[item.path] = duration } }
     var items = scanned
     for index in items.indices where items[index].isVideo { items[index].duration = known[items[index].path] ?? items[index].duration }
-    guard items != folderItems else { return }
-    folderItems = items
+    let revision = folderContentRevision
+    if items != folderItems || !hasFolderItems {
+      let scanned = items
+      var recordsRevision: Int
+      var evidence: FileUploads
+      repeat {
+        recordsRevision = recordsGeneration
+        let records = folderRecords
+        let email = cloud?.library.accountEmail
+        evidence = await Task.detached(priority: .userInitiated) {
+          Self.fileUploads(records, email: email, folder: scanned)
+        }.value
+        guard generation == folderGeneration, authoritative || !foldersAreSettled,
+          authoritative || revision == folderContentRevision
+        else { return }
+      } while recordsRevision != recordsGeneration
+      if items != folderItems {
+        folderContentRevision &+= 1
+        folderItems = items
+      }
+      applyFileEvidence(evidence)
+    }
+    hasFolderItems = true
+    if authoritative { foldersAreSettled = true }
     await rebuild()
   }
 
@@ -292,172 +420,357 @@ public final class UnifiedLibraryModel: MediaViewerSource {
 
   public func setFilter(_ filter: LibraryFilter) async {
     guard filter != self.filter else { return }
+    hasResolvedFilter = false
     self.filter = filter
     await rebuild()
   }
 
-  /// First load: the device library (fetched once; its change observer keeps it current
-  /// after that), the upload records and the Google Photos mirror. Safe to call again.
-  public func start(records: [TransferRecord]) async {
-    async let deviceReady: Void = preload()
-    await cloud?.reloadIfNeeded()
-    await deviceReady
-    await waitForFolders(atMost: .milliseconds(400))
-    await recordsChanged(records, rebuilds: false)
-    hasStarted = true
+  /// Starts PhotoKit and allows a local first screen if the merged launch takes too long.
+  public func startLocal(firstScreen: (count: Int, pixelSide: CGFloat)? = nil) async {
+    if !hasStarted {
+      hasStarted = true
+      launchFallback = Task { [weak self] in
+        try? await Task.sleep(for: Self.launchWait)
+        // The saved screen is already up, so waiting for the whole timeline beats showing
+        // part of it and moving it.
+        if self?.showsSavedScreen == true, !Task.isCancelled { try? await Task.sleep(for: .seconds(1)) }
+        guard let self, !Task.isCancelled else { return }
+        self.launchWaitExpired = true
+        async let preview: Void = self.loadLaunchPreview(firstScreen: firstScreen)
+        await self.rebuild()
+        await preview
+        // Rows still on their way keep the saved screen up, for a bounded time.
+        let deadline = ContinuousClock.now + .seconds(3)
+        while self.entries.isEmpty, self.isRebuilding || !self.device.isLoaded, ContinuousClock.now < deadline {
+          try? await Task.sleep(for: .milliseconds(50))
+          guard !Task.isCancelled else { return }
+        }
+        self.launchIsStillEmpty = self.entries.isEmpty && !self.isLoaded
+      }
+    }
+    let fullAccess = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+    if hasFullPhotoAccess != fullAccess || (mergedFetch != nil && !PhotoLibraryGridModel.hasAccess) {
+      hasFullPhotoAccess = fullAccess
+      deviceInfosToken = -1
+      mergedFetch = nil
+      mergedFetchIndices = nil
+      mergedDevice = []
+      mergedCloud = []
+      entries = []
+      positions = [:]
+      timeline = TimelineIndex()
+      isLoaded = false
+      hasMerged = false
+      hasResolvedFilter = false
+      resetContentMatching()
+      preparedHashKey = nil
+      localEvidence = .init()
+      cloud?.library.clearLocalCopies()
+      await device.reloadForAuthorization()
+    }
+    await preload()
     await rebuild()
   }
 
-  /// A folder read still running after this long (a very large folder) joins the
-  /// timeline when it finishes rather than holding back the rest.
-  private func waitForFolders(atMost limit: Duration) async {
-    guard !hasFolderItems else { return }
-    let cacheRead = folderCacheRead
-    let folderRead = folderRead
-    let read = Task {
-      await cacheRead?.value
-      if !hasFolderItems { await folderRead?.value }
+  public func start(records: [TransferRecord]) async {
+    accountReady = true
+    let target = cloud
+    async let local: Void = startLocal()
+    async let mirror: Void? = target?.reloadIfNeeded()
+    await recordsChanged(records, rebuilds: false)
+    await mirror
+    if target === cloud {
+      mirrorReadFailed = target?.loadFailed == true
+      await rebuild()
     }
-    // A task group would wait for the read even after the timeout; whichever comes first
-    // resumes this, once.
-    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-      let resumed = OSAllocatedUnfairLock(initialState: false)
-      let resume = { @Sendable in
-        if resumed.withLock({ done in
-          defer { done = true }
-          return !done
-        }) {
-          continuation.resume()
-        }
-      }
-      Task {
-        await read.value
-        resume()
-      }
-      Task {
-        try? await Task.sleep(for: limit)
-        resume()
-      }
-    }
+    await local
+    await contentHashTask?.value
   }
 
-  /// Reads the device library while accounts and upload records are still loading, so the
-  /// first merge has everything and the grid draws once.
-  ///
-  /// With `firstScreen` (how many cells the grid shows first, and their size in pixels),
-  /// the newest photos' thumbnails start loading too, so the grid draws with its images.
-  public func preload(firstScreen: (count: Int, pixelSide: CGFloat)? = nil) async {
-    // A preload before photo access was granted read nothing; it runs again once there is.
-    if preloadTask != nil, !device.isLoaded, PhotoLibraryGridModel.hasAccess { preloadTask = nil }
-    if preloadTask == nil {
-      preloadTask = Task { [device] in
-        if !device.isLoaded { await device.load() }
-        if let firstScreen { warmNewest(firstScreen) }
-        let token = device.reloadToken
-        let infos = await device.deviceInfos()
-        guard token == device.reloadToken, deviceInfosToken == -1 else { return }
-        deviceInfosToken = token
-        deviceInfos = infos
-      }
+  /// Supports launch prefetch before the Library view is mounted.
+  public func preload() async {
+    if let preloadTask {
+      await preloadTask.value
+      if deviceInfosToken == device.reloadToken || !PhotoLibraryGridModel.hasAccess { return }
     }
-    await preloadTask?.value
+    let load = Task {
+      if !device.isLoaded { await device.load() }
+      guard device.currentFetch != nil else { return }
+      let token = device.reloadToken
+      guard token != deviceInfosToken else { return }
+      if launchWaitExpired && !isLoaded {
+        // PhotoKit may have finished its fetch after the launch timer fired.
+        Task { await loadLaunchPreview(firstScreen: nil) }
+      }
+      let infos = await device.deviceInfos()
+      guard token == device.reloadToken, PhotoLibraryGridModel.hasAccess else { return }
+      deviceInfos = infos
+      deviceInfosToken = token
+    }
+    preloadTask = load
+    await load.value
+    preloadTask = nil
   }
 
-  /// The newest device photos are the timeline's end, where the grid opens. The pipeline
-  /// keeps what arrives; the grid's own requests for them join these.
-  private func warmNewest(_ firstScreen: (count: Int, pixelSide: CGFloat)) {
-    let bucket = ThumbnailBucket.forPixelSide(firstScreen.pixelSide)
-    var tickets: [ThumbnailTicket] = []
-    for index in 0..<min(firstScreen.count, device.itemCount) {
-      let key = ThumbnailKey(id: device.itemID(at: index), bucket: bucket)
-      tickets.append(ThumbnailPipeline.shared.load(key, from: composite) { _, _ in })
+  private func loadLaunchPreview(firstScreen: (count: Int, pixelSide: CGFloat)?) async {
+    guard !isLoaded, deviceInfosToken != device.reloadToken, device.itemCount > 0, filter == .all,
+      let fetch = device.currentFetch
+    else { return }
+    let indices = device.currentFetchIndices
+    let limit = max(96, firstScreen?.count ?? 0)
+    let infos = await Task.detached(priority: .userInitiated) {
+      DeviceInfoSnapshot.readAll(fetch, indices: indices, limit: limit)
+    }.value
+    await publishPreview(infos, fetch: fetch, indices: indices)
+  }
+
+  private func publishPreview(_ infos: [DeviceItemInfo], fetch: PHFetchResult<PHAsset>, indices: [Int]?) async {
+    let hidesScreenshots = !showsScreenshots
+    let result = await Task.detached(priority: .userInitiated) {
+      let entries = TimelineMerge.merge(device: infos, cloud: [], uploadedMediaKeys: [:], hidesScreenshots: hidesScreenshots)
+      return Self.index(entries, device: infos, cloud: [], folder: [])
+    }.value
+    guard !Task.isCancelled, !isLoaded, fetch === device.currentFetch, filter == .all,
+      hidesScreenshots == !showsScreenshots, !result.positions.isEmpty
+    else { return }
+    mergedDevice = infos
+    mergedFetch = fetch
+    mergedFetchIndices = indices
+    mergedInputs = MergeInputs(isComplete: false)
+    entries = result.entries
+    positions = result.positions
+    timeline = result.timeline
+    isLoaded = true
+    launchIsStillEmpty = false
+    reloadToken &+= 1
+    // A merge under way began without these rows.
+    if isRebuilding {
+      generation &+= 1
+      rebuildPending = true
     }
-    // A request PhotoKit never answers is let go, or the grid's own request for the same
-    // photo would wait on it for good.
-    Task {
-      try? await Task.sleep(for: .seconds(5))
-      for ticket in tickets { ticket.cancel() }
-    }
+    #if DEBUG
+      traceLaunchPublish()
+    #endif
   }
 
   /// Upload records changed: backup badges and which device items are in Google Photos.
   public func recordsChanged(_ records: [TransferRecord], rebuilds: Bool = true) async {
-    await device.updateBackupStates(from: records)
+    recordsGeneration &+= 1
+    let current = recordsGeneration
     let email = cloud?.library.accountEmail
-    let files = await Task.detached(priority: .utility) { Self.fileUploads(records, email: email) }.value
-    var changed = files.keys != uploadedFileKeys
-    uploadedFileKeys = files.keys
-    if files.states != fileStates {
-      fileStates = files.states
-      mergeBadgeToken &+= 1
+    let previousKeys = uploadedMediaKeys
+    let previousHashes = uploadedSHA1s
+    let previousFiles = uploadedFileKeys
+    let previousAdditionalFiles = additionalFileKeys
+    let previousFileHashes = fileSHA1s
+    let previousSkipped = skippedFilePaths
+    let previousBackup = backup
+    let mirrorKeys = mirrorKeys
+    let mirrorHashes = mirrorHashes
+    let folder = folderItems
+    let folderGeneration = folderGeneration
+    let result = await Task.detached(priority: .utility) {
+      let primary = records.filter { $0.resourceRole == .primary && $0.assetLocalIdentifier != nil }
+      let evidence = Self.uploadEvidence(primary, email: email ?? "")
+      let byPath = Self.folderRecordsByPath(records)
+      let files = Self.fileUploads(byPath, email: email, folder: folder)
+      let backup = PhotoBackupEvidence.read(records, accountEmail: email)
+      let affectsMirror =
+        Self.touchesMirror(previousKeys, evidence.keys, mirrorKeys)
+        || Self.touchesMirror(previousHashes, evidence.hashes, mirrorHashes)
+        || Self.touchesMirror(previousAdditionalFiles, files.allKeys, mirrorKeys)
+        || Self.touchesMirror(previousFileHashes, files.hashes, mirrorHashes)
+      let hasActiveTransfers = records.contains { $0.status == .sending }
+      return (primary, evidence, byPath, files, backup, affectsMirror, backup != previousBackup, hasActiveTransfers)
+    }.value
+    guard current == recordsGeneration, email == cloud?.library.accountEmail else { return }
+    let first = !hasRecords
+    let (primary, evidence, byPath, files, backup, affectsMirror, backupChanged, hasActiveTransfers) = result
+    let transferActivityChanged = self.hasActiveTransfers != hasActiveTransfers
+    self.hasActiveTransfers = hasActiveTransfers
+
+    primaryRecords = primary
+    if affectsMirror { matchReceiptRevision &+= 1 }
+    uploadedMediaKeys = evidence.keys
+    uploadedSHA1s = evidence.hashes
+    folderRecords = byPath
+    self.backup = backup
+    if folderGeneration == self.folderGeneration, folder == folderItems {
+      applyFileEvidence(files)
+    } else {
+      await refreshFileEvidence()
     }
+    guard current == recordsGeneration else { return }
+    hasRecords = true
     let readsFolders = recordedFileCount != -1 && files.count != recordedFileCount
     recordedFileCount = files.count
-    if let cloud, let email {
-      let (keys, hashes) = await Task.detached(priority: .utility) { Self.uploadEvidence(records, email: email) }.value
-      await cloud.updateDeviceMatches(from: records)
-      if keys != uploadedMediaKeys || hashes != uploadedSHA1s {
-        uploadedSHA1s = hashes
-        uploadedMediaKeys = keys
-        changed = true
-      }
+    if readsFolders || AppSettingsStore.load().pairLivePhotos != pairFolderLivePhotos { await refreshFolders() }
+    if transferActivityChanged { await contentProbeConditionsChanged() }
+    if rebuilds,
+      first || affectsMirror
+        || (filter.dependsOnBackup && (backupChanged || files.keys != previousFiles || files.skipped != previousSkipped))
+    {
+      await rebuild()
+    } else {
+      await updateDeviceBadges()
     }
-    if readsFolders { await refreshFolders() }
-    if changed, rebuilds { await rebuild() }
+  }
+
+  nonisolated static func touchesMirror<Key: Hashable, Value: Hashable>(
+    _ old: [Key: Set<Value>], _ new: [Key: Set<Value>], _ mirror: Set<Value>
+  ) -> Bool {
+    guard !mirror.isEmpty else { return false }
+    for (key, values) in old where values != new[key] {
+      if !values.subtracting(new[key] ?? []).isDisjoint(with: mirror) { return true }
+    }
+    for (key, values) in new where values != old[key] {
+      if !values.subtracting(old[key] ?? []).isDisjoint(with: mirror) { return true }
+    }
+    return false
+  }
+
+  private func updateDeviceBadges() async {
+    var evidence = backup.usingNewerScope(from: device.currentBackupEvidence)
+    evidence.confirmedIDs = cloud?.library.localFirstThumbnails.localCopies.confirmedAssetIDs ?? []
+    await device.applyBackupEvidence(evidence)
   }
 
   struct FileUploads: Sendable {
     var keys: [String: String] = [:]
+    var allKeys: [String: Set<String>] = [:]
+    var hashes: [String: Set<Data>] = [:]
     var states: [String: PhotoGridBadges.Backup] = [:]
+    var skipped: Set<String> = []
     var count = 0
   }
 
-  /// What the records say about folder files: media keys in the browsed account, and the
-  /// state of those still on their way.
-  nonisolated static func fileUploads(_ records: [TransferRecord], email: String?) -> FileUploads {
-    var uploads = FileUploads()
+  @ObservationIgnored private var skippedFilePaths: Set<String> = []
+
+  nonisolated static func folderRecordsByPath(_ records: [TransferRecord]) -> [String: [TransferRecord]] {
+    var byPath: [String: [TransferRecord]] = [:]
     for record in records {
       guard record.assetLocalIdentifier == nil, record.sharedEntryID == nil, let path = record.sourcePath else { continue }
-      uploads.count += 1
-      if let email, let key = record.mediaKeysByAccount[email] {
-        uploads.keys[path] = key
-        uploads.states[path] = nil
-        continue
-      }
-      guard uploads.keys[path] == nil else { continue }
-      switch record.status {
-      case .failed: uploads.states[path] = .failed
-      case .sent, .deleted: break
-      default: uploads.states[path] = .pending
+      byPath[TransferManifestStore.standardizedPath(path), default: []].append(record)
+    }
+    return byPath
+  }
+
+  nonisolated static func fileUploads(
+    _ byPath: [String: [TransferRecord]], email: String?, folder: [FolderItemInfo]
+  ) -> FileUploads {
+    var uploads = FileUploads(count: byPath.count)
+    guard let email else { return uploads }
+    for item in folder {
+      guard let records = byPath[item.path],
+        let modified = item.modifiedAt
+          ?? (try? item.url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+      else { continue }
+      for record in records {
+        guard matchesFile(record, size: item.size, modified: modified, motion: item.motion, isLivePhoto: item.isLivePhoto)
+        else { continue }
+        if let encoded = record.sourceSHA1 ?? record.sha1, let digest = Data(base64Encoded: encoded), digest.count == 20 {
+          uploads.hashes[item.id, default: []].insert(digest)
+        }
+        if record.isTerminalSuccess, let key = record.mediaKeysByAccount[email], !key.isEmpty {
+          uploads.allKeys[item.path, default: []].insert(key)
+          if uploads.keys[item.path] == nil || key < (uploads.keys[item.path] ?? key) {
+            uploads.keys[item.path] = key
+          }
+          uploads.states[item.path] = nil
+          if record.isSkipped { uploads.skipped.insert(item.path) }
+          continue
+        }
+        guard TransferRecord.accountEmail(fromScopedID: record.id) == email else { continue }
+        if record.isSkipped { uploads.skipped.insert(item.path) }
+        guard uploads.keys[item.path] == nil, !record.isSkipped, !record.isTerminalSuccess else { continue }
+        if uploads.states[item.path] != .failed {
+          uploads.states[item.path] = record.status == .failed ? .failed : .pending
+        }
       }
     }
     return uploads
   }
 
-  /// The Google Photos mirror changed. Only a change in which items exist, or their order,
-  /// re-merges; flag changes (a favorite) just refresh badges.
+  nonisolated static func matchesFile(
+    _ record: TransferRecord, size: Int64, modified: Date, motion: FolderItemInfo.FileVersion? = nil, isLivePhoto: Bool
+  ) -> Bool {
+    guard (record.sourceFileSize ?? record.byteCount) == size, let recorded = record.sourceModifiedAt,
+      abs(recorded.timeIntervalSince(modified)) < 1
+    else { return false }
+    guard isLivePhoto else { return record.pairedSourcePath == nil }
+    guard let motion, let recordedPath = record.pairedSourcePath, let date = record.pairedSourceModifiedAt,
+      TransferManifestStore.standardizedPath(recordedPath) == motion.path,
+      motion.size == record.pairedSourceFileSize
+    else { return false }
+    return abs(date.timeIntervalSince(motion.modifiedAt)) < 1
+  }
+
+  private func applyFileEvidence(_ files: FileUploads) {
+    let badgesChanged = files.states != fileStates || files.keys != uploadedFileKeys
+    uploadedFileKeys = files.keys
+    additionalFileKeys = files.allKeys
+    fileSHA1s = files.hashes
+    skippedFilePaths = files.skipped
+    if badgesChanged {
+      fileStates = files.states
+      mergeBadgeToken &+= 1
+    }
+  }
+
+  private func refreshFileEvidence() async {
+    let records = folderRecords
+    let folder = folderItems
+    let email = cloud?.library.accountEmail
+    let revision = recordsGeneration
+    let folderRevision = folderGeneration
+    let evidence = await Task.detached(priority: .utility) {
+      Self.fileUploads(records, email: email, folder: folder)
+    }.value
+    guard revision == recordsGeneration, folderRevision == folderGeneration, folder == folderItems else { return }
+    applyFileEvidence(evidence)
+  }
+
   public func cloudChanged() async {
     guard let cloud else { return }
     let token = cloud.reloadToken
     let badges = cloud.badgeToken
+    let hadLoaded = cloud.isLoaded
+    let hadFailed = mirrorReadFailed
     await cloud.reloadIfNeeded()
-    if cloud.reloadToken != token || (filter != .all && cloud.badgeToken != badges) { await rebuild() }
-    scheduleContentMatching()
+    guard cloud === self.cloud else { return }
+    mirrorReadFailed = cloud.loadFailed
+    if token != cloud.reloadToken || badges != cloud.badgeToken || hadLoaded != cloud.isLoaded
+      || mirrorReadFailed != hadFailed
+    {
+      await rebuild()
+    }
   }
 
   /// What links device photos to Google copies, read in one pass over the records.
   nonisolated static func uploadEvidence(
-    _ records: [TransferRecord], email: String
+    _ records: [TransferRecord], email: String, versions: [String: PhotoBackupEvidence.Version]? = nil
   ) -> (keys: [String: Set<String>], hashes: [String: Set<Data>]) {
     var keys: [String: Set<String>] = [:]
     var hashes: [String: Set<Data>] = [:]
     for record in records {
       // Originals and RAWs are separate cloud photos, not the displayed rendition.
       guard record.resourceRole == .primary, let asset = record.assetLocalIdentifier else { continue }
-      if let key = record.mediaKeysByAccount[email], !key.isEmpty { keys[asset, default: []].insert(key) }
-      // The mirror itself proves which account has these bytes; no upload state is changed.
-      if let encoded = record.sha1, let hash = Data(base64Encoded: encoded), hash.count == 20 {
-        hashes[asset, default: []].insert(hash)
+      let version = versions?[asset]?.assetVersion
+      guard versions == nil || version != nil else { continue }
+      if version?.contentChanged(since: record.assetVersion) != true {
+        if record.isTerminalSuccess, let key = record.mediaKeysByAccount[email], !key.isEmpty {
+          keys[asset, default: []].insert(key)
+        }
+        if let encoded = record.sha1, let digest = Data(base64Encoded: encoded), digest.count == 20 {
+          hashes[asset, default: []].insert(digest)
+        }
+      }
+      // The mirror proves which account has these bytes. A prepared export can already prove
+      // a display match before the upload finishes.
+      if let prepared = record.preparedAsset, version?.contentChanged(since: prepared.version) != true,
+        let digest = Data(base64Encoded: prepared.sha1), digest.count == 20
+      {
+        hashes[asset, default: []].insert(digest)
       }
     }
     return (keys, hashes)
@@ -467,6 +780,7 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   /// it, so bursts of changes cost at most two merges.
   public func rebuild() async {
     guard hasStarted else { return }
+    generation &+= 1
     guard !isRebuilding else {
       rebuildPending = true
       return
@@ -480,136 +794,360 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   }
 
   private func merge() async {
-    generation &+= 1
     let current = generation
-    if device.reloadToken != deviceInfosToken || deviceInfos.count != device.itemCount {
-      localSHA1s = [:]
-      contentHashTask?.cancel()
-      contentHashTask = nil
-      contentHashKey = nil
-      deviceInfosToken = device.reloadToken
-      deviceInfos = await device.deviceInfos()
+    let token = device.reloadToken
+    let hasAccess = PhotoLibraryGridModel.hasAccess
+    let fetch = hasAccess && token == deviceInfosToken ? device.currentFetch : nil
+    let fetchIndices = fetch == nil ? nil : device.currentFetchIndices
+    let deviceReady = !hasAccess || fetch != nil
+    if !deviceReady, device.currentFetch != nil, preloadTask == nil {
+      Task {
+        await preload()
+        await rebuild()
+      }
     }
-    let device = deviceInfos
-    let cloudItems = cloud?.items ?? []
-    let uploaded = uploadedMediaKeys
-    let uploadedHashes = uploadedSHA1s
-    let localHashes = localSHA1s
-    let hashes = await Task.detached(priority: .utility) {
-      uploadedHashes.merging(localHashes, uniquingKeysWith: { $0.union($1) })
-    }.value
+    let device: [DeviceItemInfo] = if fetch != nil { deviceInfos } else if hasAccess { mergedDevice } else { [] }
+    let gridFetch = fetch ?? (hasAccess ? mergedFetch : nil)
+    let gridIndices = fetch == nil && hasAccess ? mergedFetchIndices : fetchIndices
+    #if DEBUG
+      mergeCount += 1
+    #endif
+    let cloud = cloud
     let folder = folderItems
+    let mirrorLoaded = cloud?.isLoaded == true
+    let remoteReady = mirrorLoaded && hasRecords
+    let foldersReady = !waitsForFolders && (hasFolderItems || foldersAreSettled)
+    let canPlan = remoteReady && deviceReady && (foldersReady || launchWaitExpired)
+    // Google rows wait for the device list and the upload records: without them, what's on
+    // this device would show again from Google.
+    let canShowCloud = mirrorLoaded && hasRecords && deviceReady
+    let remote: [RemoteItemSummary]
+    if canShowCloud {
+      remote = cloud?.items ?? []
+    } else if mirrorLoaded, !mergedCloud.isEmpty, let items = cloud?.items {
+      // Only additions wait: what left (or was locked) goes at once.
+      let current = Set(items.map(\.mediaKey))
+      remote = mergedCloud.filter { current.contains($0.mediaKey) }
+    } else {
+      remote = mergedCloud
+    }
+    let matchInput = MatchInput(
+      deviceToken: token, hasPhotoAccess: fetch != nil, folderToken: folderContentRevision,
+      receiptToken: matchReceiptRevision, cloudToken: cloud?.matchRevision ?? -1)
+    let prepared = preparedHashKey
+    let initialSyncDone = cloud?.library.syncState.initialSyncDone == true
+    let launchIsComplete = Self.launchIsComplete(
+      accountReady: accountReady && deviceReady, foldersReady: foldersReady, hasCloud: cloud != nil,
+      mirrorReady: remoteReady && !mirrorReadFailed && initialSyncDone,
+      matchingReady: prepared == matchInput)
+    let canPublish = launchIsComplete || hasPublishedCompleteTimeline || launchWaitExpired || isLoaded
+    guard canPlan || canPublish else { return }
+    // Use the revisions for the summaries we are merging, before any local-copy badge updates.
+    let cloudMetadata = cloud.map { $0.reloadToken &+ ($0.badgeToken &- $0.thumbnailRevision) }
+    let metadataSource = (token, canShowCloud ? cloudMetadata : indexedMetadataSource.cloud)
+    let primary = primaryRecords
+    let email = cloud?.library.accountEmail ?? ""
+    let localEvidence = localEvidence
+    let fileSHA1s = fileSHA1s
     let uploadedFiles = uploadedFileKeys
+    let extraFileKeys = additionalFileKeys
+    let restrictFolders = !disabledFolderIDs.isEmpty
+    var roots: [String] = []
+    if restrictFolders {
+      roots = FolderLibrary.shared.resolvedPaths(excluding: disabledFolderIDs)
+      if !foldersAreSettled {
+        for folder in folders where !disabledFolderIDs.contains(folder.id) {
+          let path = TransferManifestStore.standardizedPath(folder.path)
+          roots.append(path.hasSuffix("/") ? path : path + "/")
+        }
+      }
+    }
+    let enabledRoots = roots
+    let skipped = skippedFilePaths
+    let backup = backup.usingNewerScope(from: self.device.currentBackupEvidence)
     let filter = filter
     let hidesScreenshots = !showsScreenshots
     let previous = entries
-    // Without photo access there is no device list to wait for: folders and Google Photos
-    // are the whole library.
-    let deviceReady = self.device.isLoaded || !PhotoLibraryGridModel.hasAccess
-    let inputs = MergeInputs(
-      uploadedMediaKeys: uploaded, uploadedSHA1s: hashes, uploadedFileKeys: uploadedFiles,
-      isFiltered: filter != .all || hidesScreenshots,
-      isComplete: deviceReady && (cloud?.isLoaded ?? true))
-    // One pass off the main actor: merge, then (only if the result changed) the month
-    // index and the id-to-position map.
-    let result = await Task.detached(priority: .userInitiated) { () -> MergeResult? in
-      let merged = TimelineMerge.merge(
-        device: device, cloud: cloudItems, uploadedMediaKeys: uploaded, uploadedSHA1s: hashes,
-        folder: folder, uploadedFileKeys: uploadedFiles,
-        filter: filter, hidesScreenshots: hidesScreenshots)
-      guard merged != previous else { return nil }
-      var localAssets: [String: String] = [:]
-      var deviceByHash: [Data: String] = [:]
-      for (id, values) in hashes { for hash in values { deviceByHash[hash] = id } }
-      for item in cloudItems {
-        if let hash = item.sha1, let id = deviceByHash[hash] { localAssets[item.mediaKey] = id }
-      }
-      var localFiles: [String: FolderItemInfo] = [:]
-      var positions: [String: Int] = [:]
-      positions.reserveCapacity(merged.count)
-      var dates: [Date] = []
-      dates.reserveCapacity(merged.count)
-      for (position, entry) in merged.enumerated() {
-        switch entry {
-        case .device(let index, let match):
-          positions[device[index].localIdentifier] = position
-          if let match {
-            positions[LibraryIndexer.searchID(cloudMediaKey: cloudItems[match].mediaKey)] = position
-            localAssets[cloudItems[match].mediaKey] = device[index].localIdentifier
-          }
-          dates.append(device[index].date)
-        case .cloud(let index):
-          positions[LibraryIndexer.searchID(cloudMediaKey: cloudItems[index].mediaKey)] = position
-          dates.append(cloudItems[index].takenAt)
-        case .folder(let index, let match):
-          positions[folder[index].id] = position
-          if let match {
-            positions[LibraryIndexer.searchID(cloudMediaKey: cloudItems[match].mediaKey)] = position
-            localFiles[cloudItems[match].mediaKey] = folder[index]
-            dates.append(cloudItems[match].takenAt)
-          } else {
-            dates.append(folder[index].date)
-          }
+    let previousDevice = mergedDevice
+    let previousCloud = mergedCloud
+    let previousFolder = mergedFolder
+    let oldComplete = mergedInputs.isComplete
+    let displayedFilter = displayedFilter
+    let inputsComplete =
+      accountReady && deviceReady && foldersAreSettled && !waitsForFolders
+      && (cloud == nil || (remoteReady && prepared == matchInput && initialSyncDone))
+    let filterReady =
+      Self.filterIsReady(
+        filter, accountReady: accountReady && deviceReady,
+        hasRecords: hasRecords, foldersAreSettled: foldersAreSettled && !waitsForFolders,
+        hasCloud: cloud != nil, mirrorLoaded: mirrorLoaded,
+        initialSyncDone: initialSyncDone,
+        syncFailed: {
+          if case .failed = cloud?.library.status { return true }
+          return false
+        }())
+    let result = await Task.detached(priority: .userInitiated) {
+      let versions =
+        primary.isEmpty
+        ? [:]
+        : Dictionary(
+          uniqueKeysWithValues: device.lazy.filter { !$0.isHidden }.map {
+            ($0.localIdentifier, $0.version)
+          })
+      let evidence = Self.uploadEvidence(primary, email: email, versions: versions)
+      let receipts = evidence.hashes.merging(fileSHA1s, uniquingKeysWith: { $0.union($1) })
+      let localHashes = localEvidence.current(device: device, folder: folder)
+      let hashes = receipts.merging(localHashes, uniquingKeysWith: { $0.union($1) })
+      var excludedFiles = skipped
+      if restrictFolders {
+        for file in folder where !enabledRoots.contains(where: { file.path.hasPrefix($0) }) {
+          excludedFiles.insert(file.path)
         }
       }
-      return MergeResult(
-        localAssets: localAssets, localFiles: localFiles, entries: merged, positions: positions,
-        timeline: TimelineIndex.build(count: dates.count) { dates[$0] })
+      let projection = TimelineMerge.project(
+        device: device, cloud: remote, uploadedMediaKeys: evidence.keys, uploadedSHA1s: hashes,
+        folder: folder, uploadedFileKeys: uploadedFiles, filter: filter, hidesScreenshots: hidesScreenshots, backup: backup,
+        excludedFilePaths: excludedFiles, extraFileKeys: extraFileKeys)
+      let next = projection.entries
+      let reindex =
+        canPublish
+        && (next != previous || displayedFilter != filter
+          || Self.layoutsDiffer(
+            new: device, old: previousDevice, fields: { ($0.localIdentifier, $0.date) }, samePixels: { $0.version == $1.version })
+          || Self.layoutsDiffer(new: remote, old: previousCloud, fields: { ($0.thumbnailID, $0.takenAt) })
+          || Self.layoutsDiffer(
+            new: folder, old: previousFolder, fields: { ($0.id, $0.date) },
+            samePixels: { $0.modifiedAt == $1.modifiedAt && $0.size == $1.size }))
+      return (
+        projection, reindex ? Self.index(next, device: device, cloud: remote, folder: folder, copies: projection.copies) : nil,
+        evidence.keys, hashes, receipts, Set(remote.map(\.mediaKey)), Set(remote.compactMap(\.sha1))
+      )
     }.value
-    guard current == generation else { return }
-    isLoaded = device.isEmpty && folder.isEmpty ? deviceReady : true
-    hasMerged = true
+    guard current == generation, token == self.device.reloadToken, fetch === self.device.currentFetch || fetch == nil else { return }
+    let (projection, indexed, uploaded, hashes, receipts, keys, remoteHashes) = result
+    if deviceReady && remoteReady {
+      cloud?.library.replaceLocalCopies(projection.copies)
+    }
+    if canPlan {
+      matchRequest = MatchRequest(input: matchInput, device: device, folder: folder, items: remote, receipts: receipts)
+      prepareContentMatching()
+    }
+    guard canPublish else { return }
+    if launchIsComplete {
+      hasPublishedCompleteTimeline = true
+      launchFallback?.cancel()
+    }
+    self.displayedFilter = filter
+    mirrorKeys = keys
+    mirrorHashes = remoteHashes
+    hasMerged = inputsComplete
+    hasResolvedFilter = filterReady
+    isLoaded = !projection.entries.isEmpty || hasResolvedFilter
+    if isLoaded, launchIsStillEmpty { launchIsStillEmpty = false }
+    mergedDevice = device
+    mergedFetch = gridFetch
+    mergedFetchIndices = gridIndices
     mergedFolder = folder
-    mergedCloud = cloudItems
-    mergedInputs = inputs
-    if let result {
-      keyIndexCache = [:]
-      cloud?.library.registerLocalCopies(assets: result.localAssets, files: result.localFiles)
-      entries = result.entries
-      positions = result.positions
-      timeline = result.timeline
+    confirmedFileIDs = projection.confirmedFileIDs
+    mergedCloud = remote
+    mergedInputs = MergeInputs(
+      uploadedMediaKeys: uploaded, uploadedSHA1s: hashes, uploadedFileKeys: uploadedFiles,
+      isFiltered: filter != .all || hidesScreenshots, isComplete: inputsComplete, extraFileKeys: extraFileKeys
+    )
+    keyIndexCache = [:]
+    dayTitleCache = nil
+    if let indexed {
+      entries = indexed.entries
+      positions = indexed.positions
+      timeline = indexed.timeline
       reloadToken &+= 1
+      #if DEBUG
+        traceLaunchPublish()
+      #endif
     } else {
       mergeBadgeToken &+= 1
     }
-    scheduleContentMatching()
+    if metadataSource != indexedMetadataSource || oldComplete != inputsComplete {
+      indexedMetadataSource = metadataSource
+      indexMetadataToken &+= 1
+    }
+    await updateDeviceBadges()
   }
 
-  private func scheduleContentMatching() {
-    guard let cloud, cloud.isLoaded, !cloud.library.isSyncing, device.isLoaded, filter == .all else { return }
-    let key = "\(cloud.library.accountEmail)|\(deviceInfosToken)|\(cloud.reloadToken)"
-    guard key != contentHashKey else { return }
+  nonisolated static func launchIsComplete(
+    accountReady: Bool, foldersReady: Bool, hasCloud: Bool, mirrorReady: Bool, matchingReady: Bool
+  ) -> Bool {
+    accountReady && foldersReady && (!hasCloud || mirrorReady && matchingReady)
+  }
+
+  nonisolated static func filterIsReady(
+    _ filter: LibraryFilter, accountReady: Bool, hasRecords: Bool, foldersAreSettled: Bool, hasCloud: Bool,
+    mirrorLoaded: Bool, initialSyncDone: Bool, syncFailed: Bool
+  ) -> Bool {
+    guard accountReady, hasRecords else { return false }
+    if filter == .notBackedUp || filter == .notIncludedInBackup { return foldersAreSettled }
+    if filter != .cloudOnly && !foldersAreSettled { return false }
+    return !hasCloud || syncFailed || (mirrorLoaded && initialSyncDone)
+  }
+
+  /// The host can block display probes while its backup engine is busy.
+  public func setBackupActive(_ active: Bool) async {
+    guard backupIsActive != active else { return }
+    backupIsActive = active
+    await contentProbeConditionsChanged()
+  }
+
+  private var allowsContentProbes: Bool {
+    guard !backupIsActive, !hasActiveTransfers, cloud?.library.isSyncing != true, LibraryIndexer.pauseReason() == nil
+    else { return false }
+    #if os(iOS)
+      return UIApplication.shared.applicationState != .background && !UIApplication.shared.isIdleTimerDisabled
+    #else
+      return NSApplication.shared.isActive
+    #endif
+  }
+
+  func contentProbeConditionsChanged() async {
+    updateContentProbePermission(allowsContentProbes)
+  }
+
+  func updateContentProbePermission(_ allowed: Bool) {
+    if !allowed, probingContent {
+      cancelContentProbes()
+    }
+    prepareContentMatching(allowsProbes: allowed)
+  }
+
+  private func cancelContentProbes() {
     contentHashTask?.cancel()
-    contentHashKey = key
-    let infos = deviceInfos
-    let copies = cloud.library.localAssetIDs
-    let items = cloud.items
+    contentHashTask = nil
+    contentHashKey = nil
+    probingContent = false
+  }
+
+  private func resetContentMatching() {
+    cancelContentProbes()
+    matchRequest = nil
+    probedHashKey = nil
+  }
+
+  private struct MatchInput: Equatable, Sendable {
+    let deviceToken: Int
+    let hasPhotoAccess: Bool
+    let folderToken: Int
+    let receiptToken: Int
+    let cloudToken: Int
+  }
+
+  private struct MatchRequest {
+    let input: MatchInput
+    let device: [DeviceItemInfo]
+    let folder: [FolderItemInfo]
+    let items: [RemoteItemSummary]
+    let receipts: [String: Set<Data>]
+  }
+
+  private func prepareContentMatching(allowsProbes: Bool? = nil) {
+    guard let request = matchRequest else { return }
+    let input = request.input
+    let canProbe = allowsProbes ?? self.allowsContentProbes
+    if contentHashKey == input, !canProbe || probingContent { return }
+    guard preparedHashKey != input || (canProbe && probedHashKey != input) else { return }
+    cancelContentProbes()
+    contentHashKey = input
+    probingContent = canProbe
+    let previous = localEvidence
     let store = SiriLibrary.shared.store
-    contentHashTask = Task { [weak self] in
-      let read = Task.detached(priority: .utility) {
-        let matched = Set(copies.values)
-        let ids = infos.filter { !$0.isVideo && !matched.contains($0.localIdentifier) }.map(\.localIdentifier)
-        return await LocalAssetHashes.read(ids: ids, cloud: items, store: store)
+    let priority: TaskPriority = !isLoaded ? .userInitiated : .utility
+    contentHashTask = Task.detached(priority: priority) { [weak self] in
+      let plan = await LocalAssetHashes.prepare(
+        device: request.device, folder: request.folder, cloud: request.items, store: store, previous: previous,
+        receipts: request.receipts, allowsProbes: canProbe
+      ) { [weak self] evidence in
+        await self?.publishContentPlan(evidence, input: input, finished: false, probed: false)
       }
-      let hashes = await withTaskCancellationHandler {
-        await read.value
-      } onCancel: {
-        read.cancel()
+      guard !Task.isCancelled else { return }
+      let readsContent = !plan.pendingKeys.isEmpty
+      await self?.publishContentPlan(plan.known, input: input, finished: !readsContent, probed: canProbe)
+      guard readsContent else { return }
+      let result = await LocalAssetHashes.read(plan, store: store) { [weak self] in
+        await self?.allowsContentProbes == true
       }
-      guard !Task.isCancelled, let self, contentHashKey == key else { return }
-      contentHashTask = nil
-      guard !hashes.isEmpty else { return }
-      localSHA1s.merge(hashes, uniquingKeysWith: { $0.union($1) })
-      await rebuild()
+      guard !Task.isCancelled else { return }
+      await self?.publishContentPlan(result.evidence, input: input, finished: true, probed: result.complete)
     }
   }
 
-  private struct MergeResult: Sendable {
-    let localAssets: [String: String]
-    let localFiles: [String: FolderItemInfo]
+  private func publishContentPlan(
+    _ evidence: LocalAssetHashes.Evidence, input: MatchInput, finished: Bool, probed: Bool
+  ) async {
+    guard !Task.isCancelled, contentHashKey == input else { return }
+    if finished {
+      contentHashTask = nil
+      contentHashKey = nil
+      probingContent = false
+    }
+    guard device.reloadToken == input.deviceToken, folderContentRevision == input.folderToken,
+      matchReceiptRevision == input.receiptToken, cloud?.matchRevision == input.cloudToken
+    else { return }
+    let changed = (finished && preparedHashKey != input) || !localEvidence.matches(evidence)
+    if finished {
+      preparedHashKey = input
+      if probed { probedHashKey = input }
+    }
+    localEvidence = evidence
+    if changed { await rebuild() }
+  }
+
+  nonisolated static func layoutsDiffer<Item>(
+    new: [Item], old: [Item], fields: (Item) -> (String, Date), samePixels: (Item, Item) -> Bool = { _, _ in true }
+  ) -> Bool {
+    new.count != old.count || !zip(new, old).allSatisfy { fields($0) == fields($1) && samePixels($0, $1) }
+  }
+
+  struct IndexedTimeline: Sendable {
     let entries: [UnifiedEntry]
     let positions: [String: Int]
     let timeline: TimelineIndex
+  }
+
+  nonisolated static func index(
+    _ entries: [UnifiedEntry], device: [DeviceItemInfo], cloud: [RemoteItemSummary], folder: [FolderItemInfo],
+    copies: LocalFirstThumbnailSource.LocalCopies = .init()
+  ) -> IndexedTimeline {
+    var positions: [String: Int] = [:]
+    positions.reserveCapacity(entries.count)
+    var dates: [Date] = []
+    dates.reserveCapacity(entries.count)
+    for (position, entry) in entries.enumerated() {
+      switch entry {
+      case .device(let index, let match):
+        positions[device[index].localIdentifier] = position
+        if let match { positions[LibraryIndexer.searchID(cloudMediaKey: cloud[match].mediaKey)] = position }
+        dates.append(device[index].date)
+      case .cloud(let index):
+        positions[LibraryIndexer.searchID(cloudMediaKey: cloud[index].mediaKey)] = position
+        dates.append(cloud[index].takenAt)
+      case .folder(let index, let match):
+        positions[folder[index].id] = position
+        if let match {
+          positions[LibraryIndexer.searchID(cloudMediaKey: cloud[match].mediaKey)] = position
+          dates.append(cloud[match].takenAt)
+        } else {
+          dates.append(folder[index].date)
+        }
+      }
+    }
+    for (key, id) in copies.assets {
+      let cloudID = LibraryIndexer.searchID(cloudMediaKey: key)
+      if positions[cloudID] == nil { positions[cloudID] = positions[id] }
+    }
+    for (key, file) in copies.files {
+      let cloudID = LibraryIndexer.searchID(cloudMediaKey: key)
+      if positions[cloudID] == nil { positions[cloudID] = positions[file.id] }
+    }
+    return IndexedTimeline(
+      entries: entries, positions: positions, timeline: TimelineIndex.build(count: dates.count) { dates[$0] })
   }
 
   /// Local identifiers of every device item in the library.
@@ -627,6 +1165,7 @@ public final class UnifiedLibraryModel: MediaViewerSource {
     var isFiltered = false
     /// The device and Google Photos lists had loaded when merged.
     var isComplete = true
+    var extraFileKeys: [String: Set<String>] = [:]
   }
 
   public struct IndexSnapshot: Sendable {
@@ -642,9 +1181,11 @@ public final class UnifiedLibraryModel: MediaViewerSource {
     func unfiltered() -> IndexSnapshot {
       guard inputs.isFiltered else { return self }
       var snapshot = IndexSnapshot(
-        entries: TimelineMerge.merge(
+        entries: TimelineMerge.project(
           device: device, cloud: cloud, uploadedMediaKeys: inputs.uploadedMediaKeys,
-          uploadedSHA1s: inputs.uploadedSHA1s, folder: folder, uploadedFileKeys: inputs.uploadedFileKeys),
+          uploadedSHA1s: inputs.uploadedSHA1s, folder: folder, uploadedFileKeys: inputs.uploadedFileKeys,
+          filter: .all, hidesScreenshots: false, extraFileKeys: inputs.extraFileKeys
+        ).entries,
         device: device, cloud: cloud, folder: folder, cloudLibrary: cloudLibrary, inputs: inputs)
       snapshot.inputs.isFiltered = false
       return snapshot
@@ -683,7 +1224,7 @@ public final class UnifiedLibraryModel: MediaViewerSource {
 
   public func indexSnapshot() -> IndexSnapshot {
     IndexSnapshot(
-      entries: entries, device: deviceInfos, cloud: mergedCloud, folder: mergedFolder, cloudLibrary: cloud?.library,
+      entries: entries, device: mergedDevice, cloud: mergedCloud, folder: mergedFolder, cloudLibrary: cloud?.library,
       inputs: isLoaded ? mergedInputs : MergeInputs(isComplete: false))
   }
 
@@ -707,8 +1248,95 @@ public final class UnifiedLibraryModel: MediaViewerSource {
     }
   }
 
+  enum SelectionID: Hashable, Sendable {
+    case device(String)
+    case folder(ThumbnailIdentity)
+    case cloud(ObjectIdentifier, String)
+
+    var indexKey: String {
+      switch self {
+      case .device(let id): id
+      case .folder(let identity): identity.id
+      case .cloud(_, let key): LibraryIndexer.searchID(cloudMediaKey: key)
+      }
+    }
+  }
+
+  func selectionID(at position: Int) -> SelectionID? {
+    guard let entry = entry(at: position) else { return nil }
+    return Self.selectionID(
+      for: entry, device: mergedDevice, cloud: mergedCloud, folder: mergedFolder, account: cloud.map { ObjectIdentifier($0.library) })
+  }
+
+  nonisolated static func selectionID(
+    for entry: UnifiedEntry, device: [DeviceItemInfo], cloud: [RemoteItemSummary], folder: [FolderItemInfo],
+    account: ObjectIdentifier?
+  ) -> SelectionID? {
+    switch entry {
+    case .device(let index, _): return device.indices.contains(index) ? .device(device[index].localIdentifier) : nil
+    case .folder(let index, _): return folder.indices.contains(index) ? .folder(folder[index].thumbnailIdentity) : nil
+    case .cloud(let index):
+      return cloud.indices.contains(index) ? account.map { .cloud($0, cloud[index].mediaKey) } : nil
+    }
+  }
+
+  func selectionPositions(_ ids: Set<SelectionID>) -> Set<Int> {
+    Self.selectionPositions(ids, in: positions, identityAt: selectionID(at:))
+  }
+
+  nonisolated static func selectionPositions(
+    _ ids: Set<SelectionID>, in positions: [String: Int], identityAt: (Int) -> SelectionID?
+  ) -> Set<Int> {
+    // The navigation index includes aliases for Google copies. Selection must never follow them.
+    Set(
+      ids.compactMap { id in
+        guard let position = positions[id.indexKey], identityAt(position) == id else { return nil }
+        return position
+      })
+  }
+
+  func dragItem(at position: Int) -> PhotoGridDragItem? {
+    guard displayedFilter == filter, let id = selectionID(at: position),
+      let current = selectionPositions([id]).first, let item = viewerItem(at: current)
+    else { return nil }
+    if case .cloud(let summary, let library, _) = item,
+      library.isRetired || LockedItems.contains(summary.mediaKey, accountEmail: library.accountEmail)
+    {
+      return nil
+    }
+    let drag = item.dragItem
+    return PhotoGridDragItem(fileName: drag.fileName, isVideo: drag.isVideo) { [weak self] in
+      guard let self else { throw CocoaError(.fileNoSuchFile) }
+      return try await self.exportSelectedRow(id)
+    }
+  }
+
+  private func exportSelectedRow(_ id: SelectionID) async throws -> URL {
+    let fresh = await resolveSelection([id])
+    if let asset = fresh.device.first { return try await SharedAsset(asset).export() }
+    if let item = fresh.cloud.first, let library = cloud?.library { return try await library.download(item) }
+    if let file = fresh.files.first { return file.url }
+    throw CocoaError(.fileNoSuchFile)
+  }
+
   public func deviceInfo(at index: Int) -> DeviceItemInfo? {
-    deviceInfos.indices.contains(index) ? deviceInfos[index] : nil
+    mergedDevice.indices.contains(index) ? mergedDevice[index] : nil
+  }
+
+  private func mergedAsset(at index: Int) -> PHAsset? {
+    guard let fetch = mergedFetch, mergedDevice.indices.contains(index), PhotoLibraryGridModel.hasAccess else { return nil }
+    return fetch.object(at: mergedFetchIndices?[index] ?? index)
+  }
+
+  private func mergedBackupState(at index: Int) -> PhotoGridBadges.Backup? {
+    guard let item = deviceInfo(at: index) else { return nil }
+    if let state = backup.state(for: item.localIdentifier, version: item.version.assetVersion) { return state }
+    return cloud?.library.localFirstThumbnails.localCopies.confirmedAssetIDs.contains(item.localIdentifier) == true ? .backedUp : nil
+  }
+
+  private func folderBackupState(_ item: FolderItemInfo) -> PhotoGridBadges.Backup? {
+    if uploadedFileKeys[item.path] != nil || confirmedFileIDs.contains(item.id) { return .backedUp }
+    return fileStates[item.path]
   }
 
   public func folderItem(at index: Int) -> FolderItemInfo? {
@@ -765,22 +1393,68 @@ public final class UnifiedLibraryModel: MediaViewerSource {
   }
 
   /// Resolves a selection off the main actor (Select All in a 100k library is 100k assets).
-  public func picked(_ indices: Set<Int>) async -> Picked {
+  func resolveSelection(_ ids: Set<SelectionID>) async -> Picked {
+    guard displayedFilter == filter, !ids.isEmpty else { return .init() }
+    let revision = reloadToken
+    let library = cloud?.library
+    let fresh = await picked(selectionPositions(ids), validating: true)
+    guard revision == reloadToken, displayedFilter == filter, library === cloud?.library,
+      library?.isRetired != true
+    else { return .init() }
+    return fresh
+  }
+
+  func picked(_ indices: Set<Int>, validating: Bool = false) async -> Picked {
     let entries = entries
-    let fetch = device.currentFetch
+    let fetch = mergedFetch
+    let fetchIndices = mergedFetchIndices
     let cloudItems = mergedCloud
     let folder = mergedFolder
+    let device = mergedDevice
+    let receipts = mergedInputs.uploadedMediaKeys
+    let accountEmail = cloud?.library.accountEmail
+    let hasAccess = PhotoLibraryGridModel.hasAccess
     return await Task.detached(priority: .userInitiated) {
+      let freshAssets: [String: PHAsset]
+      if validating && hasAccess {
+        let ids = indices.compactMap { index -> String? in
+          guard entries.indices.contains(index), case .device(let deviceIndex, _) = entries[index] else { return nil }
+          return device[deviceIndex].localIdentifier
+        }
+        let options = AssetExportService.allFramesFetchOptions()
+        options.includeAssetSourceTypes = [.typeUserLibrary, .typeCloudShared, .typeiTunesSynced]
+        let current = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: options)
+        var visible: [String: PHAsset] = [:]
+        for index in 0..<current.count {
+          let asset = current.object(at: index)
+          if !asset.isHidden { visible[asset.localIdentifier] = asset }
+        }
+        freshAssets = visible
+      } else {
+        freshAssets = [:]
+      }
+      func isUnlocked(_ item: RemoteItemSummary) -> Bool {
+        accountEmail.map { !LockedItems.contains(item.mediaKey, accountEmail: $0) } == true
+      }
       var picked = Picked()
       for index in indices.sorted() where entries.indices.contains(index) {
         switch entries[index] {
         case .device(let deviceIndex, let match):
-          if let fetch, deviceIndex < fetch.count { picked.device.append(fetch.object(at: deviceIndex)) }
-          if let match, cloudItems.indices.contains(match) { picked.cloudCopies.append(cloudItems[match]) }
+          let info = device[deviceIndex]
+          let asset = validating ? freshAssets[info.localIdentifier] : fetch?.object(at: fetchIndices?[deviceIndex] ?? deviceIndex)
+          guard let asset else { continue }
+          picked.device.append(asset)
+          if let match, let copy = Self.recordedCloudCopy(info, cloudItems[match], receipts: receipts), isUnlocked(copy),
+            !validating || LocalFirstThumbnailSource.hasCurrentVersion(asset, info.version)
+          {
+            picked.cloudCopies.append(copy)
+          }
         case .cloud(let cloudIndex):
-          if cloudItems.indices.contains(cloudIndex) { picked.cloud.append(cloudItems[cloudIndex]) }
+          let item = cloudItems[cloudIndex]
+          if isUnlocked(item) { picked.cloud.append(item) }
         case .folder(let folderIndex, _):
-          if folder.indices.contains(folderIndex) { picked.files.append(folder[folderIndex]) }
+          let file = folder[folderIndex]
+          if !validating || LocalFirstThumbnailSource.fileAliasIsCurrent(file) { picked.files.append(file) }
         }
       }
       picked.allFavorites = !picked.isEmpty && picked.device.allSatisfy(\.isFavorite) && picked.cloud.allSatisfy(\.isFavorite)
@@ -794,7 +1468,7 @@ public final class UnifiedLibraryModel: MediaViewerSource {
     var cloudItems: [RemoteItemSummary] = []
     for index in indices.sorted() {
       switch entry(at: index) {
-      case .device(let deviceIndex, _): if let asset = device.asset(at: deviceIndex) { deviceItems.append(asset) }
+      case .device(let deviceIndex, _): if let asset = mergedAsset(at: deviceIndex) { deviceItems.append(asset) }
       case .cloud(let cloudIndex): if let item = cloudItem(at: cloudIndex) { cloudItems.append(item) }
       case .folder, nil: break
       }
@@ -802,19 +1476,18 @@ public final class UnifiedLibraryModel: MediaViewerSource {
     return (deviceItems, cloudItems)
   }
 
-  /// The Google Photos copies of the device items among `indices`.
-  public func cloudCopies(_ indices: Set<Int>) -> [RemoteItemSummary] {
-    indices.sorted().compactMap { index in
-      if case .device(_, cloud: .some(let match)) = entry(at: index) { return cloudItem(at: match) }
-      return nil
-    }
+  nonisolated static func recordedCloudCopy(
+    _ device: DeviceItemInfo, _ item: RemoteItemSummary, receipts: [String: Set<String>]
+  ) -> RemoteItemSummary? {
+    receipts[device.localIdentifier]?.contains(item.mediaKey) == true ? item : nil
   }
 
-  /// The Google Photos copy of a device item, which deleting it also trashes.
+  /// The recorded Google Photos copy of a device item, which deleting it also trashes.
   public func cloudCopy(at index: Int) -> (item: RemoteItemSummary, library: CloudLibrary)? {
-    guard case .device(_, cloud: .some(let match)) = entry(at: index), let cloud, let item = cloudItem(at: match)
+    guard case .device(let index, cloud: .some(let match)) = entry(at: index), let cloud, let item = cloudItem(at: match),
+      let copy = Self.recordedCloudCopy(mergedDevice[index], item, receipts: mergedInputs.uploadedMediaKeys)
     else { return nil }
-    return (item, cloud.library)
+    return (copy, cloud.library)
   }
 
   /// The folder files among `indices`.
@@ -853,30 +1526,49 @@ public final class UnifiedLibraryModel: MediaViewerSource {
 
   public func itemID(at index: Int) -> String {
     switch entry(at: index) {
-    case .device(let deviceIndex, _): device.itemID(at: deviceIndex)
-    case .cloud(let cloudIndex): cloudItem(at: cloudIndex)?.thumbnailID ?? ""
-    case .folder(let folderIndex, _): folderItem(at: folderIndex)?.id ?? ""
-    case nil: ""
+    case .device(let deviceIndex, _):
+      guard let asset = mergedAsset(at: deviceIndex) else { return "" }
+      PhotoKitImageSource.shared.remember(asset)
+      return asset.localIdentifier
+    case .cloud(let cloudIndex): return cloudItem(at: cloudIndex)?.thumbnailID ?? ""
+    case .folder(let folderIndex, _): return folderItem(at: folderIndex)?.id ?? ""
+    case nil: return ""
+    }
+  }
+
+  public func thumbnailIdentity(at index: Int) -> ThumbnailIdentity {
+    switch entry(at: index) {
+    case .device(let deviceIndex, _):
+      guard let info = deviceInfo(at: deviceIndex) else { return ThumbnailIdentity(id: "") }
+      return ThumbnailIdentity(
+        id: itemID(at: index),
+        version: PhotoKitImageSource.pixelVersion(modifiedAt: info.version.modifiedAt, adjustedAt: info.version.adjustmentTimestamp))
+    case .folder(let folderIndex, _):
+      return folderItem(at: folderIndex)?.thumbnailIdentity ?? ThumbnailIdentity(id: "")
+    case .cloud(let cloudIndex):
+      let id = cloudItem(at: cloudIndex)?.thumbnailID ?? ""
+      return cloud?.library.localFirstThumbnails.thumbnailIdentity(for: id) ?? ThumbnailIdentity(id: id)
+    case nil:
+      return ThumbnailIdentity(id: "")
     }
   }
 
   public func badges(at index: Int) -> PhotoGridBadges {
     switch entry(at: index) {
-    case .device(let deviceIndex, let match):
-      var badges = device.badges(at: deviceIndex)
-      if match != nil { badges.backup = .backedUp }
-      return badges
+    case .device(let deviceIndex, _):
+      guard let asset = mergedAsset(at: deviceIndex) else { return PhotoGridBadges() }
+      return PhotoGridBadges(
+        videoDuration: asset.mediaType == .video ? asset.duration : nil, isFavorite: asset.isFavorite,
+        backup: mergedBackupState(at: deviceIndex))
     case .cloud(let cloudIndex):
-      var badges = cloud?.badges(at: cloudIndex) ?? PhotoGridBadges()
-      badges.backup = .cloudOnly
-      return badges
+      guard let item = cloudItem(at: cloudIndex) else { return PhotoGridBadges() }
+      return PhotoGridBadges(videoDuration: item.duration, isFavorite: item.isFavorite, backup: .cloudOnly)
     case .folder(let folderIndex, let match):
-      if let match, var badges = cloud?.badges(at: match) {
-        badges.backup = .backedUp
-        return badges
-      }
-      let item = folderItem(at: folderIndex)
-      return PhotoGridBadges(videoDuration: item?.duration, backup: item.flatMap { fileStates[$0.path] })
+      guard let item = folderItem(at: folderIndex) else { return PhotoGridBadges() }
+      let remote = match.flatMap(cloudItem(at:))
+      return PhotoGridBadges(
+        videoDuration: remote?.duration ?? item.duration, isFavorite: remote?.isFavorite ?? false,
+        backup: folderBackupState(item))
     case nil:
       return PhotoGridBadges()
     }
@@ -884,17 +1576,17 @@ public final class UnifiedLibraryModel: MediaViewerSource {
 
   public func accessibilityLabel(at index: Int) -> String {
     switch entry(at: index) {
-    case .device(let deviceIndex, let match):
-      let label = device.accessibilityLabel(at: deviceIndex)
-      return match != nil && device.backupState(at: deviceIndex) == nil
-        ? label + ", " + PhotoGridBadges.Backup.backedUp.title : label
+    case .device(let deviceIndex, _):
+      guard let asset = mergedAsset(at: deviceIndex) else { return "" }
+      return PhotoLibraryGridModel.accessibilityLabel(for: asset, backup: mergedBackupState(at: deviceIndex))
     case .cloud(let cloudIndex):
-      return (cloud?.accessibilityLabel(at: cloudIndex) ?? "") + ", " + PhotoGridBadges.Backup.cloudOnly.title
+      guard let item = cloudItem(at: cloudIndex) else { return "" }
+      return RemoteLibraryGridModel.accessibilityLabel(for: item) + ", " + PhotoGridBadges.Backup.cloudOnly.title
     case .folder(let folderIndex, let match):
       guard let item = folderItem(at: folderIndex) else { return "" }
       let kind = item.isVideo ? String(localized: "Video") : String(localized: "Photo")
       let date = (match.flatMap { cloudItem(at: $0)?.takenAt } ?? item.date).formatted(date: .long, time: .shortened)
-      let state = match != nil ? PhotoGridBadges.Backup.backedUp.title : fileStates[item.path]?.title
+      let state = folderBackupState(item)?.title
       return [kind, date, item.fileName, state].compactMap(\.self).joined(separator: ", ")
     case nil:
       return ""
@@ -915,16 +1607,16 @@ public final class UnifiedLibraryModel: MediaViewerSource {
 
   public func viewerItem(at index: Int) -> ViewerItem? {
     switch entry(at: index) {
-    case .device(let deviceIndex, let match):
-      guard let asset = device.asset(at: deviceIndex) else { return nil }
-      return .device(asset, backup: match != nil ? .backedUp : device.backupState(at: deviceIndex))
+    case .device(let deviceIndex, _):
+      guard let asset = mergedAsset(at: deviceIndex) else { return nil }
+      return .device(asset, backup: mergedBackupState(at: deviceIndex))
     case .cloud(let cloudIndex):
       guard let cloud, let item = cloudItem(at: cloudIndex) else { return nil }
       return .cloud(item, library: cloud.library, isOnDevice: false)
     case .folder(let folderIndex, let match):
       guard let item = folderItem(at: folderIndex) else { return nil }
       let copy = match.flatMap { index in cloud.flatMap { cloud in cloudItem(at: index).map { ($0, cloud.library) } } }
-      return .file(item, backup: copy != nil ? .backedUp : fileStates[item.path], cloud: copy)
+      return .file(item, backup: folderBackupState(item), cloud: copy)
     case nil:
       return nil
     }

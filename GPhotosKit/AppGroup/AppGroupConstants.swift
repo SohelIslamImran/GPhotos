@@ -40,9 +40,22 @@ public enum AppGroupConstants {
       return false
     }
     let probe = directory.appendingPathComponent(".storage-probe")
-    guard (try? Data().write(to: probe)) != nil else { return false }
+    do {
+      try Data().write(to: probe)
+    } catch {
+      return isOutOfSpace(error)
+    }
     try? fileManager.removeItem(at: probe)
     return true
+  }
+
+  /// A full disk is no reason to leave the container: the private one would start from an
+  /// empty manifest, and every photo would look new.
+  static func isOutOfSpace(_ error: any Error) -> Bool {
+    let error = error as NSError
+    if error.domain == NSCocoaErrorDomain, error.code == NSFileWriteOutOfSpaceError { return true }
+    if error.domain == NSPOSIXErrorDomain, error.code == Int(ENOSPC) || error.code == Int(EDQUOT) { return true }
+    return error.underlyingErrors.contains(where: isOutOfSpace)
   }
 
   public static func storageDirectory() -> URL {

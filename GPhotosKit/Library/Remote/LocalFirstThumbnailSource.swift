@@ -1,111 +1,209 @@
 import CoreGraphics
-import Dispatch
+import Foundation
+import Photos
 import os
 
 /// Keeps routing off the main actor while the library discovers local copies.
 final class LocalFirstThumbnailSource: ThumbnailSource {
-  struct LocalCopies: Sendable {
+  struct LocalCopies: Sendable, Equatable {
     var assets: [String: String] = [:]
+    var assetVersions: [String: PhotoBackupEvidence.Version] = [:]
     var files: [String: FolderItemInfo] = [:]
+    var confirmedAssetIDs: Set<String> = []
+
+    func route(for key: String) -> Route {
+      if let id = assets[key] { return .asset(id) }
+      if let file = files[key] { return .file(file.id) }
+      return .remote
+    }
   }
 
-  private let copies = OSAllocatedUnfairLock(initialState: LocalCopies())
+  enum Route: Hashable {
+    case asset(String)
+    case file(String)
+    case remote
+  }
+
+  private let state = OSAllocatedUnfairLock(initialState: (copies: LocalCopies(), hasProjection: false))
   private let remote: any ThumbnailSource
+  private let accountEmail: String?
+  private let repairObserver = OSAllocatedUnfairLock<(@Sendable (LocalCopies, LocalCopies) -> Void)?>(initialState: nil)
 
-  init(remote: any ThumbnailSource) { self.remote = remote }
+  func observeRepairs(_ observer: @escaping @Sendable (LocalCopies, LocalCopies) -> Void) {
+    repairObserver.withLock { $0 = observer }
+  }
+  #if DEBUG
+    private let remoteRequests = OSAllocatedUnfairLock(initialState: 0)
+    var remoteRequestCount: Int { remoteRequests.withLock { $0 } }
+  #endif
 
-  var localCopies: LocalCopies { copies.withLock { $0 } }
+  init(remote: any ThumbnailSource, accountEmail: String? = nil) {
+    self.remote = remote
+    self.accountEmail = accountEmail
+  }
 
-  func register(assets: [String: String], files: [String: FolderItemInfo]) -> Bool {
-    copies.withLock { copies in
-      var changed = false
-      for (key, id) in assets where copies.assets[key] != id {
-        copies.assets[key] = id
-        changed = true
+  func thumbnailIdentity(for id: String) -> ThumbnailIdentity {
+    guard let key = RemoteThumbnailID(id)?.mediaKey else { return ThumbnailIdentity(id: id) }
+    return identity(for: id, key: key, copies: localCopies)
+  }
+
+  private func identity(for id: String, key: String, copies: LocalCopies) -> ThumbnailIdentity {
+    let route = copies.route(for: key)
+    var version: Int64 = 0
+    if route != .remote {
+      var hasher = Hasher()
+      hasher.combine(route)
+      switch route {
+      case .asset(let assetID): hasher.combine(copies.assetVersions[assetID])
+      case .file: hasher.combine(copies.files[key]?.thumbnailIdentity.version)
+      case .remote: break
       }
-      for (key, file) in files where copies.files[key] != file {
-        copies.files[key] = file
-        changed = true
+      version = Int64(hasher.finalize())
+    }
+    return ThumbnailIdentity(id: id, version: version, accountEmail: accountEmail)
+  }
+
+  var localCopies: LocalCopies { state.withLock { $0.copies } }
+  var needsRegistration: Bool { state.withLock { !$0.hasProjection } }
+
+  func clearProjection() {
+    state.withLock { $0 = (LocalCopies(), false) }
+  }
+
+  func register(assets: [String: String], versions: [String: PhotoBackupEvidence.Version]) -> Bool {
+    state.withLock {
+      guard !$0.hasProjection else { return false }
+      var next = $0.copies
+      next.assets = assets
+      next.assetVersions = versions
+      guard next != $0.copies else { return false }
+      $0.copies = next
+      return true
+    }
+  }
+
+  func replace(with copies: LocalCopies) -> Bool {
+    state.withLock {
+      $0.hasProjection = true
+      guard $0.copies != copies else { return false }
+      $0.copies = copies
+      return true
+    }
+  }
+
+  func route(for key: String) -> Route {
+    state.withLock { $0.copies.route(for: key) }
+  }
+
+  static func visibleAsset(_ id: String) -> PHAsset? {
+    guard PhotoLibraryGridModel.hasAccess else { return nil }
+    let options = AssetExportService.allFramesFetchOptions()
+    options.includeAssetSourceTypes = [.typeUserLibrary, .typeCloudShared, .typeiTunesSynced]
+    guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: options).firstObject, !asset.isHidden
+    else { return nil }
+    return asset
+  }
+
+  static func hasCurrentVersion(_ asset: PHAsset, _ version: PhotoBackupEvidence.Version?) -> Bool {
+    guard let version else { return true }
+    return LocalAssetHashes.Evidence.sameContent(.init(AssetExportService.version(of: asset)), version)
+  }
+
+  static func fileAliasIsCurrent(_ file: FolderItemInfo) -> Bool {
+    do {
+      let values = try file.url.resourceValues(forKeys: [.isReadableKey, .fileSizeKey, .contentModificationDateKey])
+      if values.isReadable == false { return false }
+      if let size = values.fileSize, Int64(size) != file.size { return false }
+      if let expected = file.modifiedAt, let modified = values.contentModificationDate, modified != expected { return false }
+      return true
+    } catch let error as NSError {
+      guard error.domain == NSCocoaErrorDomain else { return true }
+      return ![NSFileNoSuchFileError, NSFileReadNoSuchFileError, NSFileReadNoPermissionError].contains(error.code)
+    }
+  }
+
+  /// Repair only the alias we actually checked. A new projection may have supplied another copy.
+  func discardAlias(for key: String, route: Route, checked: LocalCopies) {
+    let change: (LocalCopies, LocalCopies)? = state.withLock {
+      let previous = $0.copies
+      guard previous.route(for: key) == route else { return nil }
+      switch route {
+      case .asset(let id):
+        guard previous.assetVersions[id] == checked.assetVersions[id] else { return nil }
+        $0.copies.assets[key] = nil
+      case .file:
+        guard previous.files[key] == checked.files[key] else { return nil }
+        $0.copies.files[key] = nil
+      case .remote:
+        return nil
       }
-      return changed
+      return (previous, $0.copies)
+    }
+    if let (previous, updated) = change {
+      let observer = repairObserver.withLock { $0 }
+      observer?(previous, updated)
     }
   }
 
   func requestImage(
-    id: String, pixelSize: CGSize, quality: ImageRequestQuality, deliver: @escaping @Sendable (CGImage, Bool) -> Void
+    id: String, pixelSize: CGSize, quality: ImageRequestQuality,
+    onUnavailable: @escaping @Sendable () -> Void, deliver: @escaping @Sendable (CGImage, Bool) -> Void
   ) -> ImageRequestToken {
-    guard let key = RemoteThumbnailID(id)?.mediaKey else { return .none }
-    let (assetID, fileID) = copies.withLock { ($0.assets[key], $0.files[key]?.id) }
-    guard assetID != nil || fileID != nil else {
-      return remote.requestImage(id: id, pixelSize: pixelSize, quality: quality, deliver: deliver)
+    guard let key = RemoteThumbnailID(id)?.mediaKey else {
+      onUnavailable()
+      return .none
     }
-
-    // Manifest matches can outlive a deleted asset or an unavailable folder.
-    let requests = OSAllocatedUnfairLock<[ImageRequestToken]?>(initialState: [])
-    let add: @Sendable (ImageRequestToken) -> Void = { token in
-      let cancelled = requests.withLock { tokens in
-        tokens?.append(token)
-        return tokens == nil
+    if let accountEmail, LockedItems.contains(key, accountEmail: accountEmail) {
+      onUnavailable()
+      return .none
+    }
+    let checked = localCopies
+    let identity = identity(for: id, key: key, copies: checked)
+    let selected = checked.route(for: key)
+    let deliverCurrent: @Sendable (CGImage, Bool) -> Void = { [self] image, final in
+      guard !identity.isLocked, thumbnailIdentity(for: id) == identity else {
+        if final { onUnavailable() }
+        return
       }
-      if cancelled { token.cancel() }
+      deliver(image, final)
     }
-    let requestRemote: @Sendable () -> Void = { [remote] in
-      guard requests.withLock({ $0 != nil }) else { return }
-      add(remote.requestImage(id: id, pixelSize: pixelSize, quality: quality, deliver: deliver))
-    }
-    let requestFile: @Sendable () -> Void = {
-      guard requests.withLock({ $0 != nil }) else { return }
-      guard let fileID else { return requestRemote() }
-      add(
-        FolderLibrary.shared.thumbnails.requestImage(
-          id: fileID, pixelSize: pixelSize, quality: quality, onUnavailable: requestRemote, deliver: deliver))
-    }
-    if let assetID {
-      DispatchQueue.global(qos: .userInitiated).async {
-        guard requests.withLock({ $0 != nil }) else { return }
-        add(
-          PhotoKitImageSource.shared.requestImage(
-            id: assetID, pixelSize: pixelSize, quality: quality, onUnavailable: requestFile, deliver: deliver))
+    let localUnavailable: @Sendable () -> Void = { [self] in
+      Task.detached(priority: .userInitiated) {
+        switch selected {
+        case .asset(let id):
+          if Self.visibleAsset(id).map({ Self.hasCurrentVersion($0, checked.assetVersions[id]) }) != true {
+            self.discardAlias(for: key, route: selected, checked: checked)
+          }
+        case .file:
+          if let file = checked.files[key], !Self.fileAliasIsCurrent(file) {
+            self.discardAlias(for: key, route: selected, checked: checked)
+          }
+        case .remote:
+          break
+        }
+        onUnavailable()
       }
-    } else {
-      requestFile()
     }
-    return ImageRequestToken {
-      let tokens = requests.withLock { tokens in
-        defer { tokens = nil }
-        return tokens ?? []
-      }
-      for token in tokens { token.cancel() }
+    switch selected {
+    case .remote:
+      #if DEBUG
+        remoteRequests.withLock { $0 &+= 1 }
+      #endif
+      return remote.requestImage(
+        id: id, pixelSize: pixelSize, quality: quality, onUnavailable: onUnavailable, deliver: deliverCurrent)
+    case .file(let fileID):
+      return FolderLibrary.shared.thumbnails.requestImage(
+        id: fileID, pixelSize: pixelSize, quality: quality, alias: checked.files[key],
+        onUnavailable: localUnavailable, deliver: deliverCurrent)
+    case .asset(let assetID):
+      return PhotoKitImageSource.shared.requestImage(
+        id: assetID, pixelSize: pixelSize, quality: quality, allowsHidden: false,
+        expectedVersion: checked.assetVersions[assetID], onUnavailable: localUnavailable, deliver: deliverCurrent)
     }
   }
 
-  func startCaching(ids: [String], pixelSize: CGSize) {
-    for (source, ids) in groups(for: ids) where !ids.isEmpty {
-      source.startCaching(ids: ids, pixelSize: pixelSize)
-    }
-  }
-
-  func stopCaching(ids: [String], pixelSize: CGSize) {
-    for (source, ids) in groups(for: ids) where !ids.isEmpty {
-      source.stopCaching(ids: ids, pixelSize: pixelSize)
-    }
-  }
-
-  private func groups(for ids: [String]) -> [(any ThumbnailSource, [String])] {
-    let copies = localCopies
-    var assetIDs: [String] = []
-    var fileIDs: [String] = []
-    var remoteIDs: [String] = []
-    for id in ids {
-      guard let key = RemoteThumbnailID(id)?.mediaKey else { continue }
-      if let asset = copies.assets[key] {
-        assetIDs.append(asset)
-      } else if let file = copies.files[key] {
-        fileIDs.append(file.id)
-      } else {
-        remoteIDs.append(id)
-      }
-    }
-    return [(PhotoKitImageSource.shared, assetIDs), (FolderLibrary.shared.thumbnails, fileIDs), (remote, remoteIDs)]
+  func cachingTarget(for id: String) -> ThumbnailCachingTarget? {
+    guard let key = RemoteThumbnailID(id)?.mediaKey, case .asset(let assetID) = route(for: key) else { return nil }
+    return PhotoKitImageSource.shared.cachingTarget(for: assetID)
   }
 }

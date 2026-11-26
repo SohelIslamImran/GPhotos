@@ -7,10 +7,25 @@ private let logger = Logger(subsystem: "org.gphotosapp.gphotos", category: "Sync
 @MainActor
 @Observable
 open class SyncEngine: NSObject {
-  public private(set) var accounts: [GoogleAccount] = []
-  public private(set) var selectedAccount: GoogleAccount?
-  public private(set) var settings: AppSettings
-  public private(set) var records: [TransferRecord] = []
+  public private(set) var accounts: [GoogleAccount] = [] {
+    didSet { if accounts != oldValue { cleanupPolicy.invalidate() } }
+  }
+  public private(set) var selectedAccount: GoogleAccount? {
+    didSet {
+      if selectedAccount != oldValue { cleanupPolicy.invalidate() }
+      // The next launch draws its first frames before reading accounts: never another's.
+      if let previous = oldValue?.email, previous != selectedAccount?.email { LibrarySnapshot.remove() }
+    }
+  }
+  public private(set) var settings: AppSettings {
+    didSet { if settings != oldValue { cleanupPolicy.invalidate() } }
+  }
+  public let cleanupPolicy = CleanupPolicy()
+  @ObservationIgnored private var recordSnapshot: [TransferRecord] = []
+  public var records: [TransferRecord] {
+    access(keyPath: \.records)
+    return recordSnapshot
+  }
   public private(set) var statusMessage: String = "Ready"
   /// Mirrors `NetworkStatusMonitor.isExpensive` so views update when it changes.
   public private(set) var isOnMeteredNetwork = NetworkStatusMonitor.shared.isExpensive
@@ -24,12 +39,35 @@ open class SyncEngine: NSObject {
   public let remoteCopyVerifier: RemoteCopyVerifier
   public private(set) var accountMirror: AccountMirror!
   /// The Google Photos library of the selected account, synced for browsing.
-  public private(set) var cloudLibrary: CloudLibrary? {
-    // Siri browses the same account, also when it runs the app without its window.
-    didSet { SiriLibrary.shared.cloud = cloudLibrary }
-  }
+  public private(set) var cloudLibrary: CloudLibrary?
   public let shareObserver = ShareObserverHolder()
   public private(set) var accountGeneration = 0
+  public private(set) var isChangingAccount = false {
+    didSet { if isChangingAccount != oldValue { LibrarySnapshot.holdSaves(isChangingAccount) } }
+  }
+  public var canUseSelectedAccount: Bool {
+    !isChangingAccount && selectedAccount != nil && credentialError == nil
+  }
+  /// What may be removed depends on every account, so cleanup waits for any account change,
+  /// also one that leaves the primary and its backup alone.
+  public var allowsAccountWork: Bool { canUseSelectedAccount && accountTransition == nil }
+
+  public typealias AccountWake = (name: String, run: @MainActor () async -> Void)
+
+  private struct AccountWork {
+    /// Uses only the primary, which a change to the other accounts leaves as it is.
+    let isPrimaryOnly: Bool
+    let wake: AccountWake?
+    let cancel: () -> Void
+    let drain: () async -> Void
+  }
+
+  @ObservationIgnored private var accountTransition: Task<Void, Never>?
+  @ObservationIgnored private var needsAccountChangeCallback = false
+  @ObservationIgnored private var accountWork: [UUID: AccountWork] = [:]
+  /// What an account change refused or cut short, run once it ends.
+  @ObservationIgnored private var pendingWakes: [AccountWake] = []
+  @ObservationIgnored private var removingAccounts = Set<String>()
   private var isIngestingSharedQueue = false
   private var sharedIngestionRequested = false
   private var completionRefreshTask: Task<Void, Never>?
@@ -38,9 +76,7 @@ open class SyncEngine: NSObject {
   private var sharedFailureTimes: [String: Date] = [:]
   static let sharedRetryBackoff = Backoff(baseDelay: 30, maxDelay: 30 * 60, maxRetries: 5)
 
-  public override init() {
-    let auth = GoogleAuthService()
-    let manifest = TransferManifestStore.shared
+  public init(auth: GoogleAuthService = GoogleAuthService(), manifest: TransferManifestStore = .shared) {
     let settings = AppSettingsStore.load()
     self.settings = settings
     self.authService = auth
@@ -57,6 +93,10 @@ open class SyncEngine: NSObject {
     Task.detached(priority: .userInitiated) { await manifest.load() }
     let mirror = AccountMirror(engine: self)
     self.accountMirror = mirror
+    pool.canStartBatch = { [weak self] email in
+      guard let self else { return false }
+      return self.canUseSelectedAccount && self.selectedAccount?.email == email
+    }
     pool.useFilenameDate = settings.setDateFromFilename
     pool.pairLivePhotos = settings.pairLivePhotos
     pool.onBatchStarted = { [weak self] in
@@ -104,6 +144,9 @@ open class SyncEngine: NSObject {
     workerPool.isRunning
   }
 
+  /// From a batch's first item to its last album, for work that gives way to a backup.
+  public var isBackupActive: Bool { workerPool.isRunning || workerPool.isBatchFinalizing }
+
   @ObservationIgnored private var reconnectObserver: (any NSObjectProtocol)?
   @ObservationIgnored private var lastReconnectRetry: Date?
   @ObservationIgnored private var needsResumeAfterLostNetwork = false
@@ -143,6 +186,7 @@ open class SyncEngine: NSObject {
   /// because a flapping connection must not resend the same failures over and over.
   private func retryAfterReconnect() async {
     guard allowsAutomaticUploads, !isRunning, needsResumeAfterLostNetwork || !failedRecords.isEmpty else { return }
+    guard !replaysAfterAccountChange(("reconnect", { [weak self] in await self?.retryAfterReconnect() })) else { return }
     // The throttle is for failures; a batch waiting on this reconnect has nothing else coming.
     if !needsResumeAfterLostNetwork, let lastReconnectRetry, Date().timeIntervalSince(lastReconnectRetry) < 5 * 60 {
       return
@@ -167,7 +211,17 @@ open class SyncEngine: NSObject {
   /// keeps unless `removesItemsAlreadyInGooglePhotos` is on.
   public var foundInAccountCount: Int {
     guard let email = selectedAccount?.email else { return 0 }
-    return records.reduce(0) { $0 + ($1.status == .sent && $1.foundInAccounts.contains(email) ? 1 : 0) }
+    return foundCountsByAccount[email, default: 0]
+  }
+
+  private var foundCountsByAccount: [String: Int] = [:]
+
+  nonisolated static func foundCounts(in records: [TransferRecord]) -> [String: Int] {
+    var counts: [String: Int] = [:]
+    for record in records where record.status == .sent {
+      for email in record.foundInAccounts { counts[email, default: 0] += 1 }
+    }
+    return counts
   }
 
   public func activeWorker(for itemIdOrPath: String, filename: String? = nil) -> WorkerState? {
@@ -186,16 +240,25 @@ open class SyncEngine: NSObject {
   /// whole merged timeline in one go instead of adding Google Photos to it afterwards.
   public private(set) var hasLoadedAccounts = false
 
-  private typealias StoredAccounts = (accounts: [GoogleAccount], selected: GoogleAccount?)
+  typealias StoredAccounts = (accounts: [GoogleAccount], selected: GoogleAccount?)
+  @ObservationIgnored var readStoredAccounts: (() async throws -> StoredAccounts)?
+  @ObservationIgnored var retireLibrary: ((CloudLibrary) async -> Void)?
+  @ObservationIgnored var makeLibrary: ((GoogleAccount, GooglePhotosMobileClient) -> CloudLibrary)?
+  @ObservationIgnored var removeStoredAccount: (String) throws -> Void = KeychainStore.removeAccount
+  @ObservationIgnored var setStoredMirror: (String, Bool) throws -> Void = {
+    try KeychainStore.setMirrorEnabled(email: $0, enabled: $1)
+  }
+  @ObservationIgnored var removeRemoteData: ((String) async -> Void)?
+  /// Stands in for reading the share queue, which tests share with the installed app.
+  @ObservationIgnored var ingestSharedQueue: (() async -> Void)?
+  @ObservationIgnored var publishAccountMetadata: (() -> Void)?
   @ObservationIgnored private var accountsPrefetch: Task<Result<StoredAccounts, any Error>, Never>?
   @ObservationIgnored private var accountsPrefetchedAt = ContinuousClock.now
 
-  /// Starts reading the stored accounts and the upload manifest at once (call while the
-  /// app is still launching), so the first `loadAccounts()` finds them read.
+  /// Reads the accounts while the app is launching, before the first load needs them.
   public func prefetchAccounts() {
-    guard accountsPrefetch == nil, !hasLoadedAccounts else { return }
+    guard accountsPrefetch == nil, !hasLoadedAccounts, !isChangingAccount else { return }
     let authService = authService
-    // The manifest is read on its first use too; that read joins the keychain's.
     let manifestStore = manifestStore
     Task.detached(priority: .userInitiated) { await manifestStore.load() }
     accountsPrefetchedAt = .now
@@ -205,59 +268,321 @@ open class SyncEngine: NSObject {
   }
 
   public func loadAccounts() async {
-    accountGeneration += 1
+    await withAccountTransition { await self.reloadAccounts(usePrefetch: true) }
+  }
+
+  /// Keep the gate closed between queued operations. Cancelling a view task must not
+  /// interrupt a credential change. With `keepingPrimary` the primary works on: the gate
+  /// closes only if the accounts read turn out to change it.
+  private func withAccountTransition<T: Sendable>(
+    keepingPrimary: Bool = false, _ operation: @escaping @MainActor () async -> T
+  ) async -> T {
+    let previous = accountTransition
+    if !keepingPrimary, !isChangingAccount { isChangingAccount = true }
+    let task = Task { @MainActor in
+      await previous?.value
+      return await operation()
+    }
+    let completion = Task { @MainActor in _ = await task.value }
+    accountTransition = completion
+    let result = await task.value
+    while let pending = accountTransition {
+      await pending.value
+      guard accountTransition == pending else { continue }
+      accountTransition = nil
+      if isChangingAccount { isChangingAccount = false }
+      let wakes = pendingWakes
+      pendingWakes = []
+      // The callback and the wakes may resume uploads. Their network work must stay outside
+      // the transition, and one that waits for a whole batch must not hold back the rest.
+      if needsAccountChangeCallback {
+        Task { @MainActor [weak self] in
+          guard let self, !self.isChangingAccount, self.needsAccountChangeCallback else { return }
+          self.needsAccountChangeCallback = false
+          await self.accountsDidChange()
+        }
+      }
+      for wake in wakes { Task { @MainActor in await wake.run() } }
+      break
+    }
+    return result
+  }
+
+  /// Whether the primary is being changed, in which case `wake` runs once that ends, so what
+  /// asked for work meanwhile isn't lost.
+  public func replaysAfterAccountChange(_ wake: AccountWake) -> Bool {
+    guard isChangingAccount else { return false }
+    addPendingWake(wake)
+    return true
+  }
+
+  /// A scan requested for these folders can be replayed after the same primary reauthenticates.
+  public func shouldReplayFolderScan(accountEmail: String, generation: Int) -> Bool {
+    selectedAccount?.email == accountEmail && (isChangingAccount || accountGeneration != generation)
+  }
+
+  public func replayInterruptedFolderScan(accountEmail: String, generation: Int, wake: AccountWake) {
+    guard shouldReplayFolderScan(accountEmail: accountEmail, generation: generation) else { return }
+    let replay: AccountWake = (
+      "\(wake.name):\(accountEmail)",
+      { [weak self] in
+        guard self?.selectedAccount?.email == accountEmail else { return }
+        await wake.run()
+      }
+    )
+    if !replaysAfterAccountChange(replay) { Task { await replay.run() } }
+  }
+
+  private func addPendingWake(_ wake: AccountWake) {
+    guard !pendingWakes.contains(where: { $0.name == wake.name }) else { return }
+    pendingWakes.append(wake)
+  }
+
+  /// Own cleanup and standalone album tasks so a transition can cancel them and
+  /// wait for any deletion already past its final check or rolling back. `wake` starts
+  /// automatic work again when a transition refused or cancelled it; a cleanup the user
+  /// confirmed has none.
+  public func withAccountWork<T: Sendable>(
+    isPrimaryOnly: Bool = false, wake: AccountWake? = nil, _ operation: @escaping @MainActor () async -> T
+  ) async -> T? {
+    guard !Task.isCancelled else { return nil }
+    guard isPrimaryOnly ? canUseSelectedAccount : allowsAccountWork else {
+      if accountTransition != nil, let wake { addPendingWake(wake) }
+      return nil
+    }
+    let id = UUID()
+    let task = Task { @MainActor () -> T? in
+      defer { self.accountWork[id] = nil }
+      guard !Task.isCancelled else { return nil }
+      return await operation()
+    }
+    accountWork[id] = AccountWork(
+      isPrimaryOnly: isPrimaryOnly, wake: wake, cancel: { task.cancel() }, drain: { _ = await task.value })
+    return await withTaskCancellationHandler {
+      await task.value
+    } onCancel: {
+      task.cancel()
+    }
+  }
+
+  /// Removes what the app no longer needs of its own staged copies. Overridden by the app
+  /// that keeps them.
+  open func removeCompletedStagedCopies() async {}
+
+  @ObservationIgnored private var stagedCleanup: Task<Void, Never>?
+  @ObservationIgnored private var stagedCleanupRequested = false
+
+  /// That cleanup asks Google Photos about every copy first. Neither watching folders nor
+  /// backing up waits for an answer.
+  public func backUpDuringStagedCleanup(_ backUp: () async -> Void) async {
+    scheduleStagedCleanup()
+    await backUp()
+  }
+
+  func secondaryCopyDidComplete() {
+    #if os(macOS)
+      scheduleStagedCleanup()
+    #endif
+  }
+
+  private func scheduleStagedCleanup() {
+    stagedCleanupRequested = true
+    guard stagedCleanup == nil else { return }
+    stagedCleanup = Task { @MainActor [weak self] in
+      while let self, self.stagedCleanupRequested {
+        self.stagedCleanupRequested = false
+        await self.withAccountWork(wake: ("stagedCleanup", { [weak self] in self?.scheduleStagedCleanup() })) {
+          await self.removeCompletedStagedCopies()
+        }
+      }
+      self?.stagedCleanup = nil
+    }
+  }
+
+  public func waitForStagedCleanup() async {
+    await stagedCleanup?.value
+  }
+
+  public func acceptsBackgroundReceipt(accountEmail: String) -> Bool {
+    !removingAccounts.contains(accountEmail) && accounts.contains { $0.email == accountEmail }
+  }
+
+  private func drainAccountWork(discardingLibrary: Bool) async {
     cancelLostNetworkRetry()
-    // A keychain read that fails is not the same as being signed out. Reporting both
-    // as "no accounts" makes an entitlement or locked-keychain problem look like a
-    // request to sign in again, which then fails for the same reason.
-    var credentialFailure: String?
-    // Only the first load can use the read started at launch, and only soon after it:
-    // later ones (a sign-in, an account switch) read again.
-    let prefetched = ContinuousClock.now - accountsPrefetchedAt < .seconds(10) ? accountsPrefetch : nil
+    let oldLibrary = cloudLibrary
+    oldLibrary?.cancelSync()
+    workerPool.cancel()
+    workerPool.abortAlbumUpdates()
+    pauseCopies()
+    let work = cancelAccountWork { _ in true }
+    if let oldLibrary {
+      if let retireLibrary {
+        await retireLibrary(oldLibrary)
+      } else {
+        await oldLibrary.retire()
+      }
+    }
+    for item in work { await item.drain() }
+    await workerPool.waitForCurrentBatch()
+    await accountMirror?.waitForIdleWindow()
+    if discardingLibrary { await oldLibrary?.removeLocalData() }
+  }
+
+  private func cancelAccountWork(where isAffected: (AccountWork) -> Bool) -> [AccountWork] {
+    let work = accountWork.values.filter(isAffected)
+    for item in work {
+      item.cancel()
+      if let wake = item.wake { addPendingWake(wake) }
+    }
+    return work
+  }
+
+  /// Cleanup, which weighs every account's copies, receipt imports and the copies
+  /// themselves stop; the primary's batch, library, albums and credential are untouched.
+  private func drainSecondaryWork() async {
+    let work = cancelAccountWork { !$0.isPrimaryOnly }
+    pauseCopies()
+    for item in work { await item.drain() }
+    await accountMirror?.waitForIdleWindow()
+  }
+
+  private func pauseCopies() {
+    if accountMirror?.isRunning == true { replayCopies() }
+    accountMirror?.pauseAll()
+  }
+
+  /// A copy window was refused or cut short: resumed once the account change that did it ends.
+  func replayCopies() {
+    guard accountTransition != nil else { return }
+    addPendingWake(("copies", { [weak self] in self?.resumeCopies() }))
+  }
+
+  /// Account copies an account change interrupted may go on. Overridden by the app that
+  /// doesn't check for that regularly by itself.
+  open func resumeCopies() {}
+
+  private func purgeRemoteData(_ email: String) async {
+    if let removeRemoteData {
+      await removeRemoteData(email)
+    } else {
+      await CloudLibrary.removeLocalData(forAccountEmail: email)
+    }
+  }
+
+  private func reloadAccounts(
+    usePrefetch: Bool = false, removing email: String? = nil, signedOut: Bool = false, disablingMirror: String? = nil
+  ) async {
+    let prefetched = usePrefetch && ContinuousClock.now - accountsPrefetchedAt < .seconds(10) ? accountsPrefetch : nil
     accountsPrefetch = nil
+    var stored: StoredAccounts = ([], nil)
+    var failure: String?
     do {
-      let stored: StoredAccounts
       if let prefetched {
         stored = try await prefetched.value.get()
+      } else if let readStoredAccounts {
+        stored = try await readStoredAccounts()
       } else {
         stored = try await authService.accountsAndSelection()
       }
-      self.accounts = stored.accounts
-      self.selectedAccount = stored.selected
     } catch {
-      self.accounts = []
-      self.selectedAccount = nil
-      credentialFailure = error.localizedDescription
+      failure = error.localizedDescription
     }
-    updateCloudLibrary()
-    // Siri forgets an account signed out or switched from; a keychain that can't be read
-    // says nothing about which account is browsed.
-    if credentialFailure == nil {
-      let email = selectedAccount?.email
-      Task { await SiriLibrary.shared.spotlight.browsedAccountChanged(to: email) }
+
+    if hasLoadedAccounts, failure == nil, credentialError == nil, stored.accounts == accounts,
+      stored.selected == selectedAccount, cloudLibrary?.isRetired != true, email == nil, !signedOut, disablingMirror == nil
+    {
+      return
     }
-    if let sel = selectedAccount {
-      do {
-        try await authService.setCredential(sel.credentialString)
-        statusMessage = "Active account: \(sel.email)"
-      } catch {
-        // A credential that cannot be written is unusable, so it must not be reported
-        // as a healthy active account.
-        credentialFailure = credentialFailure ?? error.localizedDescription
-        statusMessage = "Credentials could not be saved."
+    if hasLoadedAccounts, failure == nil, credentialError == nil, !signedOut, cloudLibrary?.isRetired == false,
+      let current = selectedAccount, let next = stored.selected, next.hasSameCredential(as: current), email != current.email
+    {
+      await changeSecondaries(to: stored, removing: email, disablingMirror: disablingMirror)
+      return
+    }
+    if !isChangingAccount { isChangingAccount = true }
+    let cachedEmail = cloudLibrary?.accountEmail
+    let discardingLibrary = signedOut || (email != nil && email == cachedEmail)
+    if hasLoadedAccounts || cloudLibrary != nil {
+      await drainAccountWork(discardingLibrary: discardingLibrary)
+    }
+    // Scans aren't drained: from here one that started before can't write or queue anything.
+    accountGeneration &+= 1
+    if let email {
+      await manifestStore.removeRecords(forAccountEmail: email)
+      AlbumKeyStore.shared.forgetAll(forAccountEmail: email)
+      if email != cachedEmail { await purgeRemoteData(email) }
+    }
+    if signedOut {
+      for account in accounts where account.email != cachedEmail {
+        await purgeRemoteData(account.email)
       }
+    }
+    if let disablingMirror {
+      await manifestStore.removeRecords(forAccountEmail: disablingMirror, keepingSent: true)
+    }
+
+    if let account = stored.selected {
+      do {
+        try await authService.setCredential(account.credentialString, expectedEmail: account.email)
+      } catch {
+        failure = error.localizedDescription
+      }
+    } else {
+      await authService.clearCredential()
+    }
+
+    if failure == nil { await manifestStore.acceptRecords(forAccountEmails: stored.accounts.map(\.email)) }
+    accounts = failure == nil ? stored.accounts : []
+    selectedAccount = failure == nil ? stored.selected : nil
+    credentialError = failure
+    if failure == nil, publishAccountMetadata == nil {
+      await SiriLibrary.shared.spotlight.browsedAccountChanged(to: selectedAccount?.email, waitForEviction: false)
+    }
+    cloudLibrary = makeCloudLibrary(for: selectedAccount)
+    if failure != nil {
+      statusMessage = "Credentials could not be saved."
+    } else if let account = selectedAccount {
+      statusMessage = "Active account: \(account.email)"
     } else {
       statusMessage = "No accounts configured."
     }
-    credentialError = credentialFailure
-    AccountPhotoStore.shared.update(for: accounts)
-    // The account-scoped caches are derived from `selectedAccount`, so they must be
-    // rebuilt here or a sign-out / account switch keeps showing the previous
-    // account's records.
+    removingAccounts.subtract(accounts.map(\.email))
+    if let publishAccountMetadata {
+      publishAccountMetadata()
+    } else {
+      SiriLibrary.shared.cloud = cloudLibrary
+      AccountPhotoStore.shared.update(for: accounts)
+    }
     await refreshRecords()
     hasLoadedAccounts = true
-    await accountsDidChange()
+    needsAccountChangeCallback = true
     accountMirror?.reloadAccounts(accounts: accounts, primaryEmail: selectedAccount?.email)
+    await accountMirror?.refreshRecordCounts()
+  }
+
+  /// The primary stays as it is, so its library, batch, scans and credential do too.
+  private func changeSecondaries(to stored: StoredAccounts, removing email: String?, disablingMirror: String?) async {
+    await drainSecondaryWork()
+    if let email {
+      await manifestStore.removeRecords(forAccountEmail: email)
+      AlbumKeyStore.shared.forgetAll(forAccountEmail: email)
+      await purgeRemoteData(email)
+    }
+    if let disablingMirror {
+      await manifestStore.removeRecords(forAccountEmail: disablingMirror, keepingSent: true)
+    }
+    await manifestStore.acceptRecords(forAccountEmails: stored.accounts.map(\.email))
+    accounts = stored.accounts
+    if selectedAccount != stored.selected { selectedAccount = stored.selected }
+    removingAccounts.subtract(accounts.map(\.email))
+    if let publishAccountMetadata {
+      publishAccountMetadata()
+    } else {
+      AccountPhotoStore.shared.update(for: accounts)
+    }
+    await refreshRecords()
+    accountMirror?.reloadAccounts(accounts: accounts, primaryEmail: selectedAccount?.email)
+    await accountMirror?.refreshRecordCounts()
   }
 
   /// Set when stored credentials could not be read, so the UI can distinguish a
@@ -271,8 +596,8 @@ open class SyncEngine: NSObject {
   private func scheduleCompletionRefresh() {
     guard completionRefreshTask == nil else { return }
     completionRefreshTask = Task { @MainActor [weak self] in
-      try? await Task.sleep(for: .seconds(1))
-      guard let self else { return }
+      try? await Task.sleep(for: .seconds(3))
+      guard let self, !Task.isCancelled else { return }
       self.completionRefreshTask = nil
       await self.refreshRecords()
       await self.removeCompletedSharedEntries()
@@ -288,6 +613,11 @@ open class SyncEngine: NSObject {
 
   /// Subclasses call this from their batch-completion handler (they own `onBatchCompleted`).
   open func primaryBatchDidComplete() async {
+    completionRefreshTask?.cancel()
+    completionRefreshTask = nil
+    await refreshRecords()
+    await removeCompletedSharedEntries()
+    await transferItemDidComplete()
     // The Library shows the new uploads from Google Photos soon, not at the next delta.
     if workerPool.lastBatchCompletedCount > 0 { cloudLibrary?.refreshAfterUpload() }
     scheduleRetryAfterLostNetwork()
@@ -331,7 +661,7 @@ open class SyncEngine: NSObject {
         self.needsResumeAfterLostNetwork
       else { return }
       // A batch still finishing refuses new work, and offline there's nothing to resume yet.
-      guard !self.workerPool.isBatchFinalizing, NetworkStatusMonitor.shared.isConnected else {
+      guard !self.workerPool.isBatchFinalizing, !self.isChangingAccount, NetworkStatusMonitor.shared.isConnected else {
         self.armLostNetworkRetry(after: min(delay * 2, Self.longestLostNetworkRetryDelay))
         return
       }
@@ -347,11 +677,16 @@ open class SyncEngine: NSObject {
   @ObservationIgnored public private(set) var recordsRevision: Int?
 
   open func refreshRecords() async {
-    if let latest = await manifestStore.sortedRecords(ifChangedSince: recordsRevision) {
-      recordsRevision = latest.revision
-      records = latest.records
+    let revision = recordsRevision
+    if let latest = await manifestStore.sortedRecords(ifChangedSince: revision) {
+      let counts = await Task.detached(priority: .utility) { Self.foundCounts(in: latest.records) }.value
+      if recordsRevision == revision || recordsRevision.map({ $0 < latest.revision }) == true {
+        if counts != foundCountsByAccount { foundCountsByAccount = counts }
+        recordsRevision = latest.revision
+        withMutation(keyPath: \.records) { recordSnapshot = latest.records }
+      }
     }
-    accountMirror?.refreshStates()
+    await accountMirror?.refreshRecordCounts()
   }
 
   /// Gates every automatic start (shared-queue ingest, settings changes, batch
@@ -406,92 +741,65 @@ open class SyncEngine: NSObject {
     updateSettings(copy)
   }
 
-  /// One cloud library per browsed account; a new account gets its own.
-  private func updateCloudLibrary() {
+  private func makeCloudLibrary(for account: GoogleAccount?) -> CloudLibrary? {
     #if DEBUG
-      if UserDefaults.standard.string(forKey: "UIScreen")?.hasPrefix("cloud") == true {
-        if cloudLibrary == nil {
-          let screen = UserDefaults.standard.string(forKey: "UIScreen") ?? ""
-          let large = screen == "cloudLarge" || screen.hasSuffix("Stress")
-          cloudLibrary = .preview(itemCount: large ? 100_000 : 600)
-        }
-        return
+      if let screen = UserDefaults.standard.string(forKey: "UIScreen"), screen.hasPrefix("cloud") {
+        let large = screen == "cloudLarge" || screen.hasSuffix("Stress")
+        return .preview(itemCount: large ? 100_000 : 600)
       }
     #endif
-    guard cloudLibrary?.accountEmail != selectedAccount?.email else { return }
-    cloudLibrary?.cancelSync()
-    cloudLibrary = selectedAccount.map { CloudLibrary(accountEmail: $0.email, client: client) }
+    guard let account else { return nil }
+    return makeLibrary?(account, client) ?? CloudLibrary(accountEmail: account.email, client: client)
   }
 
   public func signOut() async {
-    accountGeneration += 1
-    cancelLostNetworkRetry()
-    await cloudLibrary?.removeLocalData()
-    workerPool.cancel()
-    workerPool.abortAlbumUpdates()
-    await workerPool.waitForCurrentBatch()
-    accountMirror?.pauseAll()
-    do {
-      try await authService.signOut()
-    } catch {
-      statusMessage = "Sign-out could not remove all stored credentials."
+    await withAccountTransition {
+      do {
+        try KeychainStore.deleteAccounts()
+        self.removingAccounts.formUnion(self.accounts.map(\.email))
+        await self.reloadAccounts(signedOut: true)
+      } catch {
+        self.statusMessage = "Sign-out could not remove all stored credentials."
+      }
     }
-    await loadAccounts()
   }
 
   public func setPrimary(email: String) async {
-    guard selectedAccount?.email != email else { return }
-    accountGeneration += 1
-    cancelLostNetworkRetry()
-    workerPool.cancel()
-    workerPool.abortAlbumUpdates()
-    await workerPool.waitForCurrentBatch()
-    accountMirror?.pauseAll()
-    do {
-      try KeychainStore.setPrimary(email: email)
-    } catch {
-      statusMessage = "Could not update primary account: \(error.localizedDescription)"
+    await withAccountTransition {
+      do {
+        try KeychainStore.setPrimary(email: email)
+        await self.reloadAccounts()
+      } catch {
+        self.statusMessage = "Could not update primary account: \(error.localizedDescription)"
+      }
     }
-    await loadAccounts()
   }
 
   public func removeAccount(email: String) async {
-    let wasPrimary = (selectedAccount?.email == email)
-    if wasPrimary {
-      accountGeneration += 1
-      cancelLostNetworkRetry()
-      workerPool.cancel()
-      workerPool.abortAlbumUpdates()
-      await workerPool.waitForCurrentBatch()
+    await withAccountTransition(keepingPrimary: isSecondary(email)) {
+      do {
+        try self.removeStoredAccount(email)
+        self.removingAccounts.insert(email)
+        await self.reloadAccounts(removing: email)
+      } catch {
+        self.statusMessage = "Could not remove account: \(error.localizedDescription)"
+      }
     }
-    accountMirror?.cancelMirror(for: email)
-    do {
-      try KeychainStore.removeAccount(email: email)
-    } catch {
-      statusMessage = "Could not remove account: \(error.localizedDescription)"
-    }
-    await manifestStore.removeRecords(forAccountEmail: email)
-    AlbumKeyStore.shared.forgetAll(forAccountEmail: email)
-    if cloudLibrary?.accountEmail == email {
-      await cloudLibrary?.removeLocalData()
-    } else {
-      await CloudLibrary.removeLocalData(forAccountEmail: email)
-    }
-    await loadAccounts()
   }
 
   public func setMirrorEnabled(email: String, enabled: Bool) async {
-    do {
-      try KeychainStore.setMirrorEnabled(email: email, enabled: enabled)
-      accounts = (try? await authService.accounts()) ?? []
-      accountMirror?.setMirrorEnabled(email: email, enabled: enabled)
-      if !enabled {
-        await manifestStore.removeRecords(forAccountEmail: email, keepingSent: true)
-        await refreshRecords()
+    await withAccountTransition(keepingPrimary: isSecondary(email)) {
+      do {
+        try self.setStoredMirror(email, enabled)
+        await self.reloadAccounts(disablingMirror: enabled ? nil : email)
+      } catch {
+        self.statusMessage = "Could not update mirror setting: \(error.localizedDescription)"
       }
-    } catch {
-      statusMessage = "Could not update mirror setting: \(error.localizedDescription)"
     }
+  }
+
+  private func isSecondary(_ email: String) -> Bool {
+    selectedAccount.map { $0.email != email } ?? false
   }
 
   open func mirrorItem(for record: TransferRecord) async -> UploadQueueItem? {
@@ -506,52 +814,44 @@ open class SyncEngine: NSObject {
   }
 
   public func addAccountFromOAuthToken(_ token: String) async throws {
-    let hadPrimary = (selectedAccount != nil)
-    if !hadPrimary {
-      accountGeneration += 1
-      cancelLostNetworkRetry()
-      if isRunning {
-        workerPool.cancel()
-        workerPool.abortAlbumUpdates()
-        await workerPool.waitForCurrentBatch()
-      }
-    }
-    let account = try await authService.addAccountFromOAuthToken(token)
-    await loadAccounts()
-    if !hadPrimary {
-      await ingestSharedQueueItems()
-    }
-    statusMessage = "Added \(account.email)"
+    try await addAccount { try await self.authService.addAccountFromOAuthToken(token) }
   }
 
   public func addAccountFromRawCredential(_ raw: String) async throws {
-    let hadPrimary = (selectedAccount != nil)
-    if !hadPrimary {
-      accountGeneration += 1
-      cancelLostNetworkRetry()
-      if isRunning {
-        workerPool.cancel()
-        workerPool.abortAlbumUpdates()
-        await workerPool.waitForCurrentBatch()
+    try await addAccount { try await self.authService.addAccountWithRawCredential(raw) }
+  }
+
+  /// Signing in takes as long as the network does, and usually adds a secondary or fails:
+  /// the primary works on until the account saved turns out to be its own.
+  func addAccount(_ save: @escaping @MainActor () async throws -> GoogleAccount) async throws {
+    let result: Result<Bool, any Error> = await withAccountTransition(keepingPrimary: selectedAccount != nil) {
+      let hadPrimary = self.selectedAccount != nil
+      do {
+        let account = try await save()
+        await self.reloadAccounts()
+        if self.credentialError == nil { self.statusMessage = "Added \(account.email)" }
+        return .success(!hadPrimary)
+      } catch {
+        return .failure(error)
       }
     }
-    let account = try await authService.addAccountWithRawCredential(raw)
-    await loadAccounts()
-    if !hadPrimary {
-      await ingestSharedQueueItems()
-    }
-    statusMessage = "Added \(account.email)"
+    if try result.get() { await ingestSharedQueueItems() }
   }
 
   public func ingestSharedQueueItems() async {
+    guard !replaysAfterAccountChange(("sharedQueue", { [weak self] in await self?.ingestSharedQueueItems() })),
+      canUseSelectedAccount
+    else { return }
     guard !isIngestingSharedQueue else {
       sharedIngestionRequested = true
       return
     }
     isIngestingSharedQueue = true
+    let generation = accountGeneration
     defer {
       isIngestingSharedQueue = false
-      if sharedIngestionRequested {
+      // A pass an account change cut short may have left items behind.
+      if sharedIngestionRequested || isChangingAccount || accountGeneration != generation {
         sharedIngestionRequested = false
         Task { @MainActor [weak self] in
           await self?.ingestSharedQueueItems()
@@ -559,10 +859,13 @@ open class SyncEngine: NSObject {
       }
     }
 
+    if let ingestSharedQueue {
+      await ingestSharedQueue()
+      return
+    }
     guard let accountEmail = selectedAccount?.email else { return }
     await removeCompletedSharedEntries()
-    guard !Task.isCancelled else { return }
-    let generation = accountGeneration
+    guard !Task.isCancelled, canUseSelectedAccount, accountGeneration == generation else { return }
     let entries = await Self.loadSharedEntries()
     guard !Task.isCancelled else { return }
     let current = await manifestStore.allRecords()
@@ -964,7 +1267,8 @@ open class SyncEngine: NSObject {
   }
 
   public func skipFailedRecords(_ ids: [String]) async {
-    _ = await manifestStore.skipFailed(ids: ids)
+    guard canUseSelectedAccount, let email = selectedAccount?.email else { return }
+    _ = await manifestStore.skipFailed(ids: ids.filter { TransferRecord.accountEmail(fromScopedID: $0) == email })
     await refreshRecords()
   }
 
@@ -982,8 +1286,14 @@ open class SyncEngine: NSObject {
   /// Items a batch cut short left pending, which no scan queues (files picked for upload, say,
   /// or anything while Auto-Sync is off), as one claim and one batch. A claim only takes an item
   /// still unfinished, so one that went up in the meantime is left as it is.
-  public func requeuePendingRecords(where shouldRequeue: (TransferRecord) -> Bool) async {
-    guard let account = selectedAccount, allowsAutomaticUploads else { return }
+  public func requeuePendingRecords(
+    named name: String = "requeue", where shouldRequeue: @escaping (TransferRecord) -> Bool
+  ) async {
+    let wake: AccountWake = (
+      name, { [weak self] in await self?.requeuePendingRecords(named: name, where: shouldRequeue) }
+    )
+    guard !replaysAfterAccountChange(wake) else { return }
+    guard canUseSelectedAccount, let account = selectedAccount, allowsAutomaticUploads else { return }
     let generation = accountGeneration
     let prefix = "\(account.email)|"
     let pending = await manifestStore.allRecords().filter {
@@ -991,7 +1301,7 @@ open class SyncEngine: NSObject {
     }
     guard !pending.isEmpty else { return }
     let items = await queueItems(forPending: pending)
-    guard accountGeneration == generation, allowsAutomaticUploads else { return }
+    guard !replaysAfterAccountChange(wake), accountGeneration == generation, allowsAutomaticUploads else { return }
     // One the running batch still holds (waiting on its iCloud download, say) goes up with
     // the next pass: claimed now, the batch would skip it as already tracked and strand it.
     let free = items.filter { !workerPool.hasItem(id: $0.id) }
@@ -1000,7 +1310,7 @@ open class SyncEngine: NSObject {
     await refreshRecords()
     guard !claimed.isEmpty else { return }
     workerPool.setConcurrency(settings.uploadThreads)
-    guard accountGeneration == generation, allowsAutomaticUploads,
+    guard !replaysAfterAccountChange(wake), accountGeneration == generation, allowsAutomaticUploads,
       workerPool.start(items: claimed, quality: 3, accountEmail: account.email) != .rejected
     else {
       for item in claimed { await manifestStore.releaseUploadClaim(id: item.id) }
@@ -1017,11 +1327,9 @@ open class SyncEngine: NSObject {
   open func queueItems(forPending records: [TransferRecord]) async -> [UploadQueueItem] { [] }
 
   open func requeueRecord(_ record: TransferRecord) async {
-    guard let account = selectedAccount,
-      record.id.hasPrefix("\(account.email)|"),
-      let url = await existingFileURLAsync(for: record)
-    else { return }
+    guard canUseSelectedAccount, let account = selectedAccount, record.id.hasPrefix("\(account.email)|") else { return }
     let generation = accountGeneration
+    guard let url = await existingFileURLAsync(for: record), accountGeneration == generation, canUseSelectedAccount else { return }
     let item = UploadQueueItem(
       id: record.id,
       fileURL: url,

@@ -17,9 +17,10 @@ struct MacFoldersView: View {
       if !store.folders.isEmpty {
         Section {
           ForEach(store.folders) { folder in
+            let state = state(of: folder)
             FolderRow(
               folder: folder,
-              state: state(of: folder),
+              state: state,
               onToggle: { store.setFolderEnabled(id: folder.id, isEnabled: $0) },
               onChooseAgain: {
                 folderToRegrant = folder
@@ -31,7 +32,7 @@ struct MacFoldersView: View {
             .contextMenu {
               Button("Sync Now") { store.requestSyncNow() }
                 .disabled(!store.canSync)
-              if [.needsAccess, .notWatched].contains(state(of: folder)) {
+              if [.needsAccess, .notWatched].contains(state) {
                 Button("Choose Again…") {
                   folderToRegrant = folder
                   router.isAddingFolder = true
@@ -337,10 +338,14 @@ private struct StatusDotLabelStyle: LabelStyle {
 }
 
 /// `path` with the user's home shown as `~`. The sandbox redirects `NSHomeDirectory()`
-/// into the container, so this reads the real home.
+/// into the container.
+let realHomeDirectory: String = {
+  guard let home = getpwuid(getuid())?.pointee.pw_dir else { return NSHomeDirectory() }
+  return String(cString: home)
+}()
+
 func abbreviatedHomePath(_ path: String) -> String {
-  guard let home = getpwuid(getuid())?.pointee.pw_dir else { return (path as NSString).abbreviatingWithTildeInPath }
-  let prefix = String(cString: home)
+  let prefix = realHomeDirectory
   if path == prefix { return "~" }
   return path.hasPrefix(prefix + "/") ? "~" + path.dropFirst(prefix.count) : path
 }

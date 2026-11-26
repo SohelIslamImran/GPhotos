@@ -75,6 +75,10 @@ public enum SharedQueueBridge {
   }
 
   private static func withQueueLock<T>(_ body: () throws -> T) throws -> T {
+    try SuspensionGuard.run { try lockedRun(body) }
+  }
+
+  private static func lockedRun<T>(_ body: () throws -> T) throws -> T {
     let lockURL = queueURL.appendingPathExtension("lock")
     let descriptor = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
     guard descriptor >= 0 else {
@@ -219,10 +223,14 @@ public enum SharedQueueBridge {
   }
 
   public static func postItemsAddedNotification() {
+    postDarwinNotification(named: AppGroupConstants.shareItemsAddedNotification)
+  }
+
+  static func postDarwinNotification(named name: String) {
     let center = CFNotificationCenterGetDarwinNotifyCenter()
     CFNotificationCenterPostNotification(
       center,
-      CFNotificationName(AppGroupConstants.shareItemsAddedNotification as CFString),
+      CFNotificationName(name as CFString),
       nil,
       nil,
       true
@@ -230,6 +238,10 @@ public enum SharedQueueBridge {
   }
 
   public static func observeItemsAdded(handler: @escaping @Sendable () -> Void) -> UnsafeMutableRawPointer {
+    observeDarwinNotification(named: AppGroupConstants.shareItemsAddedNotification, handler: handler)
+  }
+
+  static func observeDarwinNotification(named name: String, handler: @escaping @Sendable () -> Void) -> UnsafeMutableRawPointer {
     let token = ObserverToken(handler: handler)
     let pointer = Unmanaged.passRetained(token).toOpaque()
     let center = CFNotificationCenterGetDarwinNotifyCenter()
@@ -241,7 +253,7 @@ public enum SharedQueueBridge {
         let token = Unmanaged<ObserverToken>.fromOpaque(observer).takeUnretainedValue()
         token.handler()
       },
-      AppGroupConstants.shareItemsAddedNotification as CFString,
+      name as CFString,
       nil,
       .deliverImmediately
     )

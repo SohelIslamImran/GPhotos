@@ -49,6 +49,7 @@ public struct IndexedFace: Sendable, Equatable, Identifiable {
   public let featurePrint: Data
   public var person: Int64?
   public var quality: Double = 1
+  public var buckets: [Int64] = []
 }
 
 public struct Person: Sendable, Equatable, Identifiable {
@@ -63,10 +64,34 @@ public struct Person: Sendable, Equatable, Identifiable {
 /// scores. One database for the device; Google Photos items are keyed by their thumbnail
 /// id, so switching accounts keeps the device's analysis.
 public actor LibraryIndexStore {
+  static let didPurgeCloudIndex = Notification.Name("GooglePhotosIndexDidPurge")
+
+  public struct NamedPerson: Sendable, Equatable, Identifiable {
+    public let id: Int64
+    public let name: String
+    public let photoCount: Int
+  }
+
+  struct LabelVocabulary: Sendable {
+    let labels: [String]
+    let labelSet: Set<String>
+    let labelWords: Set<String>
+
+    init(labels: [String]) {
+      self.labels = labels
+      self.labelSet = Set(labels)
+      self.labelWords = Set(labels.flatMap { SearchVocabulary.tokens($0) })
+    }
+  }
+
   private let url: URL
   private var database: SQLiteDatabase?
-  /// Every distinct label, read once and dropped when items are written.
-  private var labelCache: [String]?
+  /// Distinct labels and their tokenized words, read once and dropped when items are written.
+  private var labelCache: LabelVocabulary?
+  private var peopleVersionCache: Int64?
+  private var peopleClusteringVersionCache: Int64?
+  private var peopleCleanVersionCache: Int64?
+  private var analysisWriteVersionCounter: Int64 = 0
   /// Bumped when analysis changes, so old results are redone.
   public static let analysisVersion = 9
   /// How the stored faces' prints were made. Prints made another way can't be compared
@@ -86,6 +111,8 @@ public actor LibraryIndexStore {
   func db() throws -> SQLiteDatabase {
     if let database { return database }
     let database = try SQLiteDatabase(url: url)
+    // Text deleted for a locked photo is overwritten, not only unlinked.
+    try database.query("PRAGMA secure_delete = ON") { _ in }
     var version = 0
     try database.query("PRAGMA user_version") { version = Int($0.int(0)) }
     if version != Self.schemaVersion {
@@ -115,10 +142,15 @@ public actor LibraryIndexStore {
         PRAGMA user_version = \(Self.schemaVersion);
         """)
     }
+    // Without it, FTS5 keeps a deleted row's words in its segments until they merge.
+    try database.execute("INSERT INTO search (search, rank) VALUES ('secure-delete', 1)")
     try Self.createSiriTables(in: database)
     try database.execute(
       "CREATE TABLE IF NOT EXISTS resource_hashes (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, digest BLOB, checked_at REAL NOT NULL)")
+    try database.execute(
+      "CREATE TABLE IF NOT EXISTS resource_sizes (id TEXT PRIMARY KEY, version TEXT NOT NULL, bytes INTEGER NOT NULL)")
     try database.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    try database.execute("CREATE INDEX IF NOT EXISTS faces_person_quality ON faces (person, quality DESC, face)")
     var faceModel: String?
     try database.query("SELECT value FROM meta WHERE key = 'face_model'") { faceModel = $0.text(0) }
     if faceModel != Self.faceModel {
@@ -127,11 +159,98 @@ public actor LibraryIndexStore {
         try database.run("DELETE FROM people")
         try database.run(
           "INSERT OR REPLACE INTO meta (key, value) VALUES ('face_model', ?)", [.text(Self.faceModel)])
+        try database.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('people_version', '0')")
+        try database.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('people_clustering_version', '0')")
+        try database.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('people_clean_version', '0')")
       }
+      peopleVersionCache = 0
+      peopleClusteringVersionCache = 0
+      peopleCleanVersionCache = 0
     }
     self.database = database
     return database
   }
+
+  private func ensurePeopleVersions(in database: SQLiteDatabase) throws -> (dirty: Int64, clustering: Int64, clean: Int64) {
+    if let dirty = peopleVersionCache, let clustering = peopleClusteringVersionCache, let clean = peopleCleanVersionCache {
+      return (dirty, clustering, clean)
+    }
+    var dirtyText: String?
+    var clusteringText: String?
+    var cleanText: String?
+    try database.query(
+      "SELECT key, value FROM meta WHERE key IN ('people_version', 'people_clustering_version', 'people_clean_version')"
+    ) { row in
+      switch row.text(0) {
+      case "people_version": dirtyText = row.text(1)
+      case "people_clustering_version": clusteringText = row.text(1)
+      case "people_clean_version": cleanText = row.text(1)
+      default: break
+      }
+    }
+    let dirty: Int64
+    let clustering: Int64
+    let clean: Int64
+    if let parsed = dirtyText.flatMap(Int64.init) {
+      dirty = parsed
+      clustering = clusteringText.flatMap(Int64.init) ?? parsed
+      clean = cleanText.flatMap(Int64.init) ?? 0
+    } else {
+      // Databases created before version tracking start dirty once if they already hold faces.
+      var hasFaces = false
+      try database.query("SELECT 1 FROM faces LIMIT 1") { _ in hasFaces = true }
+      dirty = hasFaces ? 1 : 0
+      clustering = dirty
+      clean = 0
+    }
+    peopleVersionCache = dirty
+    peopleClusteringVersionCache = clustering
+    peopleCleanVersionCache = clean
+    return (dirty, clustering, clean)
+  }
+
+  private func bumpPeopleVersion(in database: SQLiteDatabase, needsClustering: Bool = true) throws {
+    let versions = try ensurePeopleVersions(in: database)
+    let nextDirty = versions.dirty &+ 1
+    try database.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('people_version', ?)", [.text(String(nextDirty))])
+    peopleVersionCache = nextDirty
+    if needsClustering {
+      let nextClustering = versions.clustering &+ 1
+      try database.run(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('people_clustering_version', ?)", [.text(String(nextClustering))])
+      peopleClusteringVersionCache = nextClustering
+    }
+  }
+
+  /// Monotonically increases whenever faces or people metadata (names, hidden state) change;
+  /// Spotlight uses this to refresh people and photo entity names.
+  public func peopleDirtyVersion() throws -> Int64 {
+    try ensurePeopleVersions(in: try db()).dirty
+  }
+
+  /// Monotonically increases only when faces or cluster membership change and clustering/merging
+  /// must run again.
+  public func peopleClusteringVersion() throws -> Int64 {
+    try ensurePeopleVersions(in: try db()).clustering
+  }
+
+  public func needsPeoplePass() throws -> Bool {
+    let versions = try ensurePeopleVersions(in: try db())
+    return versions.clustering != versions.clean
+  }
+
+  public func markPeopleClean(version: Int64) throws {
+    let database = try db()
+    let versions = try ensurePeopleVersions(in: database)
+    let target = min(version, versions.clustering)
+    guard target != versions.clean else { return }
+    try database.run(
+      "INSERT OR REPLACE INTO meta (key, value) VALUES ('people_clean_version', ?)", [.text(String(target))])
+    peopleCleanVersionCache = target
+  }
+
+  /// Incremented on every write, prune or rekey affecting analyzed rows.
+  public func analysisWriteVersion() -> Int64 { analysisWriteVersionCounter }
 
   #if DEBUG
     /// For tests: records another face model, as an older build would have.
@@ -141,6 +260,41 @@ public actor LibraryIndexStore {
   #endif
 
   // MARK: Writing
+
+  func recentResourceHashChecks(now: Date = Date()) throws -> [String: (fingerprint: String, digest: Data?)] {
+    var hashes: [String: (fingerprint: String, digest: Data?)] = [:]
+    try db().query(
+      "SELECT id, fingerprint, digest FROM resource_hashes WHERE length(digest) = 20 OR checked_at > ?",
+      [.double(now.timeIntervalSince1970 - 86400)]
+    ) { row in
+      if let id = row.text(0), let fingerprint = row.text(1) {
+        hashes[id] = (fingerprint, row.blob(2).flatMap { $0.count == 20 ? $0 : nil })
+      }
+    }
+    return hashes
+  }
+
+  func resourceSizes() throws -> [String: LocalAssetHashes.ResourceSize] {
+    var sizes: [String: LocalAssetHashes.ResourceSize] = [:]
+    try db().query("SELECT id, version, bytes FROM resource_sizes") { row in
+      if let id = row.text(0), let version = row.text(1) {
+        sizes[id] = .init(version: version, bytes: row.int(2))
+      }
+    }
+    return sizes
+  }
+
+  func saveResourceSizes(_ sizes: [String: LocalAssetHashes.ResourceSize]) throws {
+    guard !sizes.isEmpty else { return }
+    let database = try db()
+    try database.transaction {
+      for (id, size) in sizes {
+        try database.run(
+          "INSERT OR REPLACE INTO resource_sizes (id, version, bytes) VALUES (?, ?, ?)",
+          [.text(id), .text(size.version), .int(size.bytes)])
+      }
+    }
+  }
 
   func resourceHash(id: String, fingerprint: String, now: Date = Date()) throws -> (digest: Data?, checked: Bool) {
     var result: (digest: Data?, checked: Bool) = (nil, false)
@@ -185,7 +339,10 @@ public actor LibraryIndexStore {
   /// device copy), so suggestion counts, categories and People count only what's there.
   /// Each kind (device, folder `f:`, Google `g:`) is pruned only when its list was loaded.
   @discardableResult
-  public func prune(keeping current: Set<String>, device: Bool, folder: Bool, cloud: Bool) throws -> Int {
+  public func prune(
+    keeping current: Set<String>, device: Bool, folder: Bool, cloud: Bool, source: CloudLibrary? = nil
+  ) throws -> Int {
+    guard source?.isIndexingCurrent != false else { return 0 }
     let database = try db()
     var stale: [(id: String, rowID: Int64)] = []
     try database.query("SELECT id, rowid FROM analyzed") { row in
@@ -196,16 +353,140 @@ public actor LibraryIndexStore {
     guard !stale.isEmpty else { return 0 }
     labelCache = nil
     try database.transaction {
+      var facesChanged = false
       for (id, rowID) in stale {
         let value = SQLiteDatabase.Value.text(id)
+        if !facesChanged {
+          try database.query("SELECT 1 FROM faces WHERE id = ? LIMIT 1", [value]) { _ in facesChanged = true }
+        }
         try database.run("DELETE FROM labels WHERE id = ?", [value])
         try database.run("DELETE FROM search WHERE rowid = ?", [.int(rowID)])
         try database.run("DELETE FROM faces WHERE id = ?", [value])
         try database.run("DELETE FROM prints WHERE id = ?", [value])
         try database.run("DELETE FROM analyzed WHERE id = ?", [value])
       }
+      if facesChanged { try bumpPeopleVersion(in: database) }
     }
+    analysisWriteVersionCounter &+= 1
     return stale.count
+  }
+
+  /// Removes everything kept of these items now: analysis, search text and, in their Siri
+  /// record, all but the id, which tells what is still in Spotlight.
+  func purge(ids: [String]) throws {
+    guard !ids.isEmpty else { return }
+    let database = try db()
+    let list = try SQLiteDatabase.Value.list(ids)
+    let among = "IN (SELECT value FROM json_each(?))"
+    labelCache = nil
+    try database.transaction {
+      var hasFaces = false
+      try database.query("SELECT 1 FROM faces WHERE id \(among) LIMIT 1", [list]) { _ in hasFaces = true }
+      try database.run("DELETE FROM search WHERE rowid IN (SELECT rowid FROM analyzed WHERE id \(among))", [list])
+      for table in ["labels", "faces", "prints", "analyzed"] {
+        try database.run("DELETE FROM \(table) WHERE id \(among)", [list])
+      }
+      try database.run(
+        """
+        UPDATE siri_items SET digest = 0, file_name = '', date = NULL, video = 0, favorite = 0, lat = NULL, lon = NULL,
+          place = '', caption = '', labels = '', content = '', people = '' WHERE id \(among)
+        """, [list])
+      if hasFaces { try bumpPeopleVersion(in: database) }
+    }
+    try database.checkpoint()
+    analysisWriteVersionCounter &+= 1
+  }
+
+  /// An item moved to the Locked Folder while it was being analyzed isn't written back.
+  static func lockedIDs(among ids: some Sequence<String>) -> Set<String> {
+    let keys = Set(ids.lazy.filter { $0.hasPrefix("g:") }.map { String($0.dropFirst(2)) })
+    guard !keys.isEmpty else { return [] }
+    return Set(LockedItems.locked(among: keys).map(LibraryIndexer.searchID(cloudMediaKey:)))
+  }
+
+  func rekeyKnownUnlocked(_ pairs: [(from: String, to: String)], cloud: CloudLibrary) throws {
+    guard !pairs.isEmpty else { return }
+    _ = try db()
+    // Keep the writer's lock short, especially during a large cleanup.
+    for start in stride(from: 0, to: pairs.count, by: 64) {
+      let batch = pairs[start..<min(start + 64, pairs.count)]
+      try cloud.indexLifetime.withLockUnchecked { current in
+        guard current else { return }
+        try LockedItems.withKnownState(for: cloud.accountEmail) { _, locked in
+          let eligible = batch.filter { !locked.contains(String($0.to.dropFirst(2))) }
+          try rekey(eligible)
+        }
+      }
+    }
+  }
+
+  /// Moves on-device pixel analysis from a removed device id to its Google Photos id so
+  /// the Google copy keeps labels, OCR text, aesthetics and faces without re-downloading
+  /// a thumbnail. Skips pairs whose target already has pixel analysis, and drops `prints`
+  /// (Google items carry no feature print by design).
+  @discardableResult
+  func rekey(_ pairs: [(from: String, to: String)]) throws -> Int {
+    guard !pairs.isEmpty else { return 0 }
+    let database = try db()
+    var moved = 0
+    var facesChanged = false
+    try database.transaction {
+      for (from, to) in pairs where from != to {
+        var source: (rowID: Int64, hasPixels: Bool)?
+        try database.query("SELECT rowid, has_pixels FROM analyzed WHERE id = ?", [.text(from)]) { row in
+          source = (row.int(0), row.int(1) != 0)
+        }
+        guard let source, source.hasPixels else { continue }
+
+        var target: (rowID: Int64, hasPixels: Bool)?
+        try database.query("SELECT rowid, has_pixels FROM analyzed WHERE id = ?", [.text(to)]) { row in
+          target = (row.int(0), row.int(1) != 0)
+        }
+        if let target, target.hasPixels { continue }
+
+        var targetMeta = ""
+        if let target {
+          // Preserve metadata words (place, camera, caption) already indexed on a metadata-only target.
+          try database.query("SELECT meta FROM search WHERE rowid = ?", [.int(target.rowID)]) { row in
+            targetMeta = row.text(0) ?? ""
+          }
+          let targetValue = SQLiteDatabase.Value.text(to)
+          try database.run("DELETE FROM labels WHERE id = ?", [targetValue])
+          try database.run("DELETE FROM search WHERE rowid = ?", [.int(target.rowID)])
+          try database.run("DELETE FROM faces WHERE id = ?", [targetValue])
+          try database.run("DELETE FROM prints WHERE id = ?", [targetValue])
+          try database.run("DELETE FROM analyzed WHERE rowid = ?", [.int(target.rowID)])
+        }
+
+        let fromValue = SQLiteDatabase.Value.text(from)
+        let toValue = SQLiteDatabase.Value.text(to)
+        if !facesChanged {
+          try database.query("SELECT 1 FROM faces WHERE id = ? LIMIT 1", [fromValue]) { _ in facesChanged = true }
+        }
+        try database.run("UPDATE analyzed SET id = ? WHERE rowid = ?", [toValue, .int(source.rowID)])
+        try database.run("UPDATE labels SET id = ? WHERE id = ?", [toValue, fromValue])
+        try database.run("UPDATE faces SET id = ? WHERE id = ?", [toValue, fromValue])
+        if !targetMeta.isEmpty {
+          var sourceMeta = ""
+          try database.query("SELECT meta FROM search WHERE rowid = ?", [.int(source.rowID)]) { row in
+            sourceMeta = row.text(0) ?? ""
+          }
+          let mergedMeta = sourceMeta.isEmpty ? targetMeta : sourceMeta + " " + targetMeta
+          try database.run(
+            "UPDATE search SET id = ?, meta = ? WHERE rowid = ?", [toValue, .text(mergedMeta), .int(source.rowID)])
+        } else {
+          try database.run("UPDATE search SET id = ? WHERE rowid = ?", [toValue, .int(source.rowID)])
+        }
+        try database.run("DELETE FROM prints WHERE id = ?", [fromValue])
+        moved += 1
+      }
+      if facesChanged { try bumpPeopleVersion(in: database, needsClustering: false) }
+    }
+    if moved > 0 {
+      labelCache = nil
+      analysisWriteVersionCounter &+= 1
+    }
+    return moved
   }
 
   public struct PhotoScore: Sendable {
@@ -287,25 +568,40 @@ public actor LibraryIndexStore {
   /// Saves many items in one transaction: one commit for hundreds of metadata-only
   /// items instead of one each. With `pixelsPending` the items are searchable by their
   /// metadata now and stay unsettled until their pixels are tried.
-  public func saveAll(_ items: [(metadata: ItemMetadata, analysis: ItemAnalysis?)], pixelsPending: Bool = false) throws {
+  public func saveAll(
+    _ items: [(metadata: ItemMetadata, analysis: ItemAnalysis?)], pixelsPending: Bool = false, cloud: CloudLibrary? = nil
+  ) throws {
+    // Retirement and account eviction use the same lifetime. An eviction queued on
+    // this actor waits for a transaction already writing and rejects anything later.
+    guard cloud?.isIndexingCurrent != false else { return }
+    let locked = Self.lockedIDs(among: items.lazy.map { $0.metadata.id })
+    let items = locked.isEmpty ? items : items.filter { !locked.contains($0.metadata.id) }
     guard !items.isEmpty else { return }
     let database = try db()
     labelCache = nil
     try database.transaction {
+      var facesChanged = false
       for (metadata, analysis) in items {
-        try write(metadata, analysis: analysis, pixelsPending: pixelsPending, in: database)
+        if try write(metadata, analysis: analysis, pixelsPending: pixelsPending, in: database) {
+          facesChanged = true
+        }
       }
+      if facesChanged { try bumpPeopleVersion(in: database) }
     }
+    analysisWriteVersionCounter &+= 1
   }
 
+  /// Returns whether any rows in `faces` were added or removed.
   private func write(
     _ metadata: ItemMetadata, analysis: ItemAnalysis?, pixelsPending: Bool, in database: SQLiteDatabase
-  ) throws {
+  ) throws -> Bool {
     let id = SQLiteDatabase.Value.text(metadata.id)
+    var facesChanged = false
     do {
       var searchRowID: Int64?
       try database.query("SELECT rowid FROM analyzed WHERE id = ?", [id]) { searchRowID = $0.int(0) }
       if let searchRowID {
+        try database.query("SELECT 1 FROM faces WHERE id = ? LIMIT 1", [id]) { _ in facesChanged = true }
         try database.run("DELETE FROM labels WHERE id = ?", [id])
         try database.run("DELETE FROM search WHERE rowid = ?", [.int(searchRowID)])
         try database.run("DELETE FROM faces WHERE id = ?", [id])
@@ -342,7 +638,9 @@ public actor LibraryIndexStore {
       if let print = analysis?.featurePrint {
         try database.run("INSERT OR REPLACE INTO prints (id, data) VALUES (?, ?)", [id, .blob(print)])
       }
-      for face in analysis?.faces ?? [] {
+      let newFaces = analysis?.faces ?? []
+      if !newFaces.isEmpty { facesChanged = true }
+      for face in newFaces {
         let keys = FaceClustering.buckets(face.featurePrint)
         try database.run(
           "INSERT INTO faces (id, x, y, w, h, data, quality, k0, k1, k2, k3) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -352,6 +650,7 @@ public actor LibraryIndexStore {
           ] + (0..<4).map { keys.indices.contains($0) ? .int(keys[$0]) : .null })
       }
     }
+    return facesChanged
   }
 
   /// Vision's labels use underscores ("sea_ocean"); words make them searchable.
@@ -362,6 +661,10 @@ public actor LibraryIndexStore {
   public func removeAll() throws {
     database = nil
     labelCache = nil
+    peopleVersionCache = nil
+    peopleClusteringVersionCache = nil
+    peopleCleanVersionCache = nil
+    analysisWriteVersionCounter &+= 1
     for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(at: URL(filePath: url.path + suffix)) }
   }
 
@@ -461,11 +764,16 @@ public actor LibraryIndexStore {
   }
 
   public func allLabels() throws -> [String] {
+    try labelVocabulary().labels
+  }
+
+  func labelVocabulary() throws -> LabelVocabulary {
     if let labelCache { return labelCache }
     var labels: [String] = []
     try db().query("SELECT DISTINCT label FROM labels") { if let label = $0.text(0) { labels.append(label) } }
-    labelCache = labels
-    return labels
+    let vocabulary = LabelVocabulary(labels: labels)
+    labelCache = vocabulary
+    return vocabulary
   }
 
   public func ids(withLabel label: String, minimumConfidence: Double = 0.5) throws -> [String] {
@@ -522,6 +830,12 @@ public actor LibraryIndexStore {
     return ids
   }
 
+  public func utilityCount() throws -> Int {
+    var count = 0
+    try db().query("SELECT COUNT(*) FROM analyzed WHERE utility = 1") { count = Int($0.int(0)) }
+    return count
+  }
+
   // MARK: Prints, quality and faces
 
   /// Feature prints with capture times, oldest first, for finding similar neighbours.
@@ -563,7 +877,7 @@ public actor LibraryIndexStore {
     let database = try db()
     var seeds: [IndexedFace] = []
     try database.query(
-      "SELECT face, id, x, y, w, h, data, person, quality FROM faces WHERE person IS NULL AND face > ? ORDER BY face LIMIT ?",
+      "SELECT face, id, x, y, w, h, data, person, quality, k0, k1, k2, k3 FROM faces WHERE person IS NULL AND face > ? ORDER BY face LIMIT ?",
       [.int(cursor), .int(Int64(limit))]
     ) { if let face = Self.readFace($0) { seeds.append(face) } }
     return try clusteringCandidates(seeds)
@@ -571,13 +885,18 @@ public actor LibraryIndexStore {
 
   public func peopleForMerging(after person: Int64) throws -> (faces: [IndexedFace], next: Int64)? {
     var seeds: [IndexedFace] = []
+    // Rank only (face, person) over `faces_person_quality` and join back for the 128 winning blobs.
     try db().query(
       """
-      SELECT face, id, x, y, w, h, data, person, quality FROM (
-        SELECT face, id, x, y, w, h, data, person, quality,
-          ROW_NUMBER() OVER (PARTITION BY person ORDER BY quality DESC, face) AS rank
-        FROM faces WHERE person > ?
-      ) WHERE rank = 1 ORDER BY person LIMIT 128
+      WITH winners AS (
+        SELECT face FROM (
+          SELECT face, person, ROW_NUMBER() OVER (PARTITION BY person ORDER BY quality DESC, face) AS rank
+          FROM faces WHERE person > ?
+        ) WHERE rank = 1 ORDER BY person LIMIT 128
+      )
+      SELECT f.face, f.id, f.x, f.y, f.w, f.h, f.data, f.person, f.quality, f.k0, f.k1, f.k2, f.k3
+      FROM faces f JOIN winners w ON w.face = f.face
+      ORDER BY f.person
       """, [.int(person)]
     ) { if let face = Self.readFace($0) { seeds.append(face) } }
     guard let next = seeds.last?.person else { return nil }
@@ -586,28 +905,35 @@ public actor LibraryIndexStore {
 
   private static func readFace(_ row: SQLiteDatabase.Row) -> IndexedFace? {
     guard let id = row.text(1), let data = row.blob(6) else { return nil }
+    let buckets: [Int64]
+    if let k0 = row.optionalInt(9), let k1 = row.optionalInt(10), let k2 = row.optionalInt(11), let k3 = row.optionalInt(12) {
+      buckets = [k0, k1, k2, k3]
+    } else {
+      buckets = []
+    }
     return IndexedFace(
       id: row.int(0), itemID: id,
       rect: CGRect(x: row.double(2), y: row.double(3), width: row.double(4), height: row.double(5)),
-      featurePrint: data, person: row.optionalInt(7), quality: row.double(8))
+      featurePrint: data, person: row.optionalInt(7), quality: row.double(8), buckets: buckets)
   }
 
   private func clusteringCandidates(_ seeds: [IndexedFace]) throws -> [IndexedFace] {
     let database = try db()
     var selected = Dictionary(uniqueKeysWithValues: seeds.map { ($0.id, $0) })
     for seed in seeds {
-      let keys = FaceClustering.buckets(seed.featurePrint)
+      let keys = seed.buckets
       guard keys.count == 4 else { continue }
       var clauses: [String] = []
       var bindings: [SQLiteDatabase.Value] = []
       for index in 0..<4 {
-        let neighbors = [keys[index]] + (0..<10).map { keys[index] ^ (1 << $0) }
+        let key = keys[index]
         // Each bucket is capped before anything is ranked or a print is read, so a crowded
         // bucket costs at most a few hundred index entries.
         clauses.append(
-          "SELECT face FROM (SELECT face FROM faces WHERE k\(index) IN (\(Array(repeating: "?", count: 11).joined(separator: ","))) "
+          "SELECT face FROM (SELECT face FROM faces WHERE k\(index) IN (?,?,?,?,?,?,?,?,?,?,?) "
             + "AND person IS NOT NULL LIMIT 256)")
-        bindings += neighbors.map { .int($0) }
+        bindings.append(.int(key))
+        for bit in 0..<10 { bindings.append(.int(key ^ (1 << bit))) }
       }
       try database.query(
         """
@@ -617,7 +943,7 @@ public actor LibraryIndexStore {
           FROM faces f WHERE f.face IN (SELECT face FROM hits)
         ),
         chosen AS (SELECT face FROM ranked WHERE rank <= 5 ORDER BY quality DESC, face LIMIT 64)
-        SELECT face, id, x, y, w, h, data, person, quality FROM faces WHERE face IN (SELECT face FROM chosen)
+        SELECT face, id, x, y, w, h, data, person, quality, k0, k1, k2, k3 FROM faces WHERE face IN (SELECT face FROM chosen)
         """,
         bindings
       ) { if let face = Self.readFace($0) { selected[face.id] = face } }
@@ -631,6 +957,33 @@ public actor LibraryIndexStore {
       if let name = $0.text(1) { names[$0.int(0)] = name }
     }
     return names
+  }
+
+  public func personName(id person: Int64) throws -> String? {
+    var name: String?
+    try db().query("SELECT name FROM people WHERE person = ? AND hidden = 0", [.int(person)]) {
+      name = $0.text(0)
+    }
+    return name
+  }
+
+  /// Visible named people with their distinct photo counts, without ranking face covers.
+  public func namedPeople() throws -> [NamedPerson] {
+    var result: [NamedPerson] = []
+    try db().query(
+      """
+      SELECT p.person, p.name, COUNT(DISTINCT f.id) AS n
+      FROM people p JOIN faces f ON f.person = p.person
+      WHERE p.hidden = 0 AND p.name IS NOT NULL AND p.name != ''
+      GROUP BY p.person
+      HAVING n >= 1
+      ORDER BY n DESC, p.person
+      """
+    ) { row in
+      guard let name = row.text(1) else { return }
+      result.append(NamedPerson(id: row.int(0), name: name, photoCount: Int(row.int(2))))
+    }
+    return result
   }
 
   /// Re-check the complete membership, including faces outside the reference shortlist.
@@ -662,6 +1015,7 @@ public actor LibraryIndexStore {
         try Self.move(source, into: target, keepingHidden: true, in: database)
         merged = true
       }
+      if merged { try bumpPeopleVersion(in: database) }
     }
     return merged
   }
@@ -681,6 +1035,7 @@ public actor LibraryIndexStore {
       }
       guard found == 2 else { return }
       try Self.move(source, into: target, keepingHidden: false, in: database)
+      try bumpPeopleVersion(in: database)
       merged = true
     }
     return merged
@@ -721,7 +1076,12 @@ public actor LibraryIndexStore {
           "UPDATE faces SET person = ? WHERE face = ? AND NOT EXISTS (SELECT 1 FROM faces other WHERE other.person = ? AND other.id = faces.id AND other.face != faces.face)",
           [.int(person), .int(face), .int(person)])
       }
-      try database.run("INSERT OR IGNORE INTO people (person) SELECT DISTINCT person FROM faces WHERE person IS NOT NULL")
+      for person in Set(assignments.values) {
+        try database.run(
+          "INSERT OR IGNORE INTO people (person) SELECT ? WHERE EXISTS (SELECT 1 FROM faces WHERE person = ?)",
+          [.int(person), .int(person)])
+      }
+      try bumpPeopleVersion(in: database)
     }
   }
 
@@ -738,14 +1098,20 @@ public actor LibraryIndexStore {
       """
       WITH counts AS (
         SELECT person, COUNT(DISTINCT id) AS n FROM faces WHERE person IS NOT NULL GROUP BY person
+      ), eligible AS (
+        SELECT p.person, p.name, c.n
+        FROM people p JOIN counts c ON c.person = p.person
+        WHERE p.hidden = 0 AND (c.n >= ? OR p.name IS NOT NULL)
       ), covers AS (
-        SELECT face, id, x, y, w, h, person,
-          ROW_NUMBER() OVER (PARTITION BY person ORDER BY quality DESC, w * h DESC, face) AS rank
-        FROM faces WHERE person IN (SELECT person FROM counts)
+        SELECT f.face, f.person,
+          ROW_NUMBER() OVER (PARTITION BY f.person ORDER BY f.quality DESC, f.w * f.h DESC, f.face) AS rank
+        FROM faces f JOIN eligible e ON e.person = f.person
       )
-      SELECT p.person, p.name, c.n, v.face, v.id, v.x, v.y, v.w, v.h
-      FROM people p JOIN counts c ON c.person = p.person JOIN covers v ON v.person = p.person AND v.rank = 1
-      WHERE p.hidden = 0 AND (c.n >= ? OR p.name IS NOT NULL) ORDER BY c.n DESC, p.person
+      SELECT e.person, e.name, e.n, f.face, f.id, f.x, f.y, f.w, f.h
+      FROM eligible e
+      JOIN covers v ON v.person = e.person AND v.rank = 1
+      JOIN faces f ON f.face = v.face
+      ORDER BY e.n DESC, e.person
       """, [.int(Int64(minimumFaces))]
     ) { row in
       let person = row.int(0)
@@ -774,11 +1140,16 @@ public actor LibraryIndexStore {
     let database = try db()
     try database.transaction {
       try database.run("UPDATE people SET name = ? WHERE person = ?", [.optional(name), .int(person)])
+      try bumpPeopleVersion(in: database, needsClustering: false)
     }
   }
 
   public func hide(person: Int64) throws {
-    try db().run("UPDATE people SET hidden = 1 WHERE person = ?", [.int(person)])
+    let database = try db()
+    try database.transaction {
+      try database.run("UPDATE people SET hidden = 1 WHERE person = ?", [.int(person)])
+      try bumpPeopleVersion(in: database, needsClustering: false)
+    }
   }
 
   /// People names as extra search words for each item.

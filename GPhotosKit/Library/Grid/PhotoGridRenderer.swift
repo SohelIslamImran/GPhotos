@@ -10,6 +10,7 @@ public protocol PhotoGridDataSource: AnyObject {
   var thumbnailSource: any ThumbnailSource { get }
   var thumbnailRevision: Int { get }
   func itemID(at index: Int) -> String
+  func thumbnailIdentity(at index: Int) -> ThumbnailIdentity
   func badges(at index: Int) -> PhotoGridBadges
   func accessibilityLabel(at index: Int) -> String
   /// Width over height of the full item, when known (grid thumbnails may be cropped).
@@ -20,6 +21,7 @@ public protocol PhotoGridDataSource: AnyObject {
 
 extension PhotoGridDataSource {
   public var thumbnailRevision: Int { 0 }
+  public func thumbnailIdentity(at index: Int) -> ThumbnailIdentity { ThumbnailIdentity(id: itemID(at: index)) }
   public func aspectRatio(at index: Int) -> CGFloat? { nil }
   public func entityID(at index: Int) -> String? { nil }
 }
@@ -62,7 +64,10 @@ public final class PhotoGridRenderer {
   public private(set) var layout: PhotoGridLayout
   public weak var dataSource: (any PhotoGridDataSource)? {
     didSet {
-      if dataSource !== oldValue { thumbnailRevision = dataSource?.thumbnailRevision ?? 0 }
+      if dataSource !== oldValue {
+        stopCaching()
+        thumbnailRevision = dataSource?.thumbnailRevision ?? 0
+      }
     }
   }
   private var thumbnailRevision = 0
@@ -117,6 +122,10 @@ public final class PhotoGridRenderer {
   private var visible: [Int: PhotoGridCellLayer] = [:]
   private var pool: [PhotoGridCellLayer] = []
   private var cachingRange: Range<Int> = 0..<0
+  private var warmed: [Int: ThumbnailCachingTarget] = [:]
+  private var reconnectObserver: (any NSObjectProtocol)?
+  private var warmCacheObserver: (any NSObjectProtocol)?
+  private var lockObserver: (any NSObjectProtocol)?
   private var cachingBucket: ThumbnailBucket?
   /// Pre-decoding waits for a new layout to settle, so a pinch through several column
   /// counts only warms the one it ends on.
@@ -125,9 +134,10 @@ public final class PhotoGridRenderer {
   /// A dense grid holds hundreds of cells a screen; past this, only the nearest are warmed.
   private static let maxCached = 500
   private var lastRect: CGRect = .zero
+  private var lastWanted: Range<Int>?
+  private var layoutGlideUntil: CFTimeInterval = 0
   private var liveScale: (scale: CGFloat, point: CGPoint)?
-  /// Cells kept their larger images through a pinch to smaller ones.
-  private var needsRefreshWhenSettled = false
+  private var isZoomSettling = false
   /// Cells gliding off screen after a column change, reused once the glide ends.
   private var leaving: [Int: PhotoGridCellLayer] = [:]
   private var leavingCleanup: Task<Void, Never>?
@@ -143,16 +153,61 @@ public final class PhotoGridRenderer {
   private var revealGeneration = 0
   /// Whether the cells are drawn: false while they wait for their first images.
   public var isShowing: Bool { !isRevealPending }
+
+  private var reportedPixels = false
+
+  func hasPixels(in rect: CGRect) -> Bool {
+    isShowing && visible.values.contains { !$0.isHidden && $0.contents != nil && $0.frame.intersects(rect) }
+  }
+  /// Every cell has its final image, not the small one that stands in for it.
+  func hasAllPixels(in rect: CGRect) -> Bool {
+    isShowing && !visible.isEmpty
+      && !visible.values.contains {
+        !$0.isHidden && $0.frame.intersects(rect) && $0.isWaiting
+      }
+  }
   /// Called when cells held back for their first images are drawn.
   public var onReveal: (() -> Void)?
   private var hasShownCells = false
-  private static let revealTimeout: Duration = .milliseconds(300)
+  /// Drawn with the small images that stand in for them, cells would sharpen one by one.
+  private static let revealTimeout: Duration = .milliseconds(250)
 
   public init(pipeline: ThumbnailPipeline = .shared) {
     self.pipeline = pipeline
     self.layout = PhotoGridLayout(columns: 4, width: 0, itemCount: 0)
     contentLayer.actions = PhotoGridCellLayer.noActions
     contentLayer.anchorPoint = .zero
+    reconnectObserver = NotificationCenter.default.addObserver(
+      forName: NetworkStatusMonitor.didReconnect, object: nil, queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated { self?.retryVisibleMisses() }
+    }
+    warmCacheObserver = NotificationCenter.default.addObserver(
+      forName: ThumbnailPipeline.didClearWarmCache, object: nil, queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated { self?.stopCaching() }
+    }
+    lockObserver = NotificationCenter.default.addObserver(
+      forName: LockedItems.didLock, object: nil, queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated { self?.clearLockedCells() }
+    }
+  }
+
+  isolated deinit {
+    stopCaching()
+    if let reconnectObserver { NotificationCenter.default.removeObserver(reconnectObserver) }
+    if let warmCacheObserver { NotificationCenter.default.removeObserver(warmCacheObserver) }
+    if let lockObserver { NotificationCenter.default.removeObserver(lockObserver) }
+  }
+
+  /// Moved to the Locked Folder: gone from the screen at once, before the rows change.
+  private func clearLockedCells() {
+    for cell in Array(visible.values) + Array(leaving.values) + vanishing where cell.thumbnailIdentity?.isLocked == true {
+      cell.cancelImageRequest()
+      cell.contents = nil
+      cell.isStale = false
+    }
   }
 
   public var bucket: ThumbnailBucket { .forPixelSide(layout.itemSide * displayScale) }
@@ -161,10 +216,11 @@ public final class PhotoGridRenderer {
   /// one transform while the fingers move; nothing is laid out again until a column count
   /// is reached. Cells are filled in past the edges a scale below 1 reveals.
   public func setLiveScale(_ scale: CGFloat, about point: CGPoint, visibleRect: CGRect) {
+    let beginsScale = liveScale == nil
     liveScale = (scale, point)
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    contentLayer.removeAnimation(forKey: "transform")
+    if beginsScale { contentLayer.removeAnimation(forKey: "transform") }
     contentLayer.transform = Self.transform(scale: scale, about: point)
     CATransaction.commit()
     update(visibleRect: visibleRect)
@@ -184,7 +240,7 @@ public final class PhotoGridRenderer {
       contentLayer.add(spring, forKey: "transform")
     }
     CATransaction.commit()
-    update(visibleRect: visibleRect)
+    update(visibleRect: visibleRect, atRest: true)
   }
 
   /// Applies a new layout. With `animated`, every cell glides from where it is on screen
@@ -192,10 +248,9 @@ public final class PhotoGridRenderer {
   /// and cells leaving glide out before they're reused, so pinching between column counts
   /// moves the whole grid as one. `shift` is how far the content offset moves with it.
   public func setLayout(
-    _ newLayout: PhotoGridLayout, visibleRect: CGRect, animated: Bool = false, shift: CGFloat = 0
+    _ newLayout: PhotoGridLayout, visibleRect: CGRect, animated: Bool = false, shift: CGFloat = 0,
+    populate: Bool = true
   ) {
-    let oldBucket = bucket
-    let newBucket = ThumbnailBucket.forPixelSide(newLayout.itemSide * displayScale)
     let oldLayout = layout
     // Where the cells are on screen now (mid-animation, or under a live scale), in the new
     // content coordinates.
@@ -206,51 +261,60 @@ public final class PhotoGridRenderer {
       return scaled.offsetBy(dx: 0, dy: shift)
     }
     layout = newLayout
+    lastWanted = nil
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     contentLayer.bounds = CGRect(x: 0, y: 0, width: newLayout.width, height: newLayout.contentHeight)
     contentLayer.removeAnimation(forKey: "transform")
     contentLayer.transform = CATransform3DIdentity
-    if animated, let dataSource {
+    if animated, let dataSource, !visibleRect.isEmpty {
       let wanted = newLayout.indices(in: visibleRect.insetBy(dx: 0, dy: -newLayout.itemSide))
-      // Cells still gliding out of the last change can be the ones wanted now.
-      for (index, cell) in leaving where visible[index] == nil && wanted.contains(index) {
-        visible[index] = cell
-        leaving[index] = nil
+      isZoomSettling = true
+      let now = CACurrentMediaTime()
+      let isGliding = now < layoutGlideUntil
+      layoutGlideUntil = now + Self.spring(keyPath: "position").duration
+      // An exit gets one glide. A later pinch step can reclaim its bitmap if it comes back.
+      for (index, cell) in leaving {
+        if visible[index] == nil, wanted.contains(index) {
+          visible[index] = cell
+        } else {
+          recycle(cell)
+        }
       }
-      var moves: [(PhotoGridCellLayer, CGRect, CGRect)] = []
-      for (index, cell) in leaving where index < newLayout.itemCount {
-        moves.append((cell, start(cell.presentation()?.frame ?? cell.frame), newLayout.frame(at: index)))
-      }
+      leaving.removeAll(keepingCapacity: true)
       for (index, cell) in visible {
-        guard index < newLayout.itemCount else { continue }
-        moves.append((cell, start(cell.presentation()?.frame ?? cell.frame), newLayout.frame(at: index)))
+        guard index < newLayout.itemCount else {
+          visible[index] = nil
+          recycle(cell)
+          continue
+        }
+        let from = start((isGliding ? cell.presentation()?.frame : nil) ?? cell.frame)
+        Self.glide(cell, from: from, to: newLayout.frame(at: index))
         if !wanted.contains(index) {
+          cell.cancelImageRequest()
           visible[index] = nil
           leaving[index] = cell
         }
       }
-      // Cells already on screen ask for sharper images only when they grow; shrinking,
-      // what they show is sharp enough until the pinch settles.
-      if newBucket > oldBucket { refreshImages() }
-      for index in wanted where visible[index] == nil {
-        let cell = dequeue()
-        applySelection(to: cell, at: index)
-        cell.apply(badges: dataSource.badges(at: index), scale: displayScale)
-        visible[index] = cell
-        load(cell, at: index, dataSource: dataSource)
-        moves.append((cell, start(oldLayout.frame(at: index)), newLayout.frame(at: index)))
+      for index in wanted {
+        if let cell = visible[index] {
+          if cell.contents == nil, cell.requestState == .missing {
+            load(cell, at: index, dataSource: dataSource)
+          }
+          continue
+        }
+        let cell = addCell(at: index, dataSource: dataSource)
+        Self.glide(cell, from: start(oldLayout.frame(at: index)), to: newLayout.frame(at: index))
       }
-      for (cell, from, to) in moves { Self.glide(cell, from: from, to: to) }
+      lastWanted = wanted
       scheduleLeavingCleanup()
-      if newBucket < oldBucket { needsRefreshWhenSettled = true }
-    } else {
+    } else if populate {
       for (index, cell) in visible where index < newLayout.itemCount {
         cell.removeAllAnimations()
         cell.removeBadgeAnimations()
         cell.frame = newLayout.frame(at: index)
       }
-      if newBucket != oldBucket { refreshImages() }
+      refreshImages()
     }
     CATransaction.commit()
     stopCaching()
@@ -259,21 +323,24 @@ public final class PhotoGridRenderer {
       try? await Task.sleep(for: Self.cachingSettle)
       guard !Task.isCancelled, let self else { return }
       self.cachingResume = nil
-      if self.needsRefreshWhenSettled {
-        self.needsRefreshWhenSettled = false
+      if self.isZoomSettling {
+        self.isZoomSettling = false
         self.refreshImages()
       }
-      if let dataSource = self.dataSource {
+      if let dataSource = self.dataSource, !self.lastRect.isEmpty, !self.isScrollingFast, self.liveScale == nil {
         self.updateCaching(around: self.lastRect, velocity: 0, dataSource: dataSource)
       }
     }
-    update(visibleRect: visibleRect)
+    if populate { update(visibleRect: visibleRect) }
   }
 
   /// Everything changed (new library contents): every cell is rebuilt.
   public func reloadData(visibleRect: CGRect) {
-    for (_, cell) in visible { recycle(cell) }
-    visible.removeAll()
+    isDetached = false
+    lastWanted = nil
+    for cell in visible.values { recycle(cell) }
+    visible.removeAll(keepingCapacity: true)
+    clearExitingCells()
     stopCaching()
     update(visibleRect: visibleRect)
   }
@@ -295,9 +362,10 @@ public final class PhotoGridRenderer {
         recycle(cell)
       }
     }
-    visible.removeAll()
-    for (_, cell) in leaving { recycle(cell) }
-    leaving.removeAll()
+    visible.removeAll(keepingCapacity: true)
+    lastWanted = nil
+    clearExitingCells()
+    stopCaching()
     isDetached = true
     return cells
   }
@@ -307,53 +375,65 @@ public final class PhotoGridRenderer {
   /// shrinks away, as in Photos. `shift` is how far the content offset moved meanwhile.
   /// When most of what's on screen changed (another filter or account), it's a plain
   /// reload instead.
-  func reloadData(visibleRect: CGRect, previous: [String: PhotoGridCellLayer], shift: CGFloat) {
+  func reloadData(visibleRect: CGRect, previous: [String: PhotoGridCellLayer], shift: CGFloat, animated: Bool = true) {
     isDetached = false
-    guard let dataSource, !previous.isEmpty else {
+    guard let dataSource, !visibleRect.isEmpty, !previous.isEmpty else {
       for (_, cell) in previous { recycle(cell) }
       return reloadData(visibleRect: visibleRect)
     }
     var previous = previous
     let wanted = layout.indices(in: visibleRect.insetBy(dx: 0, dy: -layout.itemSide))
-    let ids = wanted.map { dataSource.itemID(at: $0) }
-    guard ids.count(where: { previous[$0] != nil }) * 2 >= min(ids.count, previous.count) else {
+      .clamped(to: 0..<dataSource.itemCount)
+    let identities = wanted.map { dataSource.thumbnailIdentity(at: $0) }
+    guard identities.count(where: { previous[$0.id] != nil }) * 2 >= min(identities.count, previous.count) else {
       for (_, cell) in previous { recycle(cell) }
       return reloadData(visibleRect: visibleRect)
     }
     CATransaction.begin()
     CATransaction.setDisableActions(true)
-    for (index, id) in zip(wanted, ids) {
+    for (index, identity) in zip(wanted, identities) {
+      let id = identity.id
       let to = layout.frame(at: index)
       if let cell = previous.removeValue(forKey: id) {
-        Self.glide(cell, from: cell.frame.offsetBy(dx: 0, dy: shift), to: to)
+        if animated { Self.glide(cell, from: cell.frame.offsetBy(dx: 0, dy: shift), to: to) } else { cell.frame = to }
         cell.isHidden = hiddenID == id
         applySelection(to: cell, at: index)
         cell.apply(badges: dataSource.badges(at: index), scale: displayScale)
         visible[index] = cell
+        if cell.requestedBucket != bucket || cell.thumbnailIdentity != identity || identity.isLocked {
+          cell.cancelImageRequest()
+          load(cell, at: index, dataSource: dataSource, identity: identity)
+        }
       } else {
         let cell = dequeue()
         cell.frame = to
         applySelection(to: cell, at: index)
         cell.apply(badges: dataSource.badges(at: index), scale: displayScale)
         visible[index] = cell
-        load(cell, at: index, dataSource: dataSource)
+        load(cell, at: index, dataSource: dataSource, identity: identity)
         cell.isHidden = hiddenID == id
-        Self.pop(cell, appearing: true)
+        if animated { Self.pop(cell, appearing: true) }
       }
     }
     for (_, cell) in previous {
-      cell.frame = cell.frame.offsetBy(dx: 0, dy: shift)
-      Self.pop(cell, appearing: false)
-      vanishing.append(cell)
+      if animated, cell.thumbnailIdentity?.isLocked != true {
+        cell.cancelImageRequest()
+        cell.frame = cell.frame.offsetBy(dx: 0, dy: shift)
+        Self.pop(cell, appearing: false)
+        vanishing.append(cell)
+      } else {
+        recycle(cell)
+      }
     }
     CATransaction.commit()
+    lastWanted = wanted
+    layoutGlideUntil = CACurrentMediaTime() + Self.spring(keyPath: "position").duration
     scheduleLeavingCleanup()
-    stopCaching()
     update(visibleRect: visibleRect)
   }
 
   private func holdUntilImagesArrive() {
-    guard visible.values.contains(where: { $0.contents == nil }) else { return }
+    guard visible.values.contains(where: \.isWaiting) else { return }
     isRevealPending = true
     revealGeneration &+= 1
     let generation = revealGeneration
@@ -369,8 +449,17 @@ public final class PhotoGridRenderer {
     }
   }
 
+  private func reportImageArrival() {
+    let wasShowing = isShowing
+    revealIfReady()
+    if !reportedPixels, hasPixels(in: lastRect) {
+      reportedPixels = true
+      if wasShowing { onReveal?() }
+    }
+  }
+
   private func revealIfReady() {
-    guard isRevealPending, !visible.values.contains(where: { $0.contents == nil }) else { return }
+    guard isRevealPending, !visible.values.contains(where: \.isWaiting) else { return }
     reveal()
   }
 
@@ -387,41 +476,55 @@ public final class PhotoGridRenderer {
   /// Lays out the cells for `visibleRect` (in content coordinates). `velocity` is in
   /// points per second; above about three screens a second images load only from cache
   /// and PhotoKit's fast format, and full thumbnails follow once scrolling slows.
-  public func update(visibleRect: CGRect, velocity: CGFloat = 0) {
+  public func update(visibleRect: CGRect, velocity: CGFloat = 0, atRest: Bool = false) {
     guard let dataSource, !isDetached else { return }
+    guard !visibleRect.isEmpty, layout.width > 0 else {
+      lastRect = .zero
+      stopCaching()
+      return
+    }
     let visibleRect = liveScale.map { Self.rect(visibleRect, unscaledBy: $0.scale, about: $0.point) } ?? visibleRect
     lastRect = visibleRect
-    let fast = abs(velocity) > max(visibleRect.height, 1) * 3
+    // Near the cutoff, frame-time jitter should not start and stop sharp requests each row.
+    let fast = abs(velocity) > max(visibleRect.height, 1) * (isScrollingFast ? 2 : 3)
     let settled = isScrollingFast && !fast
     isScrollingFast = fast
 
     let wanted = layout.indices(in: visibleRect.insetBy(dx: 0, dy: -layout.itemSide))
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    for (index, cell) in visible where !wanted.contains(index) || index >= dataSource.itemCount {
-      visible[index] = nil
-      recycle(cell)
+      .clamped(to: 0..<dataSource.itemCount)
+    if wanted != lastWanted {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      if let lastWanted {
+        for removed in Self.subtract(lastWanted, wanted) {
+          for index in removed {
+            if let cell = visible.removeValue(forKey: index) { recycle(cell) }
+          }
+        }
+        for added in Self.subtract(wanted, lastWanted) {
+          for index in added { _ = addCell(at: index, dataSource: dataSource) }
+        }
+      } else {
+        for (index, cell) in visible where !wanted.contains(index) {
+          visible[index] = nil
+          recycle(cell)
+        }
+        for index in wanted where visible[index] == nil { _ = addCell(at: index, dataSource: dataSource) }
+      }
+      CATransaction.commit()
+      lastWanted = wanted
     }
-    for index in wanted where visible[index] == nil {
-      let cell = dequeue()
-      cell.frame = layout.frame(at: index)
-      applySelection(to: cell, at: index)
-      cell.apply(badges: dataSource.badges(at: index), scale: displayScale)
-      visible[index] = cell
-      load(cell, at: index, dataSource: dataSource)
-      cell.isHidden = hiddenID != nil && cell.itemID == hiddenID
-    }
-    CATransaction.commit()
     // An emptied grid (another account, a filter) holds its next first screen too.
-    if dataSource.itemCount == 0 { hasShownCells = false }
+    if dataSource.itemCount == 0 {
+      reportedPixels = false
+      hasShownCells = false
+    }
     if !hasShownCells, !visible.isEmpty {
       hasShownCells = true
       holdUntilImagesArrive()
     }
-    // Images straight from the cache arrive during the pass; a held grid shows once every
-    // cell in it has one.
-    revealIfReady()
-    if settled { refreshImages() }
+    reportImageArrival()
+    if settled || atRest, !isZoomSettling, liveScale == nil { refreshImages() }
     if !fast, cachingResume == nil, liveScale == nil { updateCaching(around: visibleRect, velocity: velocity, dataSource: dataSource) }
   }
 
@@ -452,6 +555,15 @@ public final class PhotoGridRenderer {
     }
   }
 
+  // A lock can arrive before the merged rows, or while a removed cell is animating out.
+  func hasLockedPixels(in rect: CGRect) -> Bool {
+    func isLocked(_ cell: PhotoGridCellLayer) -> Bool {
+      cell.contents != nil && cell.frame.intersects(rect) && cell.thumbnailIdentity?.isLocked == true
+    }
+    return visible.values.contains(where: isLocked) || leaving.values.contains(where: isLocked)
+      || vanishing.contains(where: isLocked)
+  }
+
   /// The layer drawing `index`, while it's on screen (for context menu previews).
   public func cellLayer(at index: Int) -> CALayer? { visible[index] }
 
@@ -470,9 +582,8 @@ public final class PhotoGridRenderer {
   func refreshThumbnailSourceIfNeeded(visibleRect: CGRect) {
     guard let dataSource, dataSource.thumbnailRevision != thumbnailRevision else { return }
     thumbnailRevision = dataSource.thumbnailRevision
-    stopCaching()
-    refreshImages()
-    updateCaching(around: visibleRect, velocity: 0, dataSource: dataSource)
+    refreshImages(checkIdentities: true)
+    updateCaching(around: visibleRect, velocity: 0, dataSource: dataSource, refreshTargets: true)
   }
 
   public func refreshBadges() {
@@ -488,65 +599,148 @@ public final class PhotoGridRenderer {
   public func tearDown() {
     for (_, cell) in visible { recycle(cell) }
     visible.removeAll()
-    for (_, cell) in leaving { recycle(cell) }
-    leaving.removeAll()
-    for cell in vanishing { recycle(cell) }
-    vanishing.removeAll()
-    leavingCleanup?.cancel()
+    lastWanted = nil
+    clearExitingCells()
     cachingResume?.cancel()
     cachingResume = nil
     stopCaching()
   }
 
-  private func load(_ cell: PhotoGridCellLayer, at index: Int, dataSource: any PhotoGridDataSource) {
-    let key = ThumbnailKey(id: dataSource.itemID(at: index), bucket: bucket)
-    cell.itemID = key.id
-    if let image = pipeline.placeholder(for: key) {
-      cell.setImage(image)
-      if pipeline.cachedImage(for: key) != nil { return }
+  private func addCell(at index: Int, dataSource: any PhotoGridDataSource) -> PhotoGridCellLayer {
+    if let cell = leaving.removeValue(forKey: index) {
+      cell.removeAllAnimations()
+      cell.removeBadgeAnimations()
+      cell.frame = layout.frame(at: index)
+      visible[index] = cell
+      applySelection(to: cell, at: index)
+      if cell.requestState == .missing || cell.requestedBucket != bucket {
+        load(cell, at: index, dataSource: dataSource)
+      }
+      return cell
     }
-    let quality: ImageRequestQuality = isScrollingFast ? .fast : .thumbnail
-    // A fast request is never final for the bucket, so it isn't cached as one.
-    let requestKey = isScrollingFast ? ThumbnailKey(id: key.id, bucket: .tiny) : key
-    cell.ticket = pipeline.load(requestKey, from: dataSource.thumbnailSource, quality: quality) {
-      [weak self, weak cell] image, _ in
-      guard let cell, cell.itemID == key.id else { return }
+    let cell = dequeue()
+    cell.frame = layout.frame(at: index)
+    applySelection(to: cell, at: index)
+    cell.apply(badges: dataSource.badges(at: index), scale: displayScale)
+    visible[index] = cell
+    load(cell, at: index, dataSource: dataSource)
+    cell.isHidden = hiddenID != nil && cell.itemID == hiddenID
+    return cell
+  }
+
+  private func load(
+    _ cell: PhotoGridCellLayer, at index: Int, dataSource: any PhotoGridDataSource, identity: ThumbnailIdentity? = nil
+  ) {
+    let identity = identity ?? dataSource.thumbnailIdentity(at: index)
+    // The same item's newer pixels replace the old ones once they're here.
+    let keepsPixels =
+      cell.contents != nil && !identity.isLocked && cell.thumbnailIdentity?.isLocked == false
+      && cell.thumbnailIdentity?.id == identity.id && cell.thumbnailIdentity?.accountEmail == identity.accountEmail
+    if keepsPixels {
+      if cell.thumbnailIdentity != identity { cell.isStale = true }
+    } else if cell.thumbnailIdentity != identity || identity.isLocked {
+      cell.contents = nil
+      cell.isStale = false
+    }
+    cell.thumbnailIdentity = identity
+    let key = ThumbnailKey(identity: identity, bucket: bucket)
+    cell.itemID = key.id
+    cell.requestedBucket = key.bucket
+    if let image = pipeline.cachedImage(for: key) {
       cell.setImage(image)
-      self?.revealIfReady()
+      cell.requestQuality = .thumbnail
+      cell.requestState = .ready
+      reportImageArrival()
+      return
+    }
+    if cell.contents == nil, let image = pipeline.placeholder(for: key) { cell.setImage(image) }
+
+    let quick = isScrollingFast || isZoomSettling || liveScale != nil
+    let quality: ImageRequestQuality = quick ? .fast : .thumbnail
+    let requestKey = quick ? ThumbnailKey(identity: identity, bucket: .tiny) : key
+    cell.requestQuality = quality
+    cell.requestState = .pending
+    let ticket = pipeline.load(
+      requestKey, from: dataSource.thumbnailSource, quality: quality,
+      onUnavailable: { [weak self, weak cell] in
+        cell?.requestState = .missing
+        cell?.ticket = nil
+        self?.reportImageArrival()
+        if let cell, cell.isStale, cell.thumbnailIdentity == identity {
+          cell.contents = nil
+          cell.isStale = false
+        }
+      },
+      handler: { [weak self, weak cell] image, isFinal in
+        guard let cell, cell.thumbnailIdentity == identity else { return }
+        if (isFinal && (!quick || cell.isStale)) || cell.contents == nil {
+          cell.setImage(image)
+          self?.reportImageArrival()
+        }
+        if isFinal {
+          cell.requestState = .ready
+          cell.ticket = nil
+          self?.reportImageArrival()
+        }
+      })
+    if cell.requestState == .pending { cell.ticket = ticket }
+  }
+
+  /// Reuse matching work and keep the pixels on screen while a new bucket loads.
+  private func refreshImages(checkIdentities: Bool = false) {
+    guard let dataSource else { return }
+    let bucket = self.bucket
+    let quick = isScrollingFast || isZoomSettling || liveScale != nil
+    for (index, cell) in visible where index < dataSource.itemCount {
+      let identity = checkIdentities ? dataSource.thumbnailIdentity(at: index) : cell.thumbnailIdentity
+      guard
+        cell.thumbnailIdentity != identity || cell.requestState == .missing || cell.requestedBucket != bucket
+          || (!quick && cell.requestQuality == .fast)
+      else { continue }
+      cell.cancelImageRequest()
+      load(cell, at: index, dataSource: dataSource, identity: checkIdentities ? identity : nil)
     }
   }
 
-  /// Visible cells ask again at the current bucket, keeping what they show meanwhile.
-  private func refreshImages() {
-    guard let dataSource else { return }
-    for (index, cell) in visible {
-      cell.ticket?.cancel()
+  private func retryVisibleMisses() {
+    guard !isDetached, !isScrollingFast, !isZoomSettling, liveScale == nil, let dataSource else { return }
+    for (index, cell) in visible where index < dataSource.itemCount && cell.requestState == .missing {
       load(cell, at: index, dataSource: dataSource)
     }
   }
 
+  private func clearExitingCells() {
+    leavingCleanup?.cancel()
+    leavingCleanup = nil
+    for cell in leaving.values { recycle(cell) }
+    leaving.removeAll(keepingCapacity: true)
+    for cell in vanishing { recycle(cell) }
+    vanishing.removeAll(keepingCapacity: true)
+  }
+
   private func scheduleLeavingCleanup() {
     leavingCleanup?.cancel()
+    guard !leaving.isEmpty || !vanishing.isEmpty else { return }
     leavingCleanup = Task { [weak self] in
-      try? await Task.sleep(for: .seconds(Self.glideDuration + 0.05))
+      try? await Task.sleep(for: .seconds(Self.spring(keyPath: "position").duration))
       guard !Task.isCancelled, let self else { return }
       CATransaction.begin()
       CATransaction.setDisableActions(true)
-      for (_, cell) in self.leaving { self.recycle(cell) }
-      for cell in self.vanishing { self.recycle(cell) }
+      self.clearExitingCells()
       CATransaction.commit()
-      self.leaving.removeAll()
-      self.vanishing.removeAll()
     }
   }
 
-  /// Critically damped, as the system's own zooms are.
-  private static func spring(keyPath: String) -> CASpringAnimation {
-    let spring = CASpringAnimation(perceptualDuration: glideDuration, bounce: 0)
-    spring.keyPath = keyPath
-    spring.duration = spring.settlingDuration
-    return spring
-  }
+  /// Core Animation copies the configured spring when it is added to a layer.
+  private static let springs: [String: CASpringAnimation] = Dictionary(
+    uniqueKeysWithValues: ["position", "bounds.size", "opacity", "transform"].map { keyPath in
+      let spring = CASpringAnimation(perceptualDuration: glideDuration, bounce: 0)
+      spring.keyPath = keyPath
+      spring.duration = spring.settlingDuration
+      return (keyPath, spring)
+    })
+
+  private static func spring(keyPath: String) -> CASpringAnimation { springs[keyPath]! }
 
   /// Sets `to` as the cell's frame and animates there from `from`. Cells are anchored at
   /// their origin, so position and size animate independently.
@@ -622,7 +816,9 @@ public final class PhotoGridRenderer {
 
   /// PhotoKit pre-decodes a window two screens ahead in the scroll direction and half a
   /// screen behind; only the cells entering or leaving the window are sent.
-  private func updateCaching(around rect: CGRect, velocity: CGFloat, dataSource: any PhotoGridDataSource) {
+  private func updateCaching(
+    around rect: CGRect, velocity: CGFloat, dataSource: any PhotoGridDataSource, refreshTargets: Bool = false
+  ) {
     let ahead = rect.height * 2
     let behind = rect.height * 0.5
     let window =
@@ -639,29 +835,60 @@ public final class PhotoGridRenderer {
         : max(range.lowerBound, shown.upperBound - count)..<shown.upperBound
     }
     let bucket = self.bucket
-    let source = dataSource.thumbnailSource
     if cachingBucket != bucket {
       stopCaching()
       cachingBucket = bucket
     }
-    let added = Self.subtract(range, cachingRange)
-    let removed = Self.subtract(cachingRange, range)
+    guard refreshTargets || range != cachingRange else { return }
+    let source = dataSource.thumbnailSource
+    var removed: [ThumbnailCachingTarget] = []
+    for indices in Self.subtract(cachingRange, range) {
+      for index in indices {
+        if let target = warmed.removeValue(forKey: index) { removed.append(target) }
+      }
+    }
+    var added: [ThumbnailCachingTarget] = []
+    let toCheck = refreshTargets ? [range] : Self.subtract(range, cachingRange)
+    for indices in toCheck {
+      for index in indices.clamped(to: 0..<dataSource.itemCount) {
+        let previous = warmed[index]
+        let target = source.cachingTarget(for: dataSource.itemID(at: index))
+        if previous?.id == target?.id,
+          previous.map({ ObjectIdentifier($0.source) }) == target.map({ ObjectIdentifier($0.source) })
+        {
+          continue
+        }
+        if let previous { removed.append(previous) }
+        if let target { added.append(target) }
+        warmed[index] = target
+      }
+    }
     cachingRange = range
-    let count = dataSource.itemCount
-    let ids = { (ranges: [Range<Int>]) in ranges.flatMap { $0.clamped(to: 0..<count) }.map(dataSource.itemID(at:)) }
-    let addedIDs = ids(added)
-    let removedIDs = ids(removed)
-    if !removedIDs.isEmpty { source.stopCaching(ids: removedIDs, pixelSize: bucket.pixelSize) }
-    if !addedIDs.isEmpty { source.startCaching(ids: addedIDs, pixelSize: bucket.pixelSize) }
+    for group in Self.grouped(removed) {
+      group.source.stopCaching(ids: group.ids, pixelSize: bucket.pixelSize)
+    }
+    for group in Self.grouped(added) {
+      group.source.startCaching(ids: group.ids, pixelSize: bucket.pixelSize)
+    }
   }
 
   private func stopCaching() {
-    if let cachingBucket, let source = dataSource?.thumbnailSource, !cachingRange.isEmpty {
-      let count = dataSource?.itemCount ?? 0
-      let ids = cachingRange.clamped(to: 0..<count).compactMap { dataSource?.itemID(at: $0) }
-      source.stopCaching(ids: ids, pixelSize: cachingBucket.pixelSize)
+    if let cachingBucket {
+      for group in Self.grouped(warmed.values) {
+        group.source.stopCaching(ids: group.ids, pixelSize: cachingBucket.pixelSize)
+      }
     }
+    warmed.removeAll(keepingCapacity: true)
     cachingRange = 0..<0
+    cachingBucket = nil
+  }
+
+  private static func grouped(_ work: some Sequence<ThumbnailCachingTarget>) -> [(source: any ThumbnailSource, ids: [String])] {
+    var grouped: [ObjectIdentifier: (source: any ThumbnailSource, ids: [String])] = [:]
+    for target in work {
+      grouped[ObjectIdentifier(target.source), default: (target.source, [])].ids.append(target.id)
+    }
+    return Array(grouped.values)
   }
 
   nonisolated static func subtract(_ lhs: Range<Int>, _ rhs: Range<Int>) -> [Range<Int>] {

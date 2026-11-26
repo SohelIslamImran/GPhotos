@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import NaturalLanguage
 import Observation
 import Photos
@@ -32,34 +33,102 @@ public final class LibraryIndexer {
   /// (quick when nothing is new) brings Siri's people and photos up to date.
   public func peopleDidChange() {
     contentRevision &+= 1
-    if let lastSnapshot { schedule(lastSnapshot) }
+    peopleSignal &+= 1
+    if let lastPass { schedule(lastPass) }
   }
-  @ObservationIgnored private var lastSnapshot: UnifiedLibraryModel.IndexSnapshot?
+
+  private struct ScheduledPass: Sendable {
+    let snapshot: UnifiedLibraryModel.IndexSnapshot
+    let libraryReloadToken: Int
+    let libraryBadgeToken: Int
+    let deviceReloadToken: Int
+    let deviceBadgeToken: Int
+    let cloudRevision: Int
+    let cloudLocalCopyRevision: Int
+    let cloudInitialSyncDone: Bool
+    let cloudIsSyncing: Bool
+    let localAssets: [String: String]
+    let localFiles: [String: FolderItemInfo]
+
+    var spotlightContext: SiriSpotlightIndexer.SyncContext {
+      SiriSpotlightIndexer.SyncContext(
+        libraryReloadToken: libraryReloadToken, deviceReloadToken: deviceReloadToken,
+        deviceBadgeToken: deviceBadgeToken, cloudRevision: cloudRevision)
+    }
+  }
+
+  private struct StructuralFingerprint: Equatable, Sendable {
+    let libraryReloadToken: Int
+    let deviceReloadToken: Int
+    let cloud: ObjectIdentifier?
+    let cloudRevision: Int
+    let cloudLocalCopyRevision: Int
+    let cloudInitialSyncDone: Bool
+    let cloudIsSyncing: Bool
+    let isComplete: Bool
+    let isFiltered: Bool
+    let allowsCloudAnalysis: Bool
+  }
+
+  private struct PassFingerprint: Equatable, Sendable {
+    let structural: StructuralFingerprint
+    let libraryBadgeToken: Int
+    let deviceBadgeToken: Int
+    let peopleSignal: Int
+  }
+
+  @ObservationIgnored private var lastPass: ScheduledPass?
+  @ObservationIgnored private var peopleSignal = 0
+  @ObservationIgnored private var lastCompletedFingerprint: PassFingerprint?
+  @ObservationIgnored private var lastCompletedAt = ContinuousClock.now
   /// When people were last grouped during a pass.
   @ObservationIgnored private var lastPeopleUpdate = ContinuousClock.now
   @ObservationIgnored public let store: LibraryIndexStore
   /// Brought up to date after each pass, for Siri.
   @ObservationIgnored private let spotlight: SiriSpotlightIndexer?
   @ObservationIgnored private var task: Task<Void, Never>?
-  @ObservationIgnored private var pendingSnapshot: UnifiedLibraryModel.IndexSnapshot?
+  @ObservationIgnored private var pendingPass: ScheduledPass?
   @ObservationIgnored private var searchPeopleRevision = -1
-  @ObservationIgnored private var searchPeopleCache: [Person] = []
+  @ObservationIgnored private var searchPeopleCache: [LibraryIndexStore.NamedPerson] = []
 
   nonisolated static let thumbnailSide: CGFloat = 512
 
   public init(store: LibraryIndexStore = SiriLibrary.shared.store, spotlight: SiriSpotlightIndexer? = SiriLibrary.shared.spotlight) {
     self.store = store
     self.spotlight = spotlight
-    // Google Photos items left waiting for Wi-Fi are picked up when it's back.
+    // Google Photos items waiting for Wi-Fi or Low Data Mode to turn off pick back up automatically.
     networkTask = Task { [weak self] in
       for await _ in NotificationCenter.default.notifications(named: NetworkStatusMonitor.didReconnect).map({ _ in () }) {
         guard let self else { return }
-        if let lastSnapshot = self.lastSnapshot { self.schedule(lastSnapshot) }
+        if let lastPass = self.lastPass { self.schedule(lastPass) }
+      }
+    }
+    constrainedTask = Task { [weak self] in
+      for await _ in NotificationCenter.default.notifications(named: NetworkStatusMonitor.didChangeConstrained).map({ _ in () }) {
+        guard let self else { return }
+        if Self.allowsCloudAnalysis(), let lastPass = self.lastPass { self.schedule(lastPass) }
+      }
+    }
+    purgeTask = Task { [weak self] in
+      for await _ in NotificationCenter.default.notifications(named: LibraryIndexStore.didPurgeCloudIndex, object: store)
+        .map({ _ in () })
+      {
+        guard let self else { return }
+        self.contentRevision &+= 1
       }
     }
   }
 
+  isolated deinit {
+    task?.cancel()
+    networkTask?.cancel()
+    constrainedTask?.cancel()
+    purgeTask?.cancel()
+  }
+
   @ObservationIgnored private var networkTask: Task<Void, Never>?
+  @ObservationIgnored private var constrainedTask: Task<Void, Never>?
+  @ObservationIgnored private var purgeTask: Task<Void, Never>?
 
   public var isIndexing: Bool {
     if case .indexing = state { return true }
@@ -73,13 +142,26 @@ public final class LibraryIndexer {
 
   public func update(from library: UnifiedLibraryModel) {
     let snapshot = library.indexSnapshot()
-    lastSnapshot = snapshot
-    schedule(snapshot)
+    let cloud = library.cloud?.library
+    let pass = ScheduledPass(
+      snapshot: snapshot,
+      libraryReloadToken: library.reloadToken,
+      libraryBadgeToken: library.badgeToken,
+      deviceReloadToken: library.device.reloadToken,
+      deviceBadgeToken: library.device.badgeToken,
+      cloudRevision: cloud?.revision ?? 0,
+      cloudLocalCopyRevision: cloud?.localCopyRevision ?? 0,
+      cloudInitialSyncDone: cloud?.syncState.initialSyncDone ?? false,
+      cloudIsSyncing: cloud?.isSyncing ?? false,
+      localAssets: cloud?.localAssetIDs ?? [:],
+      localFiles: cloud?.localFiles ?? [:])
+    lastPass = pass
+    schedule(pass)
   }
 
-  private func schedule(_ snapshot: UnifiedLibraryModel.IndexSnapshot) {
+  private func schedule(_ pass: ScheduledPass) {
     guard task == nil else {
-      pendingSnapshot = snapshot
+      pendingPass = pass
       return
     }
     let isFirstRun = !hasRun
@@ -88,11 +170,11 @@ public final class LibraryIndexer {
       // At launch the grid's first thumbnails come first: indexing reads the same
       // PhotoKit cache and the same main actor.
       if isFirstRun { try? await Task.sleep(for: .seconds(3)) }
-      var next: UnifiedLibraryModel.IndexSnapshot? = pendingSnapshot ?? snapshot
+      var next: ScheduledPass? = pendingPass ?? pass
       while let current = next, !Task.isCancelled {
-        pendingSnapshot = nil
+        pendingPass = nil
         await run(current)
-        next = pendingSnapshot
+        next = pendingPass
       }
       task = nil
     }
@@ -105,14 +187,22 @@ public final class LibraryIndexer {
   struct WorkItem: Sendable {
     let id: String
     let metadata: ItemMetadata
-    /// The asset to analyze; nil indexes metadata only.
+    /// The device asset to analyze (with feature print); nil when not a primary device row.
     let assetID: String?
-    /// The Google Photos thumbnail to analyze, for an item that isn't on the device.
+    /// A local backed-up folder file to decode directly instead of downloading from Google.
+    var file: FolderItemInfo?
+    /// A known local PhotoKit copy for a cloud row, decoded locally without feature print.
+    var localAssetID: String?
+    /// The Google Photos thumbnail to analyze, for an item that isn't on the device or whose
+    /// local file couldn't be read.
     var cloud: RemoteThumbnailID?
   }
 
   /// Work for items not yet settled in the index. Words are built only for those.
-  nonisolated static func workItems(_ snapshot: UnifiedLibraryModel.IndexSnapshot, settled: Set<String>) -> [WorkItem] {
+  nonisolated static func workItems(
+    _ snapshot: UnifiedLibraryModel.IndexSnapshot, settled: Set<String>,
+    localAssets: [String: String] = [:], localFiles: [String: FolderItemInfo] = [:]
+  ) -> [WorkItem] {
     let words = DateWords()
     var items: [WorkItem] = []
     for entry in snapshot.entries {
@@ -139,24 +229,41 @@ public final class LibraryIndexer {
           fileWords.append(contentsOf: name.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
         }
         items.append(WorkItem(id: file.id, metadata: ItemMetadata(id: file.id, date: file.date, words: fileWords), assetID: nil))
-      case .cloud(let index), .folder(_, cloud: .some(let index)):
+      case .folder(let folderIndex, cloud: .some(let cloudIndex)):
+        guard snapshot.cloud.indices.contains(cloudIndex) else { continue }
+        let item = snapshot.cloud[cloudIndex]
+        let id = searchID(cloudMediaKey: item.mediaKey)
+        guard !settled.contains(id) else { continue }
+        let localFile = snapshot.folder.indices.contains(folderIndex) ? snapshot.folder[folderIndex] : localFiles[item.mediaKey]
+        items.append(
+          WorkItem(
+            id: id, metadata: cloudMetadata(item, id: id, words: words), assetID: nil,
+            file: localFile,
+            cloud: RemoteThumbnailID(mediaKey: item.mediaKey, contentVersion: item.contentVersion)))
+      case .cloud(let index):
         guard snapshot.cloud.indices.contains(index) else { continue }
         let item = snapshot.cloud[index]
         let id = searchID(cloudMediaKey: item.mediaKey)
         guard !settled.contains(id) else { continue }
-        var itemWords = words(item.takenAt)
-        itemWords.append(item.kind == .video ? "video" : "photo")
-        itemWords.append(
-          contentsOf: item.fileName.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
-        if item.isFavorite { itemWords.append("favorite") }
-        itemWords.append("google")
         items.append(
           WorkItem(
-            id: id, metadata: ItemMetadata(id: id, date: item.takenAt, words: itemWords), assetID: nil,
+            id: id, metadata: cloudMetadata(item, id: id, words: words), assetID: nil,
+            file: localFiles[item.mediaKey],
+            localAssetID: localAssets[item.mediaKey],
             cloud: RemoteThumbnailID(mediaKey: item.mediaKey, contentVersion: item.contentVersion)))
       }
     }
     return items
+  }
+
+  private nonisolated static func cloudMetadata(_ item: RemoteItemSummary, id: String, words: DateWords) -> ItemMetadata {
+    var itemWords = words(item.takenAt)
+    itemWords.append(item.kind == .video ? "video" : "photo")
+    itemWords.append(
+      contentsOf: item.fileName.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init))
+    if item.isFavorite { itemWords.append("favorite") }
+    itemWords.append("google")
+    return ItemMetadata(id: id, date: item.takenAt, words: itemWords)
   }
 
   /// The index key of every item in the library, as `workItems` keys them.
@@ -177,6 +284,54 @@ public final class LibraryIndexer {
 
   /// The index key of a Google Photos item.
   public nonisolated static func searchID(cloudMediaKey: String) -> String { "g:" + cloudMediaKey }
+
+  /// Pairs `(from, to)` moving analysis from confirmed-deleted device/folder items to their
+  /// Google Photos ids for the browsed account.
+  nonisolated static func rekeyPairs(for records: [TransferRecord], accountEmail: String) -> [(from: String, to: String)] {
+    var pairs: [(from: String, to: String)] = []
+    var seen = Set<String>()
+    for record in records where record.resourceRole == .primary {
+      guard let mediaKey = record.mediaKeysByAccount[accountEmail], !mediaKey.isEmpty else { continue }
+      let target = searchID(cloudMediaKey: mediaKey)
+      if let assetID = record.assetLocalIdentifier, !assetID.isEmpty {
+        if seen.insert(assetID).inserted { pairs.append((from: assetID, to: target)) }
+      } else if let sourcePath = record.sourcePath, !sourcePath.isEmpty {
+        let rawID = FolderItemInfo.idPrefix + sourcePath
+        if seen.insert(rawID).inserted { pairs.append((from: rawID, to: target)) }
+        let standardized = TransferManifestStore.standardizedPath(sourcePath)
+        let standardizedID = FolderItemInfo.idPrefix + standardized
+        if standardizedID != rawID, seen.insert(standardizedID).inserted {
+          pairs.append((from: standardizedID, to: target))
+        }
+      }
+    }
+    return pairs
+  }
+
+  /// Call after deletion succeeds. The caller never waits on the mirror or index.
+  @discardableResult
+  public static func scheduleRekeyDeleted(
+    _ records: [TransferRecord], cloud: CloudLibrary, store: LibraryIndexStore = SiriLibrary.shared.store
+  ) -> Task<Void, Never>? {
+    guard !records.isEmpty, !cloud.isRetired else { return nil }
+    return Task(priority: .utility) {
+      await rekeyDeleted(records, cloud: cloud, store: store)
+    }
+  }
+
+  private static func rekeyDeleted(
+    _ records: [TransferRecord], cloud: CloudLibrary, store: LibraryIndexStore
+  ) async {
+    let email = cloud.accountEmail
+    guard !cloud.isRetired, LockedItems.isKnown(accountEmail: email) else { return }
+    let pairs = await Task.detached(priority: .utility) {
+      rekeyPairs(for: records, accountEmail: email)
+    }.value
+    let keys = pairs.map { String($0.to.dropFirst(2)) }
+    guard let visible = try? await cloud.store.visibleMediaKeys(in: keys), !cloud.isRetired else { return }
+    let confirmed = zip(pairs, keys).filter { visible.contains($0.1) }.map { $0.0 }
+    try? await store.rekeyKnownUnlocked(confirmed, cloud: cloud)
+  }
 
   /// Month, weekday and year words in English and the current language, from symbol
   /// tables built once instead of a date format per item.
@@ -210,40 +365,86 @@ public final class LibraryIndexer {
     }
   }
 
-  private func run(_ snapshot: UnifiedLibraryModel.IndexSnapshot) async {
+  private func run(_ pass: ScheduledPass) async {
+    await spotlight?.waitForAccountEviction()
+    let snapshot = pass.snapshot
+    guard snapshot.cloudLibrary?.isIndexingCurrent != false else { return }
+    let networkAllowed = Self.allowsCloudAnalysis()
+    let fingerprint = PassFingerprint(
+      structural: StructuralFingerprint(
+        libraryReloadToken: pass.libraryReloadToken,
+        deviceReloadToken: pass.deviceReloadToken,
+        cloud: snapshot.cloudLibrary.map(ObjectIdentifier.init),
+        cloudRevision: pass.cloudRevision,
+        cloudLocalCopyRevision: pass.cloudLocalCopyRevision,
+        cloudInitialSyncDone: pass.cloudInitialSyncDone,
+        cloudIsSyncing: pass.cloudIsSyncing,
+        isComplete: snapshot.inputs.isComplete,
+        isFiltered: snapshot.inputs.isFiltered,
+        allowsCloudAnalysis: networkAllowed),
+      libraryBadgeToken: pass.libraryBadgeToken,
+      deviceBadgeToken: pass.deviceBadgeToken,
+      peopleSignal: peopleSignal)
+    let needsPeople = (try? await store.needsPeoplePass()) ?? true
+    let retryDue = ContinuousClock.now - lastCompletedAt >= .seconds(3_600)
+    if let last = lastCompletedFingerprint, last == fingerprint, !needsPeople, !retryDue {
+      return
+    }
+    if let last = lastCompletedFingerprint, last.structural == fingerprint.structural, !retryDue {
+      // Only People or badge metadata changed: skip scanning and pruning the whole library.
+      if needsPeople, await updatePeople() { contentRevision &+= 1 }
+      await syncSpotlight(pass)
+      if !Task.isCancelled, pendingPass == nil {
+        lastCompletedFingerprint = fingerprint
+      }
+      return
+    }
+
     let store = store
     // Only a complete merge says what's gone; a list still loading (or a first sync
     // under way) would make loaded items look deleted.
     if snapshot.inputs.isComplete {
       let current = await Task.detached(priority: .utility) { Self.indexIDs(snapshot.unfiltered()) }.value
-      let cloudSynced = !snapshot.cloud.isEmpty && snapshot.cloudLibrary?.syncState.initialSyncDone == true
+      let cloudSynced = snapshot.cloudLibrary != nil && snapshot.cloudLibrary?.isRetired == false && pass.cloudInitialSyncDone
       let pruned =
         (try? await store.prune(
-          keeping: current, device: !snapshot.device.isEmpty, folder: !snapshot.folder.isEmpty, cloud: cloudSynced)) ?? 0
+          keeping: current, device: !snapshot.device.isEmpty, folder: !snapshot.folder.isEmpty, cloud: cloudSynced,
+          source: snapshot.cloudLibrary)) ?? 0
       if pruned > 0 {
+        FaceCropCache.removeAll()
         _ = await updatePeople()
         contentRevision &+= 1
       }
     }
     guard let settled = try? await store.settledIDs() else { return }
-    let pending = await Task.detached(priority: .utility) { Self.workItems(snapshot, settled: settled) }.value
+    let localAssets = pass.localAssets
+    let localFiles = pass.localFiles
+    let pending = await Task.detached(priority: .utility) {
+      Self.workItems(snapshot, settled: settled, localAssets: localAssets, localFiles: localFiles)
+    }.value
     // Google items wait here until their thumbnail has been analyzed; their metadata is
     // saved only the first time.
     let known = pending.isEmpty ? [] : ((try? await store.analyzedIDs()) ?? [])
     let metadataFirst = pending.filter { $0.assetID == nil && !known.contains($0.id) }
     // A device photo kept in iCloud that still needs its larger preview waits for the
     // network like a Google one does, instead of being analyzed again on every pass.
-    let networkAllowed = Self.allowsCloudAnalysis()
     let device = pending.filter { $0.assetID != nil && (networkAllowed || !known.contains($0.id)) }
+    // Backed-up folder files and locally-matched cloud copies analyze locally regardless of network policy.
+    let localFolderItems = pending.filter { $0.file != nil }
+    let localAliasedDevice = pending.filter { $0.file == nil && $0.localAssetID != nil }
     let thumbnails = snapshot.cloudLibrary?.thumbnails as? GoogleThumbnailSource
-    let waiting = thumbnails == nil ? [] : pending.filter { $0.cloud != nil }
+    let remoteOnly = pending.filter { $0.file == nil && $0.localAssetID == nil && $0.cloud != nil }
+    let waiting = thumbnails == nil ? [] : remoteOnly
     let cloud = networkAllowed ? waiting : []
-    let total = metadataFirst.count + device.count + cloud.count
+    let total = metadataFirst.count + device.count + localFolderItems.count + localAliasedDevice.count + cloud.count
     guard total > 0 else {
-      // Merges of duplicate people can happen with nothing new to index.
       if await updatePeople() { contentRevision &+= 1 }
       state = waiting.isEmpty ? .idle : .paused(reason: Self.waitingForWiFi)
-      await syncSpotlight(snapshot)
+      await syncSpotlight(pass)
+      if !Task.isCancelled, pendingPass == nil {
+        lastCompletedFingerprint = fingerprint
+        lastCompletedAt = .now
+      }
       return
     }
     state = .indexing(done: 0, total: total)
@@ -263,7 +464,7 @@ public final class LibraryIndexer {
     for start in stride(from: 0, to: metadataFirst.count, by: 500) where !Task.isCancelled {
       let chunk = Array(metadataFirst[start..<min(start + 500, metadataFirst.count)])
       let metadata = await Self.metadata(for: chunk, in: snapshot)
-      try? await store.saveAll(metadata.map { ($0, nil) }, pixelsPending: true)
+      try? await store.saveAll(metadata.map { ($0, nil) }, pixelsPending: true, cloud: snapshot.cloudLibrary)
       progressed(by: chunk.count)
     }
 
@@ -308,34 +509,207 @@ public final class LibraryIndexer {
       await updatePeopleIfDue()
     }
 
-    if let thumbnails { await analyzeCloud(cloud, in: snapshot, thumbnails: thumbnails, progressed: progressed) }
+    // Backed-up folder files and locally-aliased cloud items: read local pixels directly,
+    // falling back to Google only if a file is unreadable.
+    var cloudFallback: [WorkItem] = []
+    if !localFolderItems.isEmpty {
+      cloudFallback += await analyzeLocalFiles(localFolderItems, in: snapshot, progressed: progressed)
+    }
+    if !localAliasedDevice.isEmpty {
+      cloudFallback += await analyzeLocalAliasedAssets(localAliasedDevice, in: snapshot, progressed: progressed)
+    }
+
+    let cloudQueue = cloud + (Self.allowsCloudAnalysis() ? cloudFallback : [])
+    var cloudFinished = true
+    if let thumbnails, !cloudQueue.isEmpty {
+      cloudFinished = await analyzeCloud(cloudQueue, in: snapshot, thumbnails: thumbnails, progressed: progressed)
+    }
     await updatePeople()
     revision &+= 1
     contentRevision &+= 1
-    state = !waiting.isEmpty && !Self.allowsCloudAnalysis() ? .paused(reason: Self.waitingForWiFi) : .idle
-    await syncSpotlight(snapshot)
+    let hasWaitingCloud = (!waiting.isEmpty || (!cloudFallback.isEmpty && thumbnails != nil)) && !Self.allowsCloudAnalysis()
+    state = hasWaitingCloud ? .paused(reason: Self.waitingForWiFi) : .idle
+    await syncSpotlight(pass)
+    if cloudFinished, !Task.isCancelled, pendingPass == nil {
+      lastCompletedFingerprint = fingerprint
+      lastCompletedAt = .now
+    } else {
+      lastCompletedFingerprint = nil
+    }
   }
 
-  /// Google Photos items, newest first as the timeline lists them, in groups of six whose
-  /// thumbnails download two at a time (the Library's own have separate slots). It stops
-  /// when the network no longer allows it or keeps failing (a 429 fails at once); what's
-  /// left is picked up by a later pass.
-  private func analyzeCloud(
-    _ items: [WorkItem], in snapshot: UnifiedLibraryModel.IndexSnapshot, thumbnails: GoogleThumbnailSource,
-    progressed: (Int) -> Void
-  ) async {
+  enum LocalFileAnalysis: Sendable {
+    case analyzed(ItemAnalysis?)
+    case unreadable
+  }
+
+  /// Decodes a local folder file directly (never downloading from Google), returning
+  /// `.unreadable` if the file is unavailable so callers can fall back to Google if allowed.
+  nonisolated static func analyzeFile(_ file: FolderItemInfo) async -> LocalFileAnalysis {
+    let url = file.url
+    let image: CGImage?
+    if file.isVideo {
+      image = await FolderThumbnailSource.videoFrame(url, side: thumbnailSide)
+    } else {
+      image = localFileImage(url, side: thumbnailSide)
+    }
+    guard let image else { return .unreadable }
+    let analysis = try? await ItemAnalyzer.analyze(image, includesFeaturePrint: false) {
+      guard !Task.isCancelled, pauseReason() == nil else { return nil }
+      if file.isVideo { return await FolderThumbnailSource.videoFrame(url, side: 1536) }
+      return localFileImage(url, side: 1536)
+    }
+    return .analyzed(analysis)
+  }
+
+  /// Single-pass ImageIO downsample of a local folder file at `side`, using an embedded
+  /// preview only when the source is larger than `side` and the preview itself is big enough.
+  nonisolated static func localFileImage(_ url: URL, side: CGFloat) -> CGImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+    else { return nil }
+    let maxPixel = Int(side.rounded(.up))
+    let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+    let pixelWidth = properties?[kCGImagePropertyPixelWidth] as? Int ?? 0
+    let pixelHeight = properties?[kCGImagePropertyPixelHeight] as? Int ?? 0
+    let sourceLongest = max(pixelWidth, pixelHeight)
+    if sourceLongest == 0 || sourceLongest > maxPixel {
+      let embeddedOptions: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+      ]
+      if let preview = CGImageSourceCreateThumbnailAtIndex(source, 0, embeddedOptions as CFDictionary),
+        CGFloat(max(preview.width, preview.height)) >= side * 0.9
+      {
+        return preview
+      }
+    }
+    let fullOptions: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceShouldCacheImmediately: true,
+      kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+    ]
+    return CGImageSourceCreateThumbnailAtIndex(source, 0, fullOptions as CFDictionary)
+  }
+
+  /// Analyzes backed-up folder files locally without touching Google Photos. Returns any items
+  /// whose local files were unreadable and have a Google copy to fall back on.
+  func analyzeLocalFiles(
+    _ items: [WorkItem], in snapshot: UnifiedLibraryModel.IndexSnapshot, progressed: (Int) -> Void
+  ) async -> [WorkItem] {
     let store = store
+    var fallback: [WorkItem] = []
     var start = 0
-    var failures = 0
-    // A library change waiting for its own pass goes first: new device photos are
-    // indexed before the rest of these.
-    while start < items.count, failures < 3, pendingSnapshot == nil, !Task.isCancelled {
+    while start < items.count, !Task.isCancelled {
       if let reason = Self.pauseReason() {
         state = .paused(reason: reason)
         try? await Task.sleep(for: .seconds(30))
         continue
       }
-      guard Self.allowsCloudAnalysis() else { return }
+      let chunk = Array(items[start..<min(start + 32, items.count)])
+      start += chunk.count
+      let metadata = await Self.metadata(for: chunk, in: snapshot)
+      var results: [(metadata: ItemMetadata, analysis: ItemAnalysis?)] = []
+      for pairStart in stride(from: 0, to: chunk.count, by: 2) where !Task.isCancelled {
+        let pairEnd = min(pairStart + 2, chunk.count)
+        let analyzed = await withTaskGroup(of: (Int, LocalFileAnalysis).self) { group in
+          for index in pairStart..<pairEnd {
+            guard let file = chunk[index].file else { continue }
+            group.addTask(priority: .utility) { (index, await Self.analyzeFile(file)) }
+          }
+          var collected: [(Int, LocalFileAnalysis)] = []
+          for await result in group { collected.append(result) }
+          return collected
+        }
+        for (index, outcome) in analyzed {
+          switch outcome {
+          case .analyzed(let analysis):
+            results.append((metadata[index], analysis))
+          case .unreadable:
+            if chunk[index].cloud != nil { fallback.append(chunk[index]) }
+          }
+        }
+        progressed(pairEnd - pairStart)
+      }
+      try? await store.saveAll(results, cloud: snapshot.cloudLibrary)
+      await updatePeopleIfDue()
+    }
+    return fallback
+  }
+
+  private func analyzeLocalAliasedAssets(
+    _ items: [WorkItem], in snapshot: UnifiedLibraryModel.IndexSnapshot, progressed: (Int) -> Void
+  ) async -> [WorkItem] {
+    let store = store
+    var fallback: [WorkItem] = []
+    var start = 0
+    while start < items.count, !Task.isCancelled {
+      if let reason = Self.pauseReason() {
+        state = .paused(reason: reason)
+        try? await Task.sleep(for: .seconds(30))
+        continue
+      }
+      let chunk = Array(items[start..<min(start + 32, items.count)])
+      start += chunk.count
+      let metadata = await Self.metadata(for: chunk, in: snapshot)
+      let assets = await Task.detached(priority: .utility) { Self.fetchAssets(chunk.compactMap(\.localAssetID)) }.value
+      var results: [(metadata: ItemMetadata, analysis: ItemAnalysis?)] = []
+      for pairStart in stride(from: 0, to: chunk.count, by: 2) where !Task.isCancelled {
+        let pairEnd = min(pairStart + 2, chunk.count)
+        let analyzed = await withTaskGroup(of: (Int, LocalFileAnalysis).self) { group in
+          for index in pairStart..<pairEnd {
+            let asset = chunk[index].localAssetID.flatMap { assets[$0] }
+            group.addTask(priority: .utility) {
+              guard let asset, let image = await Self.thumbnail(asset: asset) else { return (index, .unreadable) }
+              let analysis = try? await ItemAnalyzer.analyze(image, includesFeaturePrint: false) {
+                guard !Task.isCancelled, Self.pauseReason() == nil else { return nil }
+                return await Self.thumbnail(asset: asset, side: 1536)
+              }
+              return (index, .analyzed(analysis))
+            }
+          }
+          var collected: [(Int, LocalFileAnalysis)] = []
+          for await result in group { collected.append(result) }
+          return collected
+        }
+        for (index, outcome) in analyzed {
+          switch outcome {
+          case .analyzed(let analysis):
+            results.append((metadata[index], analysis))
+          case .unreadable:
+            if chunk[index].cloud != nil { fallback.append(chunk[index]) }
+          }
+        }
+        progressed(pairEnd - pairStart)
+      }
+      try? await store.saveAll(results, cloud: snapshot.cloudLibrary)
+      await updatePeopleIfDue()
+    }
+    return fallback
+  }
+
+  /// Google Photos items, newest first as the timeline lists them, in groups of six whose
+  /// thumbnails download two at a time (the Library's own have separate slots). It stops
+  /// when the network no longer allows it or keeps failing (a 429 fails at once); what's
+  /// left is picked up by a later pass. Returns whether all items were processed.
+  private func analyzeCloud(
+    _ items: [WorkItem], in snapshot: UnifiedLibraryModel.IndexSnapshot, thumbnails: GoogleThumbnailSource,
+    progressed: (Int) -> Void
+  ) async -> Bool {
+    let store = store
+    var start = 0
+    var failures = 0
+    // A library change waiting for its own pass goes first: new device photos are
+    // indexed before the rest of these.
+    while start < items.count, failures < 3, pendingPass == nil, !Task.isCancelled {
+      if let reason = Self.pauseReason() {
+        state = .paused(reason: reason)
+        try? await Task.sleep(for: .seconds(30))
+        continue
+      }
+      guard Self.allowsCloudAnalysis() else { return false }
       let chunk = Array(items[start..<min(start + 48, items.count)])
       start += chunk.count
       let metadata = await Self.metadata(for: chunk, in: snapshot)
@@ -361,9 +735,10 @@ public final class LibraryIndexer {
         }
         progressed(analyzed.count)
       }
-      try? await store.saveAll(results)
+      try? await store.saveAll(results, cloud: snapshot.cloudLibrary)
       await updatePeopleIfDue()
     }
+    return start >= items.count && failures < 3
   }
 
   /// A pass over a whole library (after a new analysis version, hours for Google Photos
@@ -429,9 +804,11 @@ public final class LibraryIndexer {
     }
   }
 
-  private func syncSpotlight(_ snapshot: UnifiedLibraryModel.IndexSnapshot) async {
+  private func syncSpotlight(_ pass: ScheduledPass) async {
     guard let spotlight, !Task.isCancelled else { return }
-    await Task.detached(priority: .utility) { await spotlight.sync(snapshot) }.value
+    let snapshot = pass.snapshot
+    let context = pass.spotlightContext
+    await Task.detached(priority: .utility) { _ = await spotlight.sync(snapshot, context: context) }.value
   }
 
   nonisolated static func fetchAssets(_ ids: [String]) -> [String: PHAsset] {
@@ -461,6 +838,12 @@ public final class LibraryIndexer {
     return side > thumbnailSide ? nil : await thumbnail(asset: asset, side: side, network: false, degraded: true)
   }
 
+  /// Local-only PhotoKit image request without iCloud download.
+  nonisolated static func localThumbnail(asset: PHAsset, side: CGFloat) async -> CGImage? {
+    if let image = await thumbnail(asset: asset, side: side, network: false, degraded: false) { return image }
+    return await thumbnail(asset: asset, side: side, network: false, degraded: true)
+  }
+
   /// One delivery mode calls back once; the guard keeps a second call harmless.
   private nonisolated static func thumbnail(asset: PHAsset, side: CGFloat, network: Bool, degraded: Bool) async -> CGImage? {
     let options = PHImageRequestOptions()
@@ -488,11 +871,13 @@ public final class LibraryIndexer {
   // MARK: People
 
   /// Assigns faces found since the last run to people, then merges duplicate people.
-  /// Waits out Low Power Mode and heat like indexing does. Returns whether anyone changed.
+  /// Skips the pass when no faces or cluster memberships changed since the last finished pass.
   @discardableResult
-  private func updatePeople() async -> Bool {
+  func updatePeople() async -> Bool {
     var changed = false
+    var mergeRounds = 0
     while !Task.isCancelled {
+      guard (try? await store.needsPeoplePass()) == true else { break }
       if let reason = Self.pauseReason() {
         state = .paused(reason: reason)
         try? await Task.sleep(for: .seconds(30))
@@ -500,28 +885,56 @@ public final class LibraryIndexer {
       }
       let pass = await peoplePass()
       changed = changed || pass.changed
-      if pass.finished { break }
+      if pass.finished {
+        if !Task.isCancelled, !pass.hadError, let cleanVersion = pass.cleanVersion {
+          try? await store.markPeopleClean(version: cleanVersion)
+        }
+        // A merge during phase 2 bumps the clustering version; rerun until merges settle so
+        // transitive merges finish and the final zero-merge pass marks the post-merge state clean.
+        if pass.merged, !pass.hadError, !Task.isCancelled, mergeRounds < 8 {
+          mergeRounds += 1
+          continue
+        }
+        break
+      }
     }
     return changed
   }
 
   /// One pass over unassigned faces and then every person; stops early if a pause starts.
-  private func peoplePass() async -> (finished: Bool, changed: Bool) {
+  private func peoplePass() async -> (finished: Bool, changed: Bool, merged: Bool, hadError: Bool, cleanVersion: Int64?) {
     let store = store
-    let work = Task.detached(priority: .utility) { () -> (finished: Bool, changed: Bool) in
+    let work = Task.detached(priority: .utility) {
+      () -> (finished: Bool, changed: Bool, merged: Bool, hadError: Bool, cleanVersion: Int64?) in
       var cursor: Int64 = 0
       var merging = false
       var changed = false
+      var merged = false
+      var cleanVersion = try? await store.peopleClusteringVersion()
       while !Task.isCancelled {
-        guard Self.pauseReason() == nil else { return (false, changed) }
+        guard Self.pauseReason() == nil else { return (false, changed, merged, false, nil) }
         let faces: [IndexedFace]
         if merging {
-          guard let page = try? await store.peopleForMerging(after: cursor) else { return (true, changed) }
+          let page: (faces: [IndexedFace], next: Int64)?
+          do {
+            page = try await store.peopleForMerging(after: cursor)
+          } catch {
+            return (true, changed, merged, true, nil)
+          }
+          guard let page else { return (true, changed, merged, false, cleanVersion) }
           faces = page.faces
           cursor = page.next
         } else {
-          guard let page = try? await store.facesForClustering(after: cursor) else { return (true, changed) }
+          let page: [IndexedFace]
+          do {
+            page = try await store.facesForClustering(after: cursor)
+          } catch {
+            return (true, changed, merged, true, nil)
+          }
           guard let last = page.filter({ $0.person == nil }).map(\.id).max() else {
+            // Capture version after phase-1 assignments so a clean merge phase marks them clean,
+            // while any concurrent external edit or actual merge during phase 2 stays dirty.
+            cleanVersion = try? await store.peopleClusteringVersion()
             merging = true
             cursor = 0
             continue
@@ -531,7 +944,6 @@ public final class LibraryIndexer {
         }
         let unassigned = faces.indices.filter { faces[$0].person == nil }
         let vectors = FeatureVectors(faces.map(\.featurePrint))
-        let buckets = faces.map { FaceClustering.buckets($0.featurePrint) }
         var groups: [Int64: [Int]] = [:]
         for (index, face) in faces.enumerated() {
           if let person = face.person { groups[person, default: []].append(index) }
@@ -540,7 +952,7 @@ public final class LibraryIndexer {
         let names = (try? await store.peopleNames()) ?? [:]
         let clustering = FaceClustering.assign(
           existing: groups.map { ($0.key, $0.value) }, unassigned: unassigned, nextPersonID: next,
-          itemID: { faces[$0].itemID }, names: names, buckets: { buckets[$0] },
+          itemID: { faces[$0].itemID }, names: names, buckets: { faces[$0].buckets },
           // Merges run only in their own pass, where nothing is being assigned: the store
           // can still refuse one, and assignments must not depend on it.
           allowsMerging: merging
@@ -548,12 +960,15 @@ public final class LibraryIndexer {
         var assignments: [Int64: Int64] = [:]
         for (index, person) in clustering.assignments { assignments[faces[index].id] = person }
         do {
-          if try await store.mergePeople(clustering.merges) { changed = true }
+          if try await store.mergePeople(clustering.merges) {
+            changed = true
+            merged = true
+          }
           try await store.assignFaces(assignments)
           if !assignments.isEmpty { changed = true }
-        } catch { return (true, changed) }
+        } catch { return (true, changed, merged, true, nil) }
       }
-      return (true, changed)
+      return (false, changed, merged, false, nil)
     }
     return await withTaskCancellationHandler {
       await work.value
@@ -568,31 +983,41 @@ public final class LibraryIndexer {
   /// Vision found ("puppy" finds "dog"), using the on-device word embedding.
   public func search(_ query: String) async -> [String] {
     // The store caches its labels until the next write, so results follow indexing.
-    let vocabulary = (try? await store.allLabels()) ?? []
-    return await Self.search(query, in: store, vocabulary: vocabulary, people: namedSearchPeople())
+    let vocabulary = (try? await store.labelVocabulary()) ?? LibraryIndexStore.LabelVocabulary(labels: [])
+    let ids = await Self.search(query, in: store, vocabulary: vocabulary, people: namedSearchPeople())
+    return await SiriLibrary.shared.excludingLockedIDs(ids, cloud: lastPass?.snapshot.cloudLibrary)
   }
 
   /// The search behind `search(_:)`, also for callers without an indexer (Siri): `people`
   /// are the named people to match, read from the store when not given. While typing, the
   /// last word is completed ("bea" finds "beach"); Siri's words are whole.
   nonisolated static func search(
-    _ query: String, in store: LibraryIndexStore, vocabulary: [String], people: [Person]? = nil,
+    _ query: String, in store: LibraryIndexStore, vocabulary: [String], people: [LibraryIndexStore.NamedPerson]? = nil,
     completingLastWord: Bool? = nil
+  ) async -> [String] {
+    await search(
+      query, in: store, vocabulary: LibraryIndexStore.LabelVocabulary(labels: vocabulary), people: people,
+      completingLastWord: completingLastWord)
+  }
+
+  nonisolated static func search(
+    _ query: String, in store: LibraryIndexStore, vocabulary: LibraryIndexStore.LabelVocabulary,
+    people: [LibraryIndexStore.NamedPerson]? = nil, completingLastWord: Bool? = nil
   ) async -> [String] {
     let words = SearchVocabulary.tokens(query)
     guard !words.isEmpty else { return [] }
     let terms = await Task.detached(priority: .userInitiated) { Self.expand(words, vocabulary: vocabulary) }.value
     let completes = completingLastWord ?? (query.last?.isWhitespace != true)
     var ids = (try? await store.search(terms, completingLastWord: completes)) ?? []
-    let named: [Person]
+    let named: [LibraryIndexStore.NamedPerson]
     if let people {
       named = people
     } else {
-      named = ((try? await store.people(minimumFaces: 1)) ?? []).filter { $0.name != nil }
+      named = (try? await store.namedPeople()) ?? []
     }
     var matches: [String] = []
     for person in named {
-      guard let name = person.name, Self.matchesName(name, query: query) else { continue }
+      guard Self.matchesName(person.name, query: query) else { continue }
       matches += (try? await store.ids(ofPerson: person.id)) ?? []
     }
     var uniquePeople = Set<String>()
@@ -616,18 +1041,18 @@ public final class LibraryIndexer {
     let people = await namedSearchPeople()
     var suggestions: [SearchSuggestion] = []
     for person in people where suggestions.count < limit {
-      guard let name = person.name, Self.matchesName(name, query: prefix) else { continue }
-      let count = (try? await store.ids(ofPerson: person.id).count) ?? 0
-      suggestions.append(SearchSuggestion(kind: .person, title: name, query: name, count: count))
+      guard Self.matchesName(person.name, query: prefix) else { continue }
+      suggestions.append(
+        SearchSuggestion(kind: .person, title: person.name, query: person.name, count: person.photoCount))
     }
     suggestions += (try? await store.suggestions(for: prefix, limit: limit)) ?? []
     return Array(suggestions.prefix(limit))
   }
 
-  private func namedSearchPeople() async -> [Person] {
+  private func namedSearchPeople() async -> [LibraryIndexStore.NamedPerson] {
     if searchPeopleRevision != contentRevision {
       let revision = contentRevision
-      searchPeopleCache = ((try? await store.people(minimumFaces: 1)) ?? []).filter { $0.name != nil }
+      searchPeopleCache = (try? await store.namedPeople()) ?? []
       searchPeopleRevision = revision
     }
     return searchPeopleCache
@@ -656,9 +1081,12 @@ public final class LibraryIndexer {
   /// Each word with what else finds it: its other forms ("mountains"), the labels Vision
   /// uses for it ("hill"), and failing those the nearest label by meaning.
   nonisolated static func expand(_ words: [String], vocabulary: [String]) -> [[String]] {
-    let embedding = NLEmbedding.wordEmbedding(for: .english)
-    let labels = Set(vocabulary)
-    let labelWords = Set(vocabulary.flatMap { SearchVocabulary.tokens($0) })
+    expand(words, vocabulary: LibraryIndexStore.LabelVocabulary(labels: vocabulary))
+  }
+
+  nonisolated static func expand(_ words: [String], vocabulary: LibraryIndexStore.LabelVocabulary) -> [[String]] {
+    let labels = vocabulary.labelSet
+    let labelWords = vocabulary.labelWords
     return words.map { word in
       let forms = SearchVocabulary.forms(word)
       var alternatives = forms
@@ -667,13 +1095,30 @@ public final class LibraryIndexer {
         alternatives += (SearchVocabulary.related[key] ?? []).filter(labels.contains)
       }
       // A recognized subject must not expand to a nearby, different subject (dog -> cat).
-      if alternatives.count == forms.count, !([word] + forms).contains(where: labelWords.contains), word.count > 2,
-        let embedding
-      {
-        alternatives += semanticAlternatives(embedding.neighbors(for: word, maximumCount: 8), labels: labelWords)
+      if alternatives.count == forms.count, !([word] + forms).contains(where: labelWords.contains), word.count > 2 {
+        alternatives += semanticAlternatives(
+          EnglishEmbeddingCache.shared.neighbors(for: word, maximumCount: 8), labels: labelWords)
       }
       var seen: Set<String> = [word]
       return [word] + alternatives.filter { seen.insert($0).inserted }
+    }
+  }
+}
+
+/// Loads the system English word embedding once per process instead of per search keystroke.
+private final class EnglishEmbeddingCache: @unchecked Sendable {
+  static let shared = EnglishEmbeddingCache()
+  private let lock = NSLock()
+  private var loaded = false
+  private var embedding: NLEmbedding?
+
+  func neighbors(for word: String, maximumCount: Int) -> [(String, Double)] {
+    lock.withLock {
+      if !loaded {
+        embedding = NLEmbedding.wordEmbedding(for: .english)
+        loaded = true
+      }
+      return embedding?.neighbors(for: word, maximumCount: maximumCount) ?? []
     }
   }
 }

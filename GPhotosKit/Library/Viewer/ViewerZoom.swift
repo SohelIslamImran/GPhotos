@@ -30,7 +30,7 @@ public final class ViewerZoom {
   /// Where the pulled photo is in the window, moved and shrunk with the finger.
   @ObservationIgnored var pulledFrame: CGRect?
 
-  @ObservationIgnored private var showing: (index: Int, id: String)?
+  @ObservationIgnored private var showing: (index: Int, identity: ThumbnailIdentity)?
   @ObservationIgnored private var screen: CGRect = .zero
   @ObservationIgnored private var isClosing = false
   @ObservationIgnored var dismiss: () -> Void = {}
@@ -46,21 +46,21 @@ public final class ViewerZoom {
   private static let closing = Animation.spring(duration: 0.36, bounce: 0)
 
   /// Before presenting: the photo starts on the tapped cell, which is left empty.
-  func prepare(index: Int, id: String) {
-    showing = (index, id)
+  func prepare(index: Int, identity: ThumbnailIdentity) {
+    showing = (index, identity)
     isClosing = false
     progress = 0
     pull = 0
     pulledFrame = nil
     hidesPages = true
-    let image = ThumbnailPipeline.shared.placeholder(for: ThumbnailKey(id: id, bucket: .huge))
-    flight = proxy.windowFrame(of: index).map { Flight(frame: $0, image: image, opacity: 1) }
+    let image = ThumbnailPipeline.shared.placeholder(for: ThumbnailKey(identity: identity, bucket: .huge))
+    flight = image.flatMap { image in proxy.windowFrame(of: index).map { Flight(frame: $0, image: image, opacity: 1) } }
   }
 
   /// Opens the viewer at `index` of `source`: `present` shows it, without an animation.
   func open(_ index: Int, in source: any PhotoGridDataSource, present: () -> Void) {
     #if os(iOS)
-      prepare(index: index, id: source.itemID(at: index))
+      prepare(index: index, identity: source.thumbnailIdentity(at: index))
       var transaction = Transaction()
       transaction.disablesAnimations = true
       withTransaction(transaction, present)
@@ -70,7 +70,14 @@ public final class ViewerZoom {
   }
 
   /// While the viewer is up: the photo it shows, which it closes into.
-  func viewerShows(index: Int, id: String) { showing = (index, id) }
+  func viewerShows(index: Int, identity: ThumbnailIdentity) { showing = (index, identity) }
+
+  func refreshIdentity(in source: any PhotoGridDataSource) {
+    guard let showing, showing.index < source.itemCount else { return }
+    let identity = source.thumbnailIdentity(at: showing.index)
+    guard identity.id == showing.identity.id else { return }
+    self.showing = (showing.index, identity)
+  }
 
   /// Once the viewer is on screen: the photo grows to fill it. It starts a moment later,
   /// once the viewer has been drawn at the start, so its background and controls fade in
@@ -94,9 +101,14 @@ public final class ViewerZoom {
       withAnimation(.easeOut(duration: 0.2)) { progress = 1 }
       return
     }
-    let preview = Self.uncroppedImage(for: showing.id)
+    let preview = Self.uncroppedImage(for: showing.identity)
     // A cropped cell can only stand in at its own frame.
-    if let preview { flight?.image = preview }
+    if let preview, flight == nil, let frame = proxy.windowFrame(of: showing.index) {
+      flight = Flight(frame: frame, image: preview, opacity: 1)
+      proxy.hide(showing.index)
+    } else if let preview {
+      flight?.image = preview
+    }
     if flight == nil || preview == nil { hidesPages = false }
     withAnimation(Self.opening, completionCriteria: .removed) {
       if let preview { flight?.frame = fitted(image: preview) } else { flight?.opacity = 0 }
@@ -114,7 +126,7 @@ public final class ViewerZoom {
   func close(reduceMotion: Bool) {
     guard !isClosing else { return }
     isClosing = true
-    guard !reduceMotion, let showing, let image = Self.uncroppedImage(for: showing.id) else {
+    guard !reduceMotion, let showing, let image = Self.uncroppedImage(for: showing.identity) else {
       withAnimation(.easeOut(duration: 0.2)) {
         progress = 0
       } completion: { [weak self] in
@@ -149,10 +161,10 @@ public final class ViewerZoom {
   /// thumbnail. PhotoKit's and folder thumbnails keep the photo's shape (only the cell
   /// crops them), as Photos' do, so the photo grows out of its cell; Google's come
   /// cropped square from the server and can't stand in for the whole photo.
-  static func uncroppedImage(for id: String) -> CGImage? {
-    if let preview = ThumbnailPipeline.shared.viewerPreview(for: id) { return preview }
-    guard RemoteThumbnailID(id) == nil else { return nil }
-    return ThumbnailPipeline.shared.placeholder(for: ThumbnailKey(id: id, bucket: .huge))
+  static func uncroppedImage(for identity: ThumbnailIdentity) -> CGImage? {
+    if let preview = ThumbnailPipeline.shared.viewerPreview(for: identity) { return preview }
+    guard RemoteThumbnailID(identity.id) == nil else { return nil }
+    return ThumbnailPipeline.shared.placeholder(for: ThumbnailKey(identity: identity, bucket: .huge))
   }
 
   /// The photo as the viewer fits it: the whole photo, as large as fits the screen.
@@ -196,7 +208,15 @@ private struct PhotoViewerPresentation: ViewModifier {
     #if os(iOS)
       content
         .background {
-          OverFullScreen(isPresented: index != nil && source != nil) {
+          OverFullScreen(
+            key: source.flatMap { source in
+              index.map { _ in
+                ViewerPresentationKey(
+                  source: ObjectIdentifier(source), zoom: ObjectIdentifier(zoom),
+                  reduceMotion: reduceMotion)
+              }
+            }
+          ) {
             if let source, let index { viewer(source: source, startIndex: index) }
           }
         }
@@ -222,6 +242,8 @@ private struct PhotoViewerPresentation: ViewModifier {
           .onDisappear { zoom.viewerTitle = nil }
         }
       }
+      // The viewer has its own Back; in a pushed collection the stack's would sit beside it.
+      .navigationBarBackButtonHidden(index != nil)
     #endif
   }
 
@@ -231,9 +253,10 @@ private struct PhotoViewerPresentation: ViewModifier {
         MediaViewer(
           source: source, startIndex: startIndex, zoom: zoom,
           onIndexChange: { index in
-            zoom.viewerShows(index: index, id: source.itemID(at: index))
+            zoom.viewerShows(index: index, identity: source.thumbnailIdentity(at: index))
           }
         ) {
+          zoom.refreshIdentity(in: source)
           zoom.close(reduceMotion: reduceMotion)
         }
       }
@@ -242,14 +265,21 @@ private struct PhotoViewerPresentation: ViewModifier {
 }
 
 #if os(iOS)
+  private struct ViewerPresentationKey: Equatable {
+    let source: ObjectIdentifier
+    let zoom: ObjectIdentifier
+    let reduceMotion: Bool
+  }
+
   /// Presents `content` over the whole screen without an animation, keeping what's below
   /// on screen (a full-screen cover takes it away), so the viewer can fade in over it.
   private struct OverFullScreen<Content: View>: UIViewControllerRepresentable {
-    let isPresented: Bool
+    let key: ViewerPresentationKey?
     @ViewBuilder let content: () -> Content
 
     final class Coordinator {
       var presented: UIHostingController<Content>?
+      var key: ViewerPresentationKey?
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -258,7 +288,9 @@ private struct PhotoViewerPresentation: ViewModifier {
 
     func updateUIViewController(_ host: UIViewController, context: Context) {
       let coordinator = context.coordinator
-      if isPresented {
+      guard coordinator.key != key else { return }
+      coordinator.key = key
+      if key != nil {
         if let presented = coordinator.presented {
           presented.rootView = content()
         } else {

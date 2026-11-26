@@ -11,10 +11,11 @@ public struct PhotoGridLayout: Equatable, Sendable {
   public var insets: PhotoGridInsets
   /// Cells round down to whole pixels of this scale, so their edges stay crisp.
   public var pixelScale: CGFloat
+  public var alignsNewestRow: Bool
 
   public init(
     columns: Int, spacing: CGFloat = 2, width: CGFloat, itemCount: Int, insets: PhotoGridInsets = .zero,
-    pixelScale: CGFloat = 1
+    pixelScale: CGFloat = 1, alignsNewestRow: Bool = false
   ) {
     self.pixelScale = max(1, pixelScale)
     self.columns = max(1, columns)
@@ -22,6 +23,7 @@ public struct PhotoGridLayout: Equatable, Sendable {
     self.width = max(0, width)
     self.itemCount = max(0, itemCount)
     self.insets = insets
+    self.alignsNewestRow = alignsNewestRow
   }
 
   public var itemSide: CGFloat {
@@ -30,6 +32,11 @@ public struct PhotoGridLayout: Equatable, Sendable {
   }
 
   public var rowCount: Int { itemCount / columns + (itemCount % columns == 0 ? 0 : 1) }
+
+  /// Put an incomplete row at the oldest end, so prepending items cannot move newer cells.
+  private var leadingEmptyCells: Int {
+    alignsNewestRow ? (columns - itemCount % columns) % columns : 0
+  }
 
   private var rowPitch: CGFloat { itemSide + spacing }
 
@@ -45,8 +52,9 @@ public struct PhotoGridLayout: Equatable, Sendable {
   }
 
   public func frame(at index: Int) -> CGRect {
-    let row = index / columns
-    let column = index % columns
+    let cell = UInt(max(0, index)) + UInt(leadingEmptyCells)
+    let row = cell / UInt(columns)
+    let column = cell % UInt(columns)
     return CGRect(
       x: insets.left + CGFloat(column) * columnPitch, y: insets.top + CGFloat(row) * rowPitch,
       width: itemSide, height: itemSide)
@@ -65,8 +73,8 @@ public struct PhotoGridLayout: Equatable, Sendable {
     let firstRow = first <= 0 ? 0 : Int(first)
     let lastRow = last >= CGFloat(rowCount - 1) ? rowCount - 1 : Int(last)
     guard lastRow >= firstRow else { return 0..<0 }
-    let lower = firstRow * columns
-    let upper = lastRow == rowCount - 1 ? itemCount : (lastRow + 1) * columns
+    let lower = max(0, firstRow * columns - leadingEmptyCells)
+    let upper = lastRow == rowCount - 1 ? itemCount : (lastRow + 1) * columns - leadingEmptyCells
     return lower..<upper
   }
 
@@ -79,10 +87,8 @@ public struct PhotoGridLayout: Equatable, Sendable {
     guard rowValue >= 0, rowValue < CGFloat(rowCount), columnValue >= 0, columnValue < CGFloat(columns) else { return nil }
     let row = Int(rowValue)
     let column = Int(columnValue)
-    let start = row * columns
-    guard column < itemCount - start else { return nil }
-    let index = start + column
-    guard index < itemCount, frame(at: index).contains(point) else { return nil }
+    let (index, overflow) = (row * columns - leadingEmptyCells).addingReportingOverflow(column)
+    guard !overflow, index >= 0, index < itemCount, frame(at: index).contains(point) else { return nil }
     return index
   }
 

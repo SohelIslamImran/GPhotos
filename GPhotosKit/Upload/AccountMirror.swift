@@ -97,8 +97,7 @@ public final class AccountMirror {
         || !TransferRecord.isAssetEdited(source.assetModifiedAt, since: copy.assetModifiedAt))
   }
 
-  /// Primary records still waiting for a copy in `secondaryEmail`. Linear in the
-  /// record count: it runs on the main actor on every records refresh.
+  /// Primary records still waiting for a copy in `secondaryEmail`.
   /// - Parameter isSourceAvailable: Whether the file or photo asset still exists.
   nonisolated public static func eligiblePrimaryRecords(
     from records: [TransferRecord],
@@ -163,8 +162,6 @@ public final class AccountMirror {
 
   public func refreshStates() {
     guard let engine else { return }
-    let records = engine.records
-    let primaryEmail = engine.selectedAccount?.email
 
     for (email, runner) in runners {
       var state = secondaryStates[email] ?? SecondaryMirrorState(email: email, isMirrorEnabled: runner.account.mirrorEnabled)
@@ -176,30 +173,53 @@ public final class AccountMirror {
       state.waitingDescription = ProductCopy.idleCopiesWaiting(
         onlyWhileCharging: engine.settings.copiesOnlyWhileCharging)
 
-      let key = CountsKey(revision: engine.recordsRevision, primaryEmail: primaryEmail)
-      let counts: (copied: Int, pending: Int)
-      if let cached = cachedCounts[email], cached.key == key {
-        counts = cached.counts
-      } else {
-        var copied = 0
-        var pending = 0
-        if let primaryEmail {
-          let copies = Self.copies(in: records, secondaryEmail: email)
-          for rec in records where rec.status == .sent && TransferRecord.accountEmail(fromScopedID: rec.id) == primaryEmail {
-            if Self.matches(copies[TransferRecord.unscopedID(from: rec.id)], source: rec) { copied += 1 } else { pending += 1 }
-          }
-        }
-        counts = (copied, pending)
-        cachedCounts[email] = (key, counts)
+      if let cached = cachedCounts[email],
+        cached.key == CountsKey(revision: engine.recordsRevision, primaryEmail: engine.selectedAccount?.email)
+      {
+        state.copiedCount = cached.counts.copied
+        state.pendingCount = cached.counts.pending
       }
-      state.copiedCount = counts.copied
-      state.pendingCount = counts.pending
       // Every assignment invalidates the account rows, even when nothing changed.
       if secondaryStates[email] != state { secondaryStates[email] = state }
     }
   }
 
-  private struct CountsKey: Equatable {
+  func refreshRecordCounts() async {
+    guard let engine else { return }
+    let key = CountsKey(revision: engine.recordsRevision, primaryEmail: engine.selectedAccount?.email)
+    let emails = runners.keys.filter { cachedCounts[$0]?.key != key }
+    if !emails.isEmpty {
+      let records = engine.records
+      let counts = await Task.detached(priority: .utility) {
+        emails.map { email in
+          (email, Self.copyCounts(in: records, primaryEmail: key.primaryEmail, secondaryEmail: email))
+        }
+      }.value
+      guard key == CountsKey(revision: engine.recordsRevision, primaryEmail: engine.selectedAccount?.email) else { return }
+      for (email, counts) in counts where runners[email] != nil {
+        cachedCounts[email] = (key, counts)
+      }
+    }
+    refreshStates()
+  }
+
+  nonisolated static func copyCounts(
+    in records: [TransferRecord], primaryEmail: String?, secondaryEmail: String
+  ) -> (copied: Int, pending: Int) {
+    guard let primaryEmail else { return (0, 0) }
+    let copies = copies(in: records, secondaryEmail: secondaryEmail)
+    var counts = (copied: 0, pending: 0)
+    for record in records where record.status == .sent && TransferRecord.accountEmail(fromScopedID: record.id) == primaryEmail {
+      if matches(copies[TransferRecord.unscopedID(from: record.id)], source: record) {
+        counts.copied += 1
+      } else {
+        counts.pending += 1
+      }
+    }
+    return counts
+  }
+
+  private struct CountsKey: Equatable, Sendable {
     var revision: Int?
     var primaryEmail: String?
   }
@@ -212,7 +232,8 @@ public final class AccountMirror {
 
   public func runIdleWindow() async {
     guard activeWindowTask == nil else { return }
-    guard let engine, engine.allowsAutomaticUploads, !engine.workerPool.isRunning else { return }
+    if let engine, !engine.allowsAccountWork { engine.replayCopies() }
+    guard let engine, engine.allowsAccountWork, engine.allowsAutomaticUploads, !engine.workerPool.isRunning else { return }
 
     let task = Task { @MainActor in
       defer { self.activeWindowTask = nil }
@@ -227,6 +248,12 @@ public final class AccountMirror {
     }
     activeWindowTask = task
     await task.value
+  }
+
+  func waitForIdleWindow() async {
+    await activeWindowTask?.value
+    // Cancellation can release the window's waiter before the per-account batch unwinds.
+    for runner in runners.values { await runner.waitForCurrentBatch() }
   }
 
   public func pauseAll() {
@@ -296,6 +323,10 @@ final class SecondaryRunner {
     workerPool.abortAlbumUpdates()
   }
 
+  func waitForCurrentBatch() async {
+    await workerPool.waitForCurrentBatch()
+  }
+
   func runWindow() async {
     guard !isRunning, account.mirrorEnabled else { return }
     guard let engine, !engine.workerPool.isRunning, engine.idleMirrorConditionsHold() else { return }
@@ -303,8 +334,10 @@ final class SecondaryRunner {
     isCancelled = false
     isRunning = true
     lastRunAt = Date()
+    var sentCopies = false
     defer {
       isRunning = false
+      if sentCopies { engine.secondaryCopyDidComplete() }
       engine.accountMirror.refreshStates()
     }
     engine.accountMirror.refreshStates()
@@ -328,11 +361,11 @@ final class SecondaryRunner {
     guard let primaryEmail = engine.selectedAccount?.email else { return }
     // One snapshot per window. Each item is tried at most once per window, so a source
     // that cannot be rebuilt or keeps failing never spins the loop.
-    let work = AccountMirror.eligiblePrimaryRecords(
-      from: engine.records,
-      primaryEmail: primaryEmail,
-      secondaryEmail: account.email
-    )
+    let records = engine.records
+    let secondaryEmail = account.email
+    let work = await Task.detached(priority: .utility) {
+      AccountMirror.eligiblePrimaryRecords(from: records, primaryEmail: primaryEmail, secondaryEmail: secondaryEmail)
+    }.value
     guard !work.isEmpty else { return }
     var hasSource = false
     var hadAuthError = false
@@ -375,6 +408,11 @@ final class SecondaryRunner {
       guard await prepareRecord(id: secondaryID, from: primaryRecord, previous: previous, manifest: manifest),
         await manifest.claimForUpload(id: secondaryID)
       else { continue }
+      // Cancelled while the claim was being taken, it must not start a batch nothing stops.
+      guard !isCancelled, !Task.isCancelled else {
+        await manifest.releaseUploadClaim(id: secondaryID)
+        break
+      }
 
       let outcome = workerPool.start(items: [mirrorItem], quality: 3, accountEmail: account.email)
       guard outcome == .started else {
@@ -384,9 +422,10 @@ final class SecondaryRunner {
 
       await workerPool.waitForCurrentBatch()
       await currentEngine.refreshRecords()
+      let record = await manifest.record(for: secondaryID)
+      if record?.status == .sent { sentCopies = true }
       guard !isCancelled, !Task.isCancelled else { break }
 
-      let record = await manifest.record(for: secondaryID)
       if record?.status == .sent {
         itemsProcessed += 1
         currentBackoffDelay = 0

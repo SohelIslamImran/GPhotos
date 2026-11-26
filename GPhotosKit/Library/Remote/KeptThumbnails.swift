@@ -1,6 +1,5 @@
 import AVFoundation
 import CoreGraphics
-import CryptoKit
 import Foundation
 import ImageIO
 import Photos
@@ -23,15 +22,15 @@ public enum KeptThumbnails {
   }
 
   static func url(mediaKey: String, accountEmail: String) -> URL {
-    let digest = Insecure.SHA1.hash(data: Data(mediaKey.utf8)).map { String(format: "%02x", $0) }.joined()
-    return directory(for: accountEmail).appending(path: digest + ".jpg")
+    directory(for: accountEmail).appending(path: ThumbnailDiskCache.itemName(for: mediaKey) + ".jpg")
   }
 
   /// File names kept per account, listed once, so the many grid cells without a kept
   /// thumbnail don't each try to open a file.
   private static let index = OSAllocatedUnfairLock<[String: Set<String>]>(initialState: [:])
 
-  private static func names(for accountEmail: String) -> Set<String> {
+  private static func names(for email: String) -> Set<String> {
+    let accountEmail = email.lowercased()
     if let names = index.withLock({ $0[accountEmail] }) { return names }
     let listed = Set((try? FileManager.default.contentsOfDirectory(atPath: directory(for: accountEmail).path)) ?? [])
     return index.withLock { state in
@@ -42,6 +41,7 @@ public enum KeptThumbnails {
   }
 
   public static func data(mediaKey: String, accountEmail: String) -> Data? {
+    guard !LockedItems.contains(mediaKey, accountEmail: accountEmail) else { return nil }
     let names = names(for: accountEmail)
     guard !names.isEmpty else { return nil }
     let file = url(mediaKey: mediaKey, accountEmail: accountEmail)
@@ -52,7 +52,9 @@ public enum KeptThumbnails {
   /// Keeps a thumbnail of the item a record uploaded, from the file about to be removed or
   /// from its photo-library asset.
   public static func keep(_ record: TransferRecord, accountEmail: String, fileURL: URL? = nil) async {
-    guard record.resourceRole == .primary, let mediaKey = record.mediaKeysByAccount[accountEmail] else { return }
+    guard record.resourceRole == .primary, let mediaKey = record.mediaKeysByAccount[accountEmail],
+      let lifetime = LockedItems.unlockedLifetime(mediaKey, accountEmail: accountEmail)
+    else { return }
     let destination = url(mediaKey: mediaKey, accountEmail: accountEmail)
     guard !FileManager.default.fileExists(atPath: destination.path) else { return }
     let image: CGImage? =
@@ -61,11 +63,19 @@ public enum KeptThumbnails {
       } else if let assetID = record.assetLocalIdentifier {
         await thumbnail(assetID: assetID)
       } else { nil }
-    guard let image, let jpeg = encode(image) else { return }
-    try? FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-    guard (try? jpeg.write(to: destination, options: .atomic)) != nil else { return }
-    _ = names(for: accountEmail)
-    index.withLock { _ = $0[accountEmail, default: []].insert(destination.lastPathComponent) }
+    guard !Task.isCancelled, let image, let jpeg = encode(image) else { return }
+    write(jpeg, mediaKey: mediaKey, accountEmail: accountEmail, lifetime: lifetime)
+  }
+
+  static func write(_ jpeg: Data, mediaKey: String, accountEmail: String, lifetime: UUID) {
+    LockedItems.withKnownState(for: accountEmail) { currentLifetime, locked in
+      guard !Task.isCancelled, currentLifetime == lifetime, !locked.contains(mediaKey) else { return }
+      let destination = url(mediaKey: mediaKey, accountEmail: accountEmail)
+      try? FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+      guard (try? jpeg.write(to: destination, options: .atomic)) != nil else { return }
+      _ = names(for: accountEmail)
+      index.withLock { _ = $0[accountEmail.lowercased(), default: []].insert(destination.lastPathComponent) }
+    }
   }
 
   /// The same, for the account the record's id is scoped to, giving up after `timeout`
@@ -103,9 +113,17 @@ public enum KeptThumbnails {
     }
   }
 
+  /// Drops the thumbnails of items moved to the Locked Folder.
+  static func remove(_ mediaKeys: Set<String>, accountEmail: String) {
+    let files = mediaKeys.map { url(mediaKey: $0, accountEmail: accountEmail) }
+    for file in files { try? FileManager.default.removeItem(at: file) }
+    index.withLock { $0[accountEmail.lowercased()]?.subtract(files.map(\.lastPathComponent)) }
+  }
+
   public static func removeAll(accountEmail: String) {
+    LockedItems.forget(accountEmail: accountEmail)
     try? FileManager.default.removeItem(at: directory(for: accountEmail))
-    index.withLock { $0[accountEmail] = [] }
+    index.withLock { $0[accountEmail.lowercased()] = [] }
   }
 
   /// Drops thumbnails of items no longer in Google Photos.
@@ -116,7 +134,7 @@ public enum KeptThumbnails {
     for file in files where !wanted.contains(file) {
       try? FileManager.default.removeItem(at: folder.appending(path: file))
     }
-    index.withLock { $0[accountEmail] = Set(files).intersection(wanted) }
+    index.withLock { $0[accountEmail.lowercased()] = Set(files).intersection(wanted) }
   }
 
   private static func thumbnail(file: URL, isVideo: Bool) async -> CGImage? {
@@ -168,18 +186,57 @@ public enum RecentlyViewed {
   private static let key = "RecentlyViewedAssets"
   private static let horizon: TimeInterval = 60 * 24 * 60 * 60
 
-  public static func record(_ assetID: String, now: Date = Date(), defaults: UserDefaults = .standard) {
-    var viewed = defaults.dictionary(forKey: key) as? [String: Double] ?? [:]
-    viewed[assetID] = now.timeIntervalSince1970
-    let cutoff = now.timeIntervalSince1970 - horizon
-    if viewed.count > 2_000 { viewed = viewed.filter { $0.value > cutoff } }
-    defaults.set(viewed, forKey: key)
+  private static let pending = OSAllocatedUnfairLock(initialState: [String: Double]())
+  private static let writer = DispatchQueue(label: "RecentlyViewed", qos: .utility)
+
+  private static func recordInViewer(_ assetID: String, now: Date = Date()) {
+    let startWriter = pending.withLock { viewed in
+      let wasEmpty = viewed.isEmpty
+      viewed[assetID] = max(viewed[assetID] ?? -.infinity, now.timeIntervalSince1970)
+      return wasEmpty
+    }
+    if startWriter { writer.async(execute: persistPending) }
   }
 
-  public static func assetIDs(within interval: TimeInterval, now: Date = Date(), defaults: UserDefaults = .standard)
+  private static func persistPending() {
+    let batch = pending.withLock { $0 }
+    let defaults = UserDefaults.standard
+    var viewed = defaults.dictionary(forKey: key) as? [String: Double] ?? [:]
+    viewed.merge(batch, uniquingKeysWith: max)
+    save(viewed, now: Date(), defaults: defaults)
+    let more = pending.withLock { viewed in
+      for (id, time) in batch where viewed[id] == time {
+        viewed[id] = nil
+      }
+      return !viewed.isEmpty
+    }
+    if more { writer.async(execute: persistPending) }
+  }
+
+  public static func record(_ assetID: String, now: Date = Date(), defaults: UserDefaults = .standard) {
+    if defaults === UserDefaults.standard {
+      recordInViewer(assetID, now: now)
+      return
+    }
+    var viewed = defaults.dictionary(forKey: key) as? [String: Double] ?? [:]
+    viewed[assetID] = now.timeIntervalSince1970
+    save(viewed, now: now, defaults: defaults)
+  }
+
+  private static func save(_ viewed: [String: Double], now: Date, defaults: UserDefaults) {
+    let cutoff = now.timeIntervalSince1970 - horizon
+    defaults.set(viewed.count > 2_000 ? viewed.filter { $0.value > cutoff } : viewed, forKey: key)
+  }
+
+  public static func assetIDs(
+    within interval: TimeInterval, now: Date = Date(), defaults: UserDefaults = .standard
+  )
     -> Set<String>
   {
-    let viewed = defaults.dictionary(forKey: key) as? [String: Double] ?? [:]
+    // Read pending first: the writer only removes an entry after it is in defaults.
+    let recent = defaults === UserDefaults.standard ? pending.withLock { $0 } : [:]
+    var viewed = defaults.dictionary(forKey: key) as? [String: Double] ?? [:]
+    viewed.merge(recent, uniquingKeysWith: max)
     let cutoff = now.timeIntervalSince1970 - interval
     return Set(viewed.filter { $0.value >= cutoff }.keys)
   }

@@ -10,14 +10,30 @@ final class SQLiteDatabase {
     case text(String)
     case blob(Data)
     case null
+
+    /// For `IN (SELECT value FROM json_each(?))`: any number of strings in one statement.
+    static func list(_ strings: some Collection<String>) throws -> Value {
+      .text(String(decoding: try JSONEncoder().encode(Array(strings)), as: UTF8.self))
+    }
   }
 
   struct Failure: Error, CustomStringConvertible {
     let description: String
   }
 
+  private struct Cached {
+    let statement: OpaquePointer
+    var lastUse: UInt64
+  }
+
   private var handle: OpaquePointer?
-  private var statements: [String: OpaquePointer] = [:]
+  private var statements: [String: Cached] = [:]
+  private var uses: UInt64 = 0
+  /// Statements between their prepare and reset; a nested query never finalizes them.
+  private var active: Set<OpaquePointer> = []
+  /// Queries with generated `IN` lists have a new text for every list length, so the
+  /// least recently used statements are finalized past this many.
+  static let statementLimit = 128
   private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
   init(url: URL) throws {
@@ -33,12 +49,26 @@ final class SQLiteDatabase {
   }
 
   deinit {
-    for statement in statements.values { sqlite3_finalize(statement) }
+    for cached in statements.values { sqlite3_finalize(cached.statement) }
     sqlite3_close(handle)
   }
 
+  var cachedStatementCount: Int { statements.count }
+
+  /// Rows the last `run` inserted, updated or deleted.
+  var changes: Int { Int(sqlite3_changes(handle)) }
+
   func execute(_ sql: String) throws {
     guard sqlite3_exec(handle, sql, nil, nil, nil) == SQLITE_OK else { throw error() }
+  }
+
+  /// Writes the log into the file over the pages it replaces, and empties the log.
+  func checkpoint() throws {
+    var isBusy = true
+    for _ in 0..<3 where isBusy {
+      try query("PRAGMA wal_checkpoint(TRUNCATE)") { isBusy = $0.int(0) != 0 }
+    }
+    if isBusy { throw Failure(description: "checkpoint: busy") }
   }
 
   func transaction<T>(_ body: () throws -> T) throws -> T {
@@ -56,7 +86,11 @@ final class SQLiteDatabase {
   /// Runs a statement that returns no rows.
   func run(_ sql: String, _ values: [Value] = []) throws {
     let statement = try prepare(sql, values)
-    defer { sqlite3_reset(statement) }
+    active.insert(statement)
+    defer {
+      sqlite3_reset(statement)
+      active.remove(statement)
+    }
     let result = sqlite3_step(statement)
     guard result == SQLITE_DONE || result == SQLITE_ROW else { throw error() }
   }
@@ -64,7 +98,11 @@ final class SQLiteDatabase {
   /// Calls `row` for each result row.
   func query(_ sql: String, _ values: [Value] = [], row: (Row) throws -> Void) throws {
     let statement = try prepare(sql, values)
-    defer { sqlite3_reset(statement) }
+    active.insert(statement)
+    defer {
+      sqlite3_reset(statement)
+      active.remove(statement)
+    }
     while true {
       let result = sqlite3_step(statement)
       if result == SQLITE_DONE { return }
@@ -95,12 +133,15 @@ final class SQLiteDatabase {
 
   private func prepare(_ sql: String, _ values: [Value]) throws -> OpaquePointer {
     let statement: OpaquePointer
+    uses &+= 1
     if let cached = statements[sql] {
-      statement = cached
+      statement = cached.statement
+      statements[sql]?.lastUse = uses
     } else {
       var prepared: OpaquePointer?
       guard sqlite3_prepare_v2(handle, sql, -1, &prepared, nil) == SQLITE_OK, let prepared else { throw error() }
-      statements[sql] = prepared
+      if statements.count >= Self.statementLimit { evictLeastRecentlyUsed() }
+      statements[sql] = Cached(statement: prepared, lastUse: uses)
       statement = prepared
     }
     sqlite3_clear_bindings(statement)
@@ -116,6 +157,13 @@ final class SQLiteDatabase {
       }
     }
     return statement
+  }
+
+  private func evictLeastRecentlyUsed() {
+    let idle = statements.lazy.filter { !self.active.contains($0.value.statement) }
+    guard let oldest = idle.min(by: { $0.value.lastUse < $1.value.lastUse }) else { return }
+    sqlite3_finalize(oldest.value.statement)
+    statements[oldest.key] = nil
   }
 
   private func error() -> Failure {

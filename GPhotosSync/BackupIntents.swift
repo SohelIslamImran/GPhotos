@@ -69,6 +69,13 @@ struct BackupStatusIntent: AppIntent {
   func perform() async throws -> some IntentResult & ProvidesDialog & ShowsSnippetView {
     if !model.hasLoadedAccounts { await model.loadAccounts() }
     await model.refreshRecords()
+    #if os(macOS)
+      let failedCount = model.accountRecordCounts.failed
+      let lastBackup = model.accountRecords.compactMap(\.sentAt).max()
+    #else
+      let failedCount = model.accountFailedCount
+      let lastBackup = model.accountBuckets.lastBackup
+    #endif
     let status: BackupStatus = model.selectedAccount == nil ? .signedOut : model.backupStatus
     let summary =
       model.selectedAccount == nil
@@ -76,8 +83,8 @@ struct BackupStatusIntent: AppIntent {
       : status.title + ". "
         + BackupIntentSummary.text(
           pending: model.accountQueuedCount, uploading: model.accountUploadingCount,
-          failed: model.accountRecords.filter { $0.status == .failed }.count,
-          lastBackup: model.accountRecords.compactMap(\.sentAt).max())
+          failed: failedCount,
+          lastBackup: lastBackup)
     return .result(dialog: IntentDialog(stringLiteral: summary)) {
       VStack(alignment: .leading, spacing: 8) {
         Label(status.title, systemImage: status.symbol)

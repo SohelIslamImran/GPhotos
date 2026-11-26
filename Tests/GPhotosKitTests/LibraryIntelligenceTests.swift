@@ -622,6 +622,476 @@ struct LibraryIntelligenceTests {
     #expect(abs(MemoryFinder.kilometres(moments[0], moments[25]) - 7_900) < 200)
   }
 
+  @Test("On This Day handles leap day and multi-year history without Calendar per item")
+  func onThisDayLeapYear() {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "UTC")!
+    func day(_ y: Int, _ m: Int, _ d: Int) -> Date {
+      calendar.date(from: DateComponents(year: y, month: m, day: d, hour: 10))!
+    }
+    let moments = [
+      MemoryFinder.Moment(date: day(2016, 2, 29), latitude: nil, longitude: nil),
+      MemoryFinder.Moment(date: day(2019, 3, 1), latitude: nil, longitude: nil),
+      MemoryFinder.Moment(date: day(2020, 2, 29), latitude: nil, longitude: nil),
+      MemoryFinder.Moment(date: day(2024, 2, 29), latitude: nil, longitude: nil),
+    ]
+    let found = MemoryFinder.onThisDay(moments, today: day(2024, 2, 29), calendar: calendar)
+    #expect(found.map(\.year) == [2020, 2016])
+    #expect(found.map(\.indices) == [[2], [0]])
+  }
+
+  @MainActor
+  @Test("People-dirty counter tracks mutations, persists clean state and skips unchanged passes")
+  func peopleDirtyCounter() async throws {
+    let dir = TestTemporaryDirectory.root.appending(path: "PeopleDirty-\(UUID().uuidString)")
+    let store = LibraryIndexStore(directory: dir)
+    // Empty database starts clean.
+    #expect(try await store.needsPeoplePass() == false)
+    let v0 = try await store.peopleDirtyVersion()
+
+    // Saving an item without faces does not dirty People.
+    var dog = ItemAnalysis()
+    dog.labels = [("dog", 0.9)]
+    try await store.save(ItemMetadata(id: "no-face", date: Date(), words: []), analysis: dog)
+    #expect(try await store.peopleDirtyVersion() == v0)
+    #expect(try await store.needsPeoplePass() == false)
+
+    // Saving a face dirties People.
+    let vector = (0..<64).map { Float($0 % 5) / 5 }.withUnsafeBytes { Data($0) }
+    var withFace = ItemAnalysis()
+    withFace.faces = [DetectedFace(rect: CGRect(x: 0.1, y: 0.1, width: 0.3, height: 0.3), featurePrint: vector)]
+    try await store.save(ItemMetadata(id: "f1", date: Date(), words: []), analysis: withFace)
+    let v1 = try await store.peopleDirtyVersion()
+    #expect(v1 > v0)
+    #expect(try await store.needsPeoplePass() == true)
+
+    // Stored k0..k3 buckets are loaded on IndexedFace without recomputing.
+    let clustering = try await store.facesForClustering()
+    #expect(clustering.count == 1)
+    #expect(clustering[0].buckets == FaceClustering.buckets(vector))
+
+    // Running updatePeople assigns the face and marks clean.
+    let indexer = LibraryIndexer(store: store, spotlight: nil)
+    #expect(await indexer.updatePeople() == true)
+    #expect(try await store.needsPeoplePass() == false)
+
+    // Second call skips immediately.
+    #expect(await indexer.updatePeople() == false)
+
+    // Reopening the database on cold launch keeps clean state.
+    let reopened = LibraryIndexStore(directory: dir)
+    #expect(try await reopened.needsPeoplePass() == false)
+
+    // Naming or hiding a person bumps peopleDirtyVersion (for Spotlight) without triggering a full merge pass.
+    let personID = try #require(try await reopened.faces().first?.person)
+    let beforeNameDirty = try await reopened.peopleDirtyVersion()
+    let beforeNameClustering = try await reopened.peopleClusteringVersion()
+    try await reopened.name(person: personID, "Ada")
+    #expect(try await reopened.peopleDirtyVersion() > beforeNameDirty)
+    #expect(try await reopened.peopleClusteringVersion() == beforeNameClustering)
+    #expect(try await reopened.needsPeoplePass() == false)
+    let named = try await reopened.namedPeople()
+    #expect(named.count == 1)
+    #expect(named[0].name == "Ada")
+    #expect(named[0].photoCount == 1)
+    #expect(try await reopened.personName(id: personID) == "Ada")
+
+    let beforeHideDirty = try await reopened.peopleDirtyVersion()
+    try await reopened.hide(person: personID)
+    #expect(try await reopened.peopleDirtyVersion() > beforeHideDirty)
+    #expect(try await reopened.peopleClusteringVersion() == beforeNameClustering)
+    #expect(try await reopened.needsPeoplePass() == false)
+
+    // Refused merge does not bump the dirty counter.
+    let beforeRefused = try await reopened.peopleDirtyVersion()
+    #expect(try await reopened.mergePeople([personID: personID]) == false)
+    #expect(try await reopened.peopleDirtyVersion() == beforeRefused)
+  }
+
+  @MainActor
+  @Test("updatePeople settles merges cleanly so the next pass does not re-scan")
+  func updatePeopleSettlesMergesCleanly() async throws {
+    let store = makeStore()
+    let vector = (0..<64).map { Float($0 % 5) / 5 }.withUnsafeBytes { Data($0) }
+    var withFace = ItemAnalysis()
+    withFace.faces = [DetectedFace(rect: CGRect(x: 0.1, y: 0.1, width: 0.3, height: 0.3), featurePrint: vector)]
+    try await store.save(ItemMetadata(id: "p1", date: Date(), words: []), analysis: withFace)
+    try await store.save(ItemMetadata(id: "p2", date: Date(), words: []), analysis: withFace)
+    let faces = try await store.faces()
+    // Assign identical faces to two distinct people so phase 2 must merge them.
+    try await store.assignFaces([faces[0].id: 1, faces[1].id: 2])
+    #expect(try await store.needsPeoplePass() == true)
+
+    let indexer = LibraryIndexer(store: store, spotlight: nil)
+    #expect(await indexer.updatePeople() == true)
+    // After settling merges, needsPeoplePass must be false without needing another pass.
+    #expect(try await store.needsPeoplePass() == false)
+    #expect(await indexer.updatePeople() == false)
+  }
+
+  @MainActor
+  @Test("rekeyDeleted moves confirmed-deleted device analysis to Google id so next pass needs zero Google analysis")
+  func rekeyDeletedPreventsCloudReanalysis() async throws {
+    let store = makeStore()
+    var analysis = ItemAnalysis()
+    analysis.labels = [("mountain", 0.92)]
+    analysis.text = "Alps Summit"
+    try await store.save(
+      ItemMetadata(id: "DEV-CLEAN", date: Date(timeIntervalSince1970: 5_000), words: ["photo"]), analysis: analysis)
+
+    let browsedPrimary = TransferRecord(
+      id: "browsed@example.com|DEV-CLEAN", filename: "IMG_1.HEIC", mediaType: "Photo", status: .deleted,
+      sentAccountEmails: ["browsed@example.com"],
+      mediaKeysByAccount: ["browsed@example.com": "M_CLEAN", "other@example.com": "M_OTHER"],
+      assetLocalIdentifier: "DEV-CLEAN", resourceRole: .primary)
+    let rawCompanion = TransferRecord(
+      id: "browsed@example.com|DEV-CLEAN|raw", filename: "IMG_1.DNG", mediaType: "Photo", status: .deleted,
+      sentAccountEmails: ["browsed@example.com"],
+      mediaKeysByAccount: ["browsed@example.com": "M_RAW"],
+      assetLocalIdentifier: "DEV-CLEAN", resourceRole: .alternatePhoto)
+
+    let pairs = LibraryIndexer.rekeyPairs(for: [browsedPrimary, rawCompanion], accountEmail: "browsed@example.com")
+    #expect(pairs.count == 1)
+    #expect(pairs[0].from == "DEV-CLEAN")
+    #expect(pairs[0].to == LibraryIndexer.searchID(cloudMediaKey: "M_CLEAN"))
+
+    let email = "browsed@example.com"
+    let cloud = try await rekeyCloud(email: email, items: [rekeyItem("M_CLEAN")])
+    LockedItems.load([], accountEmail: email)
+    defer { LockedItems.forget(accountEmail: email) }
+    let rekey = LibraryIndexer.scheduleRekeyDeleted([browsedPrimary, rawCompanion], cloud: cloud, store: store)
+    await rekey?.value
+    await cloud.retire()
+
+    let cloudItem = RemoteItemSummary(
+      mediaKey: "M_CLEAN", dedupKey: "D1", sha1: nil, kind: .photo, takenAt: Date(timeIntervalSince1970: 5_000),
+      contentVersion: 1, durationMs: nil, isFavorite: false, trashedAt: nil, width: 100, height: 100,
+      fileName: "IMG_1.HEIC")
+    let postCleanupSnapshot = UnifiedLibraryModel.IndexSnapshot(
+      entries: [.cloud(0)], device: [], cloud: [cloudItem], folder: [], cloudLibrary: nil)
+    let currentIDs = LibraryIndexer.indexIDs(postCleanupSnapshot)
+    _ = try await store.prune(keeping: currentIDs, device: true, folder: false, cloud: true)
+
+    let settled = try await store.settledIDs()
+    let pending = LibraryIndexer.workItems(postCleanupSnapshot, settled: settled)
+    #expect(pending.isEmpty)
+    #expect(try await store.search([["mountain"]]) == ["g:M_CLEAN"])
+    #expect(try await store.search([["summit"]]) == ["g:M_CLEAN"])
+  }
+
+  @MainActor
+  @Test("Rekey needs a visible mirror target and rechecks the lock and Library at the write")
+  func rekeySkipsLockedMissingAndRetiredTargets() async throws {
+    let email = "rekey-\(UUID().uuidString)@example.com"
+    let cloud = try await rekeyCloud(email: email, items: [rekeyItem("locked", locked: true), rekeyItem("open"), rekeyItem("second")])
+    LockedItems.load([], accountEmail: email)
+    defer { LockedItems.forget(accountEmail: email) }
+    let store = makeStore()
+    for id in ["locked", "missing", "open", "retired"] {
+      var analysis = ItemAnalysis()
+      analysis.labels = [("mountain", 0.9)]
+      try await store.save(ItemMetadata(id: id, date: Date(), words: []), analysis: analysis)
+    }
+    func deleted(_ key: String) -> TransferRecord {
+      TransferRecord(
+        id: "\(email)|\(key)", filename: "\(key).jpg", mediaType: "Photo", status: .deleted,
+        sentAccountEmails: [email], mediaKeysByAccount: [email: key], assetLocalIdentifier: key, resourceRole: .primary)
+    }
+
+    let rekey = LibraryIndexer.scheduleRekeyDeleted([deleted("locked"), deleted("missing")], cloud: cloud, store: store)
+    await rekey?.value
+    #expect(Set(try await store.search([["mountain"]])) == ["locked", "missing", "open", "retired"])
+
+    // The mirror's lookup may already have returned an open key when a new page locks it.
+    LockedItems.insert(["open"], accountEmail: email)
+    try await store.rekeyKnownUnlocked([(from: "open", to: "g:open")], cloud: cloud)
+    #expect(Set(try await store.search([["mountain"]])).contains("open"))
+
+    LockedItems.release(["open"], accountEmail: email)
+    cloud.cancelSync()
+    try await store.rekeyKnownUnlocked([(from: "retired", to: "g:second")], cloud: cloud)
+    #expect(Set(try await store.search([["mountain"]])).contains("retired"))
+    await cloud.retire()
+  }
+
+  @MainActor
+  @Test("Scheduling post-delete rekey returns before the queued work can run")
+  func postDeleteRekeyIsBestEffort() async throws {
+    let email = "rekey-\(UUID().uuidString)@example.com"
+    let cloud = try await rekeyCloud(email: email, items: [rekeyItem("open")])
+    LockedItems.load([], accountEmail: email)
+    defer { LockedItems.forget(accountEmail: email) }
+    let store = makeStore()
+    var analysis = ItemAnalysis()
+    analysis.labels = [("mountain", 0.9)]
+    try await store.save(ItemMetadata(id: "device", date: Date(), words: []), analysis: analysis)
+    let record = TransferRecord(
+      id: "\(email)|device", filename: "device.jpg", mediaType: "Photo", status: .deleted,
+      sentAccountEmails: [email], mediaKeysByAccount: [email: "open"], assetLocalIdentifier: "device", resourceRole: .primary)
+    let rekey = try #require(LibraryIndexer.scheduleRekeyDeleted([record], cloud: cloud, store: store))
+    // Same actor turn as scheduling. Cleanup can return and the account can retire before rekey starts.
+    cloud.cancelSync()
+    await rekey.value
+    #expect(try await store.search([["mountain"]]) == ["device"])
+    await cloud.retire()
+  }
+
+  @MainActor
+  private func rekeyCloud(email: String, items: [RemoteMediaItem]) async throws -> CloudLibrary {
+    let remote = RemoteLibraryStore(accountEmail: email, directory: TestTemporaryDirectory.root.appending(path: UUID().uuidString))
+    try await remote.apply(
+      RemoteLibraryUpdate(
+        syncToken: "t", resumeToken: "", items: items, deletedMediaKeys: [], triggersNextSync: false, albums: [],
+        deletedAlbumKeys: []),
+      syncToken: "t")
+    let client = GooglePhotosMobileClient(authService: GoogleAuthService())
+    return CloudLibrary(
+      accountEmail: email, store: remote, fetcher: client,
+      thumbnails: GoogleThumbnailSource(client: client, accountEmail: email), actionClient: nil)
+  }
+
+  private func rekeyItem(_ key: String, locked: Bool = false) -> RemoteMediaItem {
+    RemoteMediaItem(
+      mediaKey: key, dedupKey: "d-\(key)", sha1: nil, fileName: "\(key).jpg", caption: nil, kind: .photo,
+      sizeBytes: 10, quotaChargedBytes: 0, isOriginalQuality: true, takenAt: Date(), timezoneOffsetMinutes: nil,
+      uploadedAt: nil, contentVersion: 1, trashedAt: nil, isArchived: false, isFavorite: false, isLocked: locked,
+      isCanonical: true, isEdited: false, origin: 0, width: 100, height: 100, latitude: nil, longitude: nil,
+      locationName: nil, cameraMake: nil, cameraModel: nil, aperture: nil, shutterSpeed: nil, iso: nil,
+      focalLength: nil, durationMs: nil)
+  }
+
+  @MainActor
+  @Test("LibraryIndexer.search fails closed for locked or signed-out Google items")
+  func indexerSearchFailsClosedForLockedItems() async throws {
+    let dir = TestTemporaryDirectory.root.appending(path: "SearchLocked-\(UUID().uuidString)")
+    let store = LibraryIndexStore(directory: dir.appending(path: "index"))
+    let remoteStore = RemoteLibraryStore(accountEmail: "search@example.com", directory: dir.appending(path: "remote"))
+
+    var analysis = ItemAnalysis()
+    analysis.labels = [("sunset", 0.95)]
+    try await store.save(ItemMetadata(id: "g:LOCKED_S", date: Date(), words: []), analysis: analysis)
+    try await store.save(ItemMetadata(id: "g:OPEN_S", date: Date(), words: []), analysis: analysis)
+    try await store.save(ItemMetadata(id: "DEV_S", date: Date(), words: []), analysis: analysis)
+
+    let lockedItem = RemoteMediaItem(
+      mediaKey: "LOCKED_S", dedupKey: "DL", sha1: nil, fileName: "secret.jpg", caption: nil, kind: .photo,
+      sizeBytes: 10, quotaChargedBytes: 0, isOriginalQuality: true, takenAt: Date(), timezoneOffsetMinutes: nil,
+      uploadedAt: nil, contentVersion: 1, trashedAt: nil, isArchived: false, isFavorite: false, isLocked: true,
+      isCanonical: true, isEdited: false, origin: 0, width: 100, height: 100, latitude: nil, longitude: nil,
+      locationName: nil, cameraMake: nil, cameraModel: nil, aperture: nil, shutterSpeed: nil, iso: nil,
+      focalLength: nil, durationMs: nil)
+    let openItem = RemoteMediaItem(
+      mediaKey: "OPEN_S", dedupKey: "DO", sha1: nil, fileName: "open.jpg", caption: nil, kind: .photo,
+      sizeBytes: 10, quotaChargedBytes: 0, isOriginalQuality: true, takenAt: Date(), timezoneOffsetMinutes: nil,
+      uploadedAt: nil, contentVersion: 1, trashedAt: nil, isArchived: false, isFavorite: false, isLocked: false,
+      isCanonical: true, isEdited: false, origin: 0, width: 100, height: 100, latitude: nil, longitude: nil,
+      locationName: nil, cameraMake: nil, cameraModel: nil, aperture: nil, shutterSpeed: nil, iso: nil,
+      focalLength: nil, durationMs: nil)
+    try await remoteStore.apply(
+      RemoteLibraryUpdate(
+        syncToken: "t", resumeToken: "", items: [lockedItem, openItem], deletedMediaKeys: [],
+        triggersNextSync: false, albums: [], deletedAlbumKeys: []),
+      syncToken: "t")
+
+    struct StubFetcher: RemoteLibraryFetching {
+      private static var empty: RemoteLibraryUpdate {
+        RemoteLibraryUpdate(
+          syncToken: "", resumeToken: "", items: [], deletedMediaKeys: [], triggersNextSync: false, albums: [],
+          deletedAlbumKeys: [])
+      }
+      func libraryState(syncToken: String) async throws -> RemoteLibraryUpdate { Self.empty }
+      func libraryInitialPage(resumeToken: String) async throws -> RemoteLibraryUpdate { Self.empty }
+      func libraryDeltaPage(resumeToken: String, syncToken: String) async throws -> RemoteLibraryUpdate { Self.empty }
+    }
+    final class EmptyThumbSource: ThumbnailSource, @unchecked Sendable {
+      func requestImage(
+        id: String, pixelSize: CGSize, quality: ImageRequestQuality,
+        onUnavailable: @escaping @Sendable () -> Void,
+        deliver: @escaping @Sendable (CGImage, Bool) -> Void
+      ) -> ImageRequestToken { .none }
+    }
+    let cloud = CloudLibrary(
+      accountEmail: "search@example.com", store: remoteStore, fetcher: StubFetcher(), thumbnails: EmptyThumbSource(),
+      actionClient: nil)
+    let previousCloud = SiriLibrary.shared.cloud
+    let previousLoad = SiriLibrary.shared.loadAccounts
+    SiriLibrary.shared.loadAccounts = nil
+    SiriLibrary.shared.cloud = cloud
+    defer {
+      SiriLibrary.shared.cloud = previousCloud
+      SiriLibrary.shared.loadAccounts = previousLoad
+    }
+
+    let indexer = LibraryIndexer(store: store, spotlight: nil)
+    let found = await indexer.search("sunset")
+    #expect(Set(found) == ["g:OPEN_S", "DEV_S"])
+
+    // Signed out / unavailable cloud fails closed for all g: items.
+    SiriLibrary.shared.cloud = nil
+    let signedOut = await indexer.search("sunset")
+    #expect(signedOut == ["DEV_S"])
+  }
+
+  @Test("Rekey moves analysis from device id to Google id, handles collisions and drops prints")
+  func rekeyMovesAnalysis() async throws {
+    let store = makeStore()
+    let vector = (0..<64).map { Float($0) / 64 }.withUnsafeBytes { Data($0) }
+    var analysis = ItemAnalysis()
+    analysis.labels = [("beach", 0.9), ("sunset", 0.8)]
+    analysis.text = "Boardwalk Cafe"
+    analysis.aesthetics = 0.85
+    analysis.isUtility = true
+    analysis.featurePrint = vector
+    analysis.faces = [DetectedFace(rect: CGRect(x: 0.2, y: 0.2, width: 0.3, height: 0.3), featurePrint: vector)]
+    try await store.save(
+      ItemMetadata(id: "DEV-1", date: Date(timeIntervalSince1970: 10_000), words: ["July"]), analysis: analysis)
+    let faceID = try #require(try await store.faces().first?.id)
+    try await store.assignFaces([faceID: 42])
+    try await store.name(person: 42, "Sam")
+
+    // Target already exists as metadata-only (has_pixels = 0) with Google place/caption metadata.
+    try await store.saveAll(
+      [(ItemMetadata(id: "g:M1", date: Date(timeIntervalSince1970: 10_000), words: ["Paris", "google"]), nil)],
+      pixelsPending: true)
+
+    // Second pair whose target already has pixel analysis must be skipped.
+    var existingCloud = ItemAnalysis()
+    existingCloud.labels = [("cat", 0.95)]
+    try await store.save(ItemMetadata(id: "DEV-2", date: Date(), words: []), analysis: analysis)
+    try await store.save(ItemMetadata(id: "g:M2", date: Date(), words: []), analysis: existingCloud)
+
+    let moved = try await store.rekey([(from: "DEV-1", to: "g:M1"), (from: "DEV-2", to: "g:M2")])
+    #expect(moved == 1)
+
+    // Device id is gone; Google id is settled with pixels, labels, OCR, merged Google metadata and face.
+    let settled = try await store.settledIDs()
+    #expect(!settled.contains("DEV-1"))
+    #expect(settled.contains("g:M1"))
+    #expect(try await store.pixelAnalyzedIDs().contains("g:M1"))
+    #expect(try await store.search([["beach"]]) == ["DEV-2", "g:M1"])
+    #expect(try await store.search([["boardwalk"]]) == ["DEV-2", "g:M1"])
+    #expect(try await store.search([["paris"]]) == ["g:M1"])
+    #expect(try await store.ids(ofPerson: 42) == ["g:M1"])
+    #expect(try await store.utilityCount() == 2)
+
+    // Feature print was dropped for the rekeyed Google item (device DEV-2 still keeps its print).
+    var printedIDs: [String] = []
+    try await store.forEachPrintByTime { id, _, _, _ in printedIDs.append(id) }
+    #expect(!printedIDs.contains("DEV-1"))
+    #expect(!printedIDs.contains("g:M1"))
+    #expect(printedIDs.contains("DEV-2"))
+
+    // Target with existing pixel analysis kept its own analysis.
+    #expect(try await store.search([["cat"]]) == ["g:M2"])
+  }
+
+  @Test("Unaligned Data slices compute face buckets and streaming similarity safely")
+  func unalignedFloatBuffers() {
+    let raw = (0..<64).map { sin(Float($0)) }.withUnsafeBytes { Data($0) }
+    var padded = Data([0xFF])
+    padded.append(raw)
+    let unalignedSlice = padded.dropFirst()
+    #expect(FaceClustering.buckets(unalignedSlice) == FaceClustering.buckets(raw))
+
+    var sim = StreamingSimilarity()
+    sim.add(id: "a", date: Date(timeIntervalSince1970: 100), print: unalignedSlice, score: 0.5)
+    sim.add(id: "b", date: Date(timeIntervalSince1970: 105), print: unalignedSlice, score: 0.8)
+    #expect(sim.groups() == [[0, 1]])
+  }
+
+  @MainActor
+  @Test("Backed-up folder files analyze local pixels under their Google id with zero Google requests")
+  func folderAnalysisUsesLocalPixels() async throws {
+    let dir = TestTemporaryDirectory.root.appending(path: "FolderIndex-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let fileURL = dir.appending(path: "IMG_1001.png")
+
+    // Create a local PNG with clear text so Vision analyzes it locally on both platforms.
+    let context = try #require(
+      CGContext(
+        data: nil, width: 256, height: 256, bitsPerComponent: 8, bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+    context.setFillColor(CGColor(red: 0.1, green: 0.5, blue: 0.9, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: 256, height: 256))
+    let cgImage = try #require(context.makeImage())
+    let dest = try #require(CGImageDestinationCreateWithURL(fileURL as CFURL, "public.png" as CFString, 1, nil))
+    CGImageDestinationAddImage(dest, cgImage, nil)
+    #expect(CGImageDestinationFinalize(dest))
+
+    let folderItem = FolderItemInfo(path: fileURL.path, date: Date(timeIntervalSince1970: 2_000), size: 1024, isVideo: false)
+    let missingItem = FolderItemInfo(
+      path: dir.appending(path: "missing.png").path, date: Date(timeIntervalSince1970: 3_000), size: 1024, isVideo: false)
+    let cloudItem = RemoteItemSummary(
+      mediaKey: "M_LOCAL", dedupKey: "D1", sha1: nil, kind: .photo, takenAt: Date(timeIntervalSince1970: 2_000),
+      contentVersion: 1, durationMs: nil, isFavorite: false, trashedAt: nil, width: 256, height: 256,
+      fileName: "IMG_1001.png")
+    let missingCloud = RemoteItemSummary(
+      mediaKey: "M_MISSING", dedupKey: "D2", sha1: nil, kind: .photo, takenAt: Date(timeIntervalSince1970: 3_000),
+      contentVersion: 1, durationMs: nil, isFavorite: false, trashedAt: nil, width: 256, height: 256,
+      fileName: "missing.png")
+    let snapshot = UnifiedLibraryModel.IndexSnapshot(
+      entries: [.folder(0, cloud: 0), .folder(1, cloud: 1)], device: [], cloud: [cloudItem, missingCloud],
+      folder: [folderItem, missingItem], cloudLibrary: nil)
+
+    let work = LibraryIndexer.workItems(snapshot, settled: [])
+    #expect(work.count == 2)
+    #expect(work[0].id == "g:M_LOCAL")
+    #expect(work[0].file?.path == fileURL.path)
+    #expect(work[0].cloud?.mediaKey == "M_LOCAL")
+
+    let store = makeStore()
+    let indexer = LibraryIndexer(store: store, spotlight: nil)
+    // `cloudLibrary` is nil (no GoogleThumbnailSource exists at all): local analysis must succeed
+    // for the readable file and return only the missing file for cloud fallback.
+    let fallback = await indexer.analyzeLocalFiles(work, in: snapshot) { _ in }
+    #expect(fallback.map(\.id) == ["g:M_MISSING"])
+    #expect(try await store.analyzedIDs().contains("g:M_LOCAL"))
+    #expect(try await store.settledIDs().contains("g:M_LOCAL"))
+  }
+
+  @Test("Places extracts newest-first points from the unfiltered timeline")
+  func placesNewestFirstAndUnfiltered() {
+    let older = DeviceItemInfo(
+      localIdentifier: "OLD", date: Date(timeIntervalSince1970: 1_000), width: 10, height: 10, isVideo: false,
+      isFavorite: false, latitude: 48.85, longitude: 2.35)
+    let newer = DeviceItemInfo(
+      localIdentifier: "NEW", date: Date(timeIntervalSince1970: 2_000), width: 10, height: 10, isVideo: false,
+      isFavorite: true, latitude: 48.85, longitude: 2.35)
+    // TimelineMerge expects inputs newest first and outputs oldest first.
+    let device = [newer, older]
+    let filtered = TimelineMerge.merge(device: device, cloud: [], uploadedMediaKeys: [:], filter: .favorites)
+    var inputs = UnifiedLibraryModel.MergeInputs()
+    inputs.isFiltered = true
+    let snapshot = UnifiedLibraryModel.IndexSnapshot(
+      entries: filtered, device: device, cloud: [], folder: [], cloudLibrary: nil, inputs: inputs)
+    let points = PlacesView.points(snapshot.unfiltered())
+    #expect(points.map(\.id) == ["NEW", "OLD"])
+  }
+
+  @Test("Low Data Mode turning off posts didChangeConstrained without firing didReconnect")
+  func constrainedChangeNotification() {
+    let monitor = NetworkStatusMonitor(watches: false)
+    let constrainedCount = LockedCounter()
+    let reconnectCount = LockedCounter()
+    let cToken = NotificationCenter.default.addObserver(
+      forName: NetworkStatusMonitor.didChangeConstrained, object: monitor, queue: nil
+    ) { _ in constrainedCount.increment() }
+    let rToken = NotificationCenter.default.addObserver(
+      forName: NetworkStatusMonitor.didReconnect, object: monitor, queue: nil
+    ) { _ in reconnectCount.increment() }
+    defer {
+      NotificationCenter.default.removeObserver(cToken)
+      NotificationCenter.default.removeObserver(rToken)
+    }
+
+    monitor.update(isConnected: true, isExpensive: false, isConstrained: true)
+    let beforeFlipConstrained = constrainedCount.value
+    let beforeFlipReconnect = reconnectCount.value
+    monitor.update(isConnected: true, isExpensive: false, isConstrained: false)
+    #expect(constrainedCount.value == beforeFlipConstrained + 1)
+    #expect(reconnectCount.value == beforeFlipReconnect)
+  }
+
   #if os(macOS)
     private func picture(_ name: String) -> CGImage? {
       let url = URL(filePath: "/System/Library/Desktop Pictures/.thumbnails/\(name).heic")
@@ -687,4 +1157,11 @@ struct LibraryIntelligenceTests {
       #expect(vectors.distance(0, 2) == nil)
     }
   #endif
+}
+
+private final class LockedCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+  var value: Int { lock.withLock { count } }
+  func increment() { lock.withLock { count += 1 } }
 }

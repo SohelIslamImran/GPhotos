@@ -1,6 +1,7 @@
 import Photos
 import PhotosUI
 import SwiftUI
+import os
 
 /// Plays a Live Photo once with sound, then reports that it finished.
 struct LivePhotoPlayer: View {
@@ -17,19 +18,69 @@ struct LivePhotoPlayer: View {
         options.deliveryMode = .highQualityFormat
         let asset = asset
         let size = pixelSize
-        livePhoto = await withCheckedContinuation { continuation in
-          var resumed = false
-          PHImageManager.default().requestLivePhoto(
-            for: asset, targetSize: size, contentMode: .aspectFit, options: options
-          ) { photo, info in
-            // High quality delivers once; guard anyway against a degraded first call.
-            guard !resumed, (info?[PHImageResultIsDegradedKey] as? Bool) != true else { return }
-            resumed = true
-            continuation.resume(returning: photo)
+        let photo: PHLivePhoto? = await ViewerPhotoKitRequest.run { manager, finish in
+          manager.requestLivePhoto(for: asset, targetSize: size, contentMode: .aspectFit, options: options) { photo, info in
+            if (info?[PHImageCancelledKey] as? Bool) == true || info?[PHImageErrorKey] != nil {
+              finish(nil)
+            } else if (info?[PHImageResultIsDegradedKey] as? Bool) != true {
+              finish(photo)
+            }
           }
         }
+        guard !Task.isCancelled else { return }
+        livePhoto = photo
         if livePhoto == nil { onEnd() }
       }
+  }
+}
+
+/// PhotoKit may call back before returning a request ID, or after cancellation.
+@MainActor
+enum ViewerPhotoKitRequest {
+  static func run<Value: Sendable>(
+    _ start: (PHImageManager, @escaping @Sendable (Value?) -> Void) -> PHImageRequestID
+  ) async -> Value? {
+    let manager = PHImageManager.default()
+    let request = OSAllocatedUnfairLock(initialState: Request<Value>())
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        let shouldStart = request.withLock { state in
+          guard !state.cancelled else { return false }
+          state.continuation = continuation
+          return true
+        }
+        guard shouldStart else {
+          continuation.resume(returning: nil)
+          return
+        }
+        let id = start(manager) { value in
+          let completion = request.withLock { state in
+            defer { state.continuation = nil }
+            return state.continuation
+          }
+          completion?.resume(returning: value)
+        }
+        let shouldCancel = request.withLock { state in
+          state.id = id
+          return state.cancelled
+        }
+        if shouldCancel { manager.cancelImageRequest(id) }
+      }
+    } onCancel: {
+      let (id, continuation) = request.withLock { state in
+        state.cancelled = true
+        defer { state.continuation = nil }
+        return (state.id, state.continuation)
+      }
+      if let id { manager.cancelImageRequest(id) }
+      continuation?.resume(returning: nil)
+    }
+  }
+
+  private struct Request<Value: Sendable>: Sendable {
+    var id: PHImageRequestID?
+    var cancelled = false
+    var continuation: CheckedContinuation<Value?, Never>?
   }
 }
 

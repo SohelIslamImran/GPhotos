@@ -109,17 +109,60 @@ extension MediaViewerSource {
 public struct MediaViewer: View {
   let source: any MediaViewerSource
   let onClose: () -> Void
-  @State private var position: Int?
+  struct PageSelection {
+    let index: Int
+    let id: String
+    let cloudID: String?
+
+    @MainActor func position(in source: any MediaViewerSource) -> Int? {
+      let count = source.itemCount
+      guard count > 0 else { return nil }
+      if index < count, source.itemID(at: index) == id { return index }
+      return source.index(ofItemID: id, near: index)
+        ?? cloudID.flatMap { source.index(ofItemID: $0, near: index) }
+        ?? min(index, count - 1)
+    }
+
+    @MainActor init(index: Int, source: any MediaViewerSource) {
+      self.index = index
+      id = source.itemID(at: index)
+      if id.hasPrefix(FolderItemInfo.idPrefix), case .file(_, _, let copy) = source.viewerItem(at: index) {
+        cloudID = copy?.item.thumbnailID
+      } else {
+        cloudID = nil
+      }
+    }
+  }
+
+  struct PageLocation: Equatable {
+    let index: Int
+    let id: String
+  }
+
+  private var pageLocation: PageLocation? {
+    position.map { PageLocation(index: $0, id: source.itemID(at: $0)) }
+  }
+
+  @State private var pageSelection: PageSelection?
+  private var position: Int? {
+    get { pageSelection?.position(in: source) }
+    nonmutating set { pageSelection = newValue.map { PageSelection(index: $0, source: source) } }
+  }
+  private var positionBinding: Binding<Int?> { Binding(get: { position }, set: { position = $0 }) }
   @State private var chromeHidden = false
   #if os(iOS)
     @State private var filmstrip = FilmstripLink()
   #endif
   @State private var showsInfo = false
   @State private var confirmsDelete = false
+  /// What the open delete dialog asks about.
+  @State private var deletingTarget: String?
   /// The item just deleted, shrinking away before the next one slides in.
   @State private var removingID: String?
   @State private var video = VideoPlayback()
-  @State private var playingLive: Int?
+  @State private var pageSize: CGSize = .zero
+  @State private var neighborRequests = ViewerNeighborRequests()
+  @State private var playingLive: String?
   @State private var errorMessage: String?
   @State private var isBusy = false
   #if os(macOS)
@@ -162,7 +205,7 @@ public struct MediaViewer: View {
     self.onTitleChange = onTitleChange
     self.onClose = onClose
     self.onIndexChange = onIndexChange
-    _position = State(initialValue: startIndex)
+    _pageSelection = State(initialValue: PageSelection(index: startIndex, source: source))
   }
 
   private var current: ViewerItem? {
@@ -170,207 +213,255 @@ public struct MediaViewer: View {
     return position.flatMap(source.viewerItem(at:))
   }
 
+  private var currentShareIdentity: [ThumbnailIdentity] {
+    position.map { [source.thumbnailIdentity(at: $0)] } ?? []
+  }
+
   public var body: some View {
-    GeometryReader { proxy in
-      #if os(iOS)
-        PagedViewer(
-          count: source.itemCount, index: $position, onSwipe: { filmstrip.pagerMoved(to: $0) },
-          pageID: source.itemID(at:), locate: { source.index(ofItemID: $0, near: $1) },
-          onReplaced: { index in
-            // The position didn't change, so the zoom back is told about the new item here.
-            onIndexChange(index)
-            playingLive = nil
-          }
-        ) { index in
-          page(index, size: proxy.size)
-        }
-        .opacity(zoom.map { $0.hidesPages ? 0 : $0.progress } ?? 1)
-        .overlay { ScrubPreview(link: filmstrip).ignoresSafeArea() }
-      #else
-        PagedViewer(count: source.itemCount, index: $position) { index in
-          page(index, size: proxy.size)
-        }
-      #endif
-    }
-    .background {
-      ZoomFade(zoom: zoom, isBackground: true) { background }
-        #if os(macOS)
-          .onGeometryChange(for: CGRect.self) {
-            $0.frame(in: .global)
-          } action: {
-            viewerFrame = $0
-          }
-        #endif
-    }
-    .ignoresSafeArea()
-    .overlay(alignment: .top) {
-      #if os(iOS)
-        if !chromeHidden {
-          ZoomFade(zoom: zoom) { header }
-            .transition(.opacity)
-        }
-      #else
-        // The controls are in the window's toolbar; the photo fits below it.
-        Color.clear.frame(height: 1)
-          .onGeometryChange(for: CGPoint.self) {
-            $0.frame(in: .global).origin
-          } action: {
-            headerBottom = $0.y
-            contentLeading = $0.x
-          }
-          .allowsHitTesting(false)
-      #endif
-    }
-    .overlay(alignment: .bottom) {
-      if !chromeHidden {
-        ZoomFade(zoom: zoom) {
-          VStack(spacing: Self.controlsSpacing) {
-            if current?.isVideo == true {
-              VideoControls(playback: video).frame(height: Self.videoControlsHeight).padding(.horizontal, 26)
-            }
-            VStack(spacing: Self.controlsSpacing) {
-              #if os(iOS)
-                if source.itemCount > 1 {
-                  Filmstrip(source: source, index: $position, link: filmstrip, thumbnailRevision: source.thumbnailRevision)
-                    .frame(height: Filmstrip.height)
-                    // Inset from the screen's edges and fading out at both ends, as in Photos.
-                    .mask {
-                      LinearGradient(
-                        stops: [
-                          .init(color: .clear, location: 0), .init(color: .black, location: 0.06),
-                          .init(color: .black, location: 0.94), .init(color: .clear, location: 1),
-                        ], startPoint: .leading, endPoint: .trailing)
-                    }
-                    .padding(.horizontal, 18)
-                }
-              #endif
-              #if os(iOS)
-                toolbar
-              #endif
-            }
-          }
+    let item = current
+    pager
+      .onGeometryChange(for: CGSize.self, of: \.size) { pageSize = $0 }
+      .background {
+        ZoomFade(zoom: zoom, isBackground: true) { background }
           #if os(macOS)
-            .padding(.bottom, 16)
+            .onGeometryChange(for: CGRect.self) {
+              $0.frame(in: .global)
+            } action: {
+              viewerFrame = $0
+            }
           #endif
-        }
-        .transition(.opacity)
       }
-    }
-    .environment(\.viewerZoom, zoom)
-    // With the controls hidden, photos sit on black, as in Photos.
-    .environment(\.colorScheme, chromeHidden ? .dark : colorScheme)
-    .animation(reduceMotion ? nil : .smooth, value: chromeHidden)
-    #if os(iOS)
-      // A sheet, which is what an inspector becomes on iPhone anyway; an inspector also
-      // puts an opaque background behind the viewer, which hides the grid while it zooms.
-      .sheet(isPresented: $showsInfo) { info.presentationDetents([.medium, .large]) }
-    #else
-      // A panel floating over the photo, as Photos' Info window does. An inspector would add
-      // a column to the window and move every toolbar item, which flickers as it opens.
-      .overlay(alignment: .topTrailing) {
-        if showsInfo {
-          info
-          .id(position.map { source.itemID(at: $0) })
-          .scrollContentBackground(.hidden)
-          // As tall as what it shows, up to a limit; then it scrolls.
-          .onScrollGeometryChange(for: CGFloat.self) {
-            $0.contentSize.height + $0.contentInsets.top + $0.contentInsets.bottom
-          } action: { _, height in
-            infoHeight = height
+      .ignoresSafeArea()
+      .overlay(alignment: .top) {
+        #if os(iOS)
+          if !chromeHidden {
+            ZoomFade(zoom: zoom) { header(item) }
+              .transition(.opacity)
           }
-          .frame(width: 320, height: min(max(infoHeight, 120), 560))
-          .glassEffect(.regular, in: .rect(cornerRadius: 20, style: .continuous))
-          .padding(12)
-          // Keep native caption fields at their measured size throughout the transition.
+        #else
+          // The controls are in the window's toolbar; the photo fits below it.
+          Color.clear.frame(height: 1)
+            .onGeometryChange(for: CGPoint.self) {
+              $0.frame(in: .global).origin
+            } action: {
+              headerBottom = $0.y
+              contentLeading = $0.x
+            }
+            .allowsHitTesting(false)
+        #endif
+      }
+      .overlay(alignment: .bottom) {
+        if !chromeHidden {
+          ZoomFade(zoom: zoom) {
+            VStack(spacing: Self.controlsSpacing) {
+              if item?.isVideo == true {
+                VideoControls(playback: video).frame(height: Self.videoControlsHeight).padding(.horizontal, 26)
+                  #if os(iOS)
+                    .modifier(DisabledWhileScrubbing(link: filmstrip))
+                  #endif
+              }
+              VStack(spacing: Self.controlsSpacing) {
+                #if os(iOS)
+                  if source.itemCount > 1 {
+                    Filmstrip(source: source, index: positionBinding, link: filmstrip, thumbnailRevision: source.thumbnailRevision)
+                      .frame(height: Filmstrip.height)
+                      // Inset from the screen's edges and fading out at both ends, as in Photos.
+                      .mask {
+                        LinearGradient(
+                          stops: [
+                            .init(color: .clear, location: 0), .init(color: .black, location: 0.06),
+                            .init(color: .black, location: 0.94), .init(color: .clear, location: 1),
+                          ], startPoint: .leading, endPoint: .trailing)
+                      }
+                      .padding(.horizontal, 18)
+                  }
+                #endif
+                #if os(iOS)
+                  // Actions are for the open item, which a moving strip has left behind.
+                  toolbar(item).modifier(DisabledWhileScrubbing(link: filmstrip))
+                #endif
+              }
+            }
+            #if os(macOS)
+              .padding(.bottom, 16)
+            #endif
+          }
           .transition(.opacity)
         }
       }
-      .animation(reduceMotion ? nil : .smooth(duration: 0.25), value: showsInfo)
-      .toolbar { macToolbar }
-      .task(id: [macTitle, macSubtitle]) {
-        guard !Task.isCancelled else { return }
-        onTitleChange((macTitle, macSubtitle))
-      }
-      .confirmationDialog(deleteTitle, isPresented: $confirmsDelete, titleVisibility: .visible) {
-        Button(deleteButtonTitle, role: .destructive) { deleteCurrent() }
-        if currentCloudCopy != nil {
-          Button("Delete from This Device", role: .destructive) { deleteCurrent(includingCopy: false) }
-        }
-      } message: {
-        Text(deleteMessage)
-      }
-    #endif
-    .alert(
-      "Couldn't Finish", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })
-    ) {
-      Button("OK") {}
-    } message: {
-      Text(errorMessage ?? "")
-    }
-    .sensoryFeedback(.impact(weight: .light), trigger: playingLive) { _, playing in playing != nil }
-    #if os(iOS)
-      // As in Photos, a video that starts by itself tucks the controls away after a moment;
-      // a tap brings them back. The Mac keeps them, as there's no tap to do that.
-      .task(id: video.autoplayCount) {
-        guard video.autoplayCount > 0 else { return }
-        try? await Task.sleep(for: .seconds(2))
-        guard !Task.isCancelled, video.isPlaying, !showsInfo else { return }
-        withAnimation(reduceMotion ? nil : .smooth) { chromeHidden = true }
-      }
-    #endif
-    #if DEBUG && os(macOS)
-      // `-UIViewerInfo` opens and closes Info on a timer, for review.
-      .task {
-        guard UserDefaults.standard.bool(forKey: "UIViewerInfo") else { return }
-        for _ in 0..<3 {
-          try? await Task.sleep(for: .seconds(2))
-          showsInfo.toggle()
-        }
-      }
-    #endif
-    #if DEBUG && os(iOS)
-      .task {
-        guard UserDefaults.standard.string(forKey: "UIScreen") == "cloudFilmstripStress" else { return }
-        try? await Task.sleep(for: .seconds(2))
-        filmstrip.runStress(seconds: 6)
-      }
-    #endif
-    .onChange(of: position, initial: true) {
-      playingLive = nil
-      removingID = nil
-      // The page now showing hands over its player, if it's a video.
-      video.attach(nil)
-      if let position { onIndexChange(position) }
-      if case .device(let asset, _) = current { RecentlyViewed.record(asset.localIdentifier) }
-    }
-
-    // Siri knows which photo is on screen ("share this with Sam", "add this to Trip").
-    .userActivity(SiriLibrary.viewingActivityType, isActive: current != nil) { activity in
-      guard let current else { return }
-      activity.title = current.date?.formatted(date: .abbreviated, time: .shortened)
-      activity.appEntityIdentifier = EntityIdentifier(for: PhotoEntity.self, identifier: current.indexID)
-    }
-    // Closing on a video: its observers go with it.
-    .onDisappear { video.attach(nil) }
-    .onChange(of: source.itemCount) { _, count in
-      if count == 0 { onClose() } else if let index = position, index >= count { position = count - 1 }
-    }
-    #if os(macOS)
-      .background {
-        ViewerKeyboardEvents { action in
-          switch action {
-          case .previous: _ = step(-1)
-          case .next: _ = step(1)
-          case .escape: if showsInfo { showsInfo = false } else { onClose() }
-          case .space: onClose()
+      .environment(\.viewerZoom, zoom)
+      // With the controls hidden, photos sit on black, as in Photos.
+      .environment(\.colorScheme, chromeHidden ? .dark : colorScheme)
+      .animation(reduceMotion ? nil : .smooth, value: chromeHidden)
+      #if os(iOS)
+        // A sheet, which is what an inspector becomes on iPhone anyway; an inspector also
+        // puts an opaque background behind the viewer, which hides the grid while it zooms.
+        .sheet(isPresented: $showsInfo) { info(item).presentationDetents([.medium, .large]) }
+      #else
+        // A panel floating over the photo, as Photos' Info window does. An inspector would add
+        // a column to the window and move every toolbar item, which flickers as it opens.
+        .overlay(alignment: .topTrailing) {
+          if showsInfo {
+            info(item)
+            .id(position.map { source.itemID(at: $0) })
+            .scrollContentBackground(.hidden)
+            // As tall as what it shows, up to a limit; then it scrolls.
+            .onScrollGeometryChange(for: CGFloat.self) {
+              $0.contentSize.height + $0.contentInsets.top + $0.contentInsets.bottom
+            } action: { _, height in
+              infoHeight = height
+            }
+            .frame(width: 320, height: min(max(infoHeight, 120), 560))
+            .glassEffect(.regular, in: .rect(cornerRadius: 20, style: .continuous))
+            .padding(12)
+            // Keep native caption fields at their measured size throughout the transition.
+            .transition(.opacity)
           }
         }
+        .animation(reduceMotion ? nil : .smooth(duration: 0.25), value: showsInfo)
+        .toolbar { macToolbar(item) }
+        .task(id: [macTitle(item), macSubtitle(item)]) {
+          guard !Task.isCancelled else { return }
+          onTitleChange((macTitle(item), macSubtitle(item)))
+        }
+        .onChange(of: deleteTarget) { confirmsDelete = false }
+        .confirmationDialog(deleteTitle, isPresented: $confirmsDelete, titleVisibility: .visible) {
+          Button(deleteButtonTitle, role: .destructive) { deleteCurrent() }
+          if currentCloudCopy != nil {
+            Button("Delete from This Device", role: .destructive) { deleteCurrent(includingCopy: false) }
+          }
+        } message: {
+          Text(deleteMessage)
+        }
+      #endif
+      .alert(
+        "Couldn't Finish", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })
+      ) {
+        Button("OK") {}
+      } message: {
+        Text(errorMessage ?? "")
+      }
+      .sensoryFeedback(.impact(weight: .light), trigger: playingLive) { _, playing in playing != nil }
+      #if os(iOS)
+        // As in Photos, a video that starts by itself tucks the controls away after a moment;
+        // a tap brings them back. The Mac keeps them, as there's no tap to do that.
+        .task(id: video.autoplayCount) {
+          guard video.autoplayCount > 0 else { return }
+          let player = video.player
+          try? await Task.sleep(for: .seconds(2))
+          guard !Task.isCancelled, player === video.player, video.isPlaying, !showsInfo, !filmstrip.isScrubbing else { return }
+          withAnimation(reduceMotion ? nil : .smooth) { chromeHidden = true }
+        }
+      #endif
+      #if DEBUG && os(macOS)
+        // `-UIViewerInfo` opens and closes Info on a timer, for review.
+        .task {
+          guard UserDefaults.standard.bool(forKey: "UIViewerInfo") else { return }
+          for _ in 0..<3 {
+            try? await Task.sleep(for: .seconds(2))
+            showsInfo.toggle()
+          }
+        }
+      #endif
+      #if DEBUG && os(iOS)
+        .task {
+          guard UserDefaults.standard.string(forKey: "UIScreen") == "cloudFilmstripStress" else { return }
+          try? await Task.sleep(for: .seconds(2))
+          filmstrip.runStress(seconds: 6)
+        }
+      #endif
+      .onChange(of: pageLocation, initial: true) { previous, current in
+        // After a deletion the neighbour becomes the selection, even at the same index.
+        if let current, pageSelection?.id != current.id || pageSelection?.index != current.index {
+          position = current.index
+        }
+        if previous?.id != current?.id {
+          playingLive = nil
+          removingID = nil
+          video.attach(nil)
+        }
+        if let current { onIndexChange(current.index) }
+      }
+
+      // Siri knows which photo is on screen ("share this with Sam", "add this to Trip").
+      .userActivity(SiriLibrary.viewingActivityType, isActive: item != nil) { activity in
+        guard let item else { return }
+        activity.title = item.date?.formatted(date: .abbreviated, time: .shortened)
+        activity.appEntityIdentifier = EntityIdentifier(for: PhotoEntity.self, identifier: item.indexID)
+      }
+      .onChange(of: item?.indexID, initial: true) {
+        if case .device(let asset, _) = item { RecentlyViewed.record(asset.localIdentifier) }
+      }
+      .onChange(of: neighborWindow, initial: true) { _, window in
+        neighborRequests.update(window.adjacent, keeping: window.current)
+      }
+      .onDisappear {
+        video.attach(nil)
+        neighborRequests.update([])
+      }
+      .onChange(of: source.itemCount) { _, count in
+        if count == 0 { onClose() }
+      }
+      #if os(macOS)
+        .background {
+          ViewerKeyboardEvents { action in
+            switch action {
+            case .previous: _ = step(-1)
+            case .next: _ = step(1)
+            case .escape: if showsInfo { showsInfo = false } else { onClose() }
+            case .space: onClose()
+            }
+          }
+        }
+      #endif
+  }
+
+  @ViewBuilder private var pager: some View {
+    #if os(iOS)
+      PagedViewer(
+        count: source.itemCount, index: positionBinding, onSwipe: { filmstrip.pagerMoved(to: $0) },
+        onTouch: { filmstrip.pagerTouched() },
+        pageID: source.itemID(at:), locate: { source.index(ofItemID: $0, near: $1) }
+      ) { index in
+        page(index, size: pageSize)
+      }
+      .opacity(zoom.map { $0.hidesPages ? 0 : $0.progress } ?? 1)
+      .overlay { ScrubPreview(link: filmstrip).ignoresSafeArea() }
+    #else
+      PagedViewer(count: source.itemCount, index: positionBinding) { index in
+        page(index, size: pageSize)
       }
     #endif
   }
 
-  @ViewBuilder private var info: some View {
-    switch current {
+  private struct NeighborWindow: Equatable {
+    var current: ViewerNeighborRequests.Target? = nil
+    var adjacent: [ViewerNeighborRequests.Target] = []
+  }
+
+  private var neighborWindow: NeighborWindow {
+    guard let position, pageSize.width > 0, pageSize.height > 0 else { return NeighborWindow() }
+    return NeighborWindow(current: neighborTarget(at: position), adjacent: [position - 1, position + 1].compactMap(neighborTarget(at:)))
+  }
+
+  private func neighborTarget(at index: Int) -> ViewerNeighborRequests.Target? {
+    guard index >= 0, index < source.itemCount else { return nil }
+    switch source.viewerItem(at: index) {
+    case .device(let asset, _):
+      PhotoKitImageSource.shared.remember(asset)
+      let pixels = ViewerImage.fittedPixels(
+        CGSize(width: asset.pixelWidth, height: asset.pixelHeight), in: pageSize, scale: displayScale)
+      return .init(identity: PhotoKitImageSource.identity(for: asset), pixels: pixels, isFile: false)
+    case .file(let file, _, _):
+      let side = max(pageSize.width, pageSize.height) * displayScale
+      return .init(identity: file.thumbnailIdentity, pixels: CGSize(width: side, height: side), isFile: true)
+    default:
+      return nil
+    }
+  }
+
+  @ViewBuilder private func info(_ item: ViewerItem?) -> some View {
+    switch item {
     case .device(let asset, let backup): PhotoInfoView(asset: asset, backup: backup)
     case .cloud(let item, let library, let isOnDevice):
       RemoteInfoView(library: library, summary: item, isOnDevice: isOnDevice)
@@ -401,15 +492,20 @@ public struct MediaViewer: View {
   #endif
 
   private func page(_ index: Int, size: CGSize) -> some View {
-    let removing = removingID != nil && removingID == source.itemID(at: index)
-    return pageContent(index, size: size)
-      .environment(\.viewerItemID, source.itemID(at: index))
-      #if os(macOS)
-        .padding(fitInsets(isVideo: source.viewerItem(at: index)?.isVideo == true))
-        // A page reused for another item (one before it was added or removed) starts over,
-        // rather than keeping the last item's image under the new item's actions.
-        .id(source.itemID(at: index))
+    let id = source.itemID(at: index)
+    let item = source.viewerItem(at: index)
+    let identity = source.thumbnailIdentity(at: index)
+    let removing = removingID == id
+    return pageContent(item, at: index, size: size)
+      .environment(\.viewerItemID, id)
+      .environment(\.viewerThumbnailIdentity, identity)
+      .environment(\.viewerNeighbors, neighborRequests)
+      #if os(iOS)
+        .environment(\.filmstripLink, filmstrip)
+      #else
+        .padding(fitInsets(isVideo: item?.isVideo == true))
       #endif
+      .id(identity)
       // As in Photos, a deleted photo shrinks and blurs away.
       .scaleEffect(removing && !reduceMotion ? 0.6 : 1)
       .blur(radius: removing && !reduceMotion ? 20 : 0)
@@ -418,30 +514,33 @@ public struct MediaViewer: View {
       .animation(.smooth(duration: 0.3), value: removing)
   }
 
-  @ViewBuilder private func pageContent(_ index: Int, size: CGSize) -> some View {
+  @ViewBuilder private func pageContent(_ item: ViewerItem?, at index: Int, size: CGSize) -> some View {
     let isCurrent = position == index
     let onTap = { withAnimation(reduceMotion ? nil : .smooth) { chromeHidden.toggle() } }
-    switch source.viewerItem(at: index) {
+    switch item {
     case .device(let asset, _):
       let page = DeviceViewerPage(
         asset: asset, label: source.accessibilityLabel(at: index), containerSize: size, displayScale: displayScale,
-        isCurrent: isCurrent, playsLive: playingLive == index, onTap: onTap, onDismiss: close,
-        onSwipeUp: { showsInfo = true },
+        isCurrent: isCurrent, playsLive: playingLive == asset.localIdentifier, onTap: onTap, onDismiss: close,
+        onSwipeUp: { if !isScrubbing { showsInfo = true } },
         onLiveEnd: { playingLive = nil }, playback: video)
       if asset.mediaSubtypes.contains(.photoLive) {
         // Press and hold plays a Live Photo, as in Photos; zooming and Live Text still work.
-        page.simultaneousGesture(LongPressGesture(minimumDuration: 0.3).onEnded { _ in playingLive = index })
+        page.simultaneousGesture(
+          LongPressGesture(minimumDuration: 0.3).onEnded { _ in
+            if !isScrubbing { playingLive = asset.localIdentifier }
+          })
       } else {
         page
       }
     case .cloud(let item, let library, _):
       RemoteViewerPage(
         library: library, item: item, containerSize: size, displayScale: displayScale, isCurrent: isCurrent,
-        onTap: onTap, onDismiss: close, onSwipeUp: { showsInfo = true }, playback: video)
+        onTap: onTap, onDismiss: close, onSwipeUp: { if !isScrubbing { showsInfo = true } }, playback: video)
     case .file(let file, _, _):
       FileViewerPage(
         item: file, containerSize: size, displayScale: displayScale, isCurrent: isCurrent, onTap: onTap,
-        onDismiss: close, onSwipeUp: { showsInfo = true }, playback: video)
+        onDismiss: close, onSwipeUp: { if !isScrubbing { showsInfo = true } }, playback: video)
     case nil:
       Color.clear
     }
@@ -510,8 +609,9 @@ public struct MediaViewer: View {
 
   /// Delete asks first in a popover from the button, as in Photos (a dialog on the Mac).
   private func deleteButton(label: LocalizedStringKey) -> some View {
-    circleButton("trash", label: label, role: .destructive) { confirmsDelete = true }
+    circleButton("trash", label: label, role: .destructive) { askToDelete() }
       .keyboardShortcut(.delete, modifiers: .command)
+      .onChange(of: deleteTarget) { confirmsDelete = false }
       .confirmationDialog(deleteTitle, isPresented: $confirmsDelete, titleVisibility: deleteTitleVisibility) {
         Button(deleteButtonTitle, role: .destructive) { deleteCurrent() }
         if currentCloudCopy != nil {
@@ -532,30 +632,35 @@ public struct MediaViewer: View {
 
   // MARK: Chrome
 
-  private var header: some View {
+  private func header(_ item: ViewerItem?) -> some View {
     HStack {
       circleButton("chevron.backward", label: "Back", action: close)
         .frame(minWidth: 72, alignment: .leading)
       Spacer()
-      if let current, let date = current.date {
-        VStack(spacing: 0) {
-          Text(date, format: .dateTime.day().month().year()).font(.headline)
-          Text(subtitle(for: current, date: date)).font(.caption).foregroundStyle(.secondary)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .glassEffect()
-      }
+      #if os(iOS)
+        ScrubTitle(link: filmstrip, source: source, item: item) { ViewerTitle(item: $0, subtitle: subtitle(for:date:)) }
+      #else
+        ViewerTitle(item: item, subtitle: subtitle(for:date:))
+      #endif
       Spacer()
       HStack(spacing: 8) {
         if isBusy {
           ProgressView().frame(width: 32, height: 32)
-        } else if let index = position, case .device(let asset, _) = current, asset.mediaSubtypes.contains(.photoLive) {
-          circleButton(playingLive == index ? "livephoto.play" : "livephoto", label: "Play Live Photo") {
-            playingLive = playingLive == index ? nil : index
+        } else if case .device(let asset, _) = item, asset.mediaSubtypes.contains(.photoLive) {
+          circleButton(playingLive == asset.localIdentifier ? "livephoto.play" : "livephoto", label: "Play Live Photo") {
+            playingLive = playingLive == asset.localIdentifier ? nil : asset.localIdentifier
           }
+          #if os(iOS)
+            .modifier(DisabledWhileScrubbing(link: filmstrip))
+          #endif
         }
-        if !isBusy { moreMenu }
+        if !isBusy {
+          #if os(iOS)
+            moreMenu(item).modifier(DisabledWhileScrubbing(link: filmstrip))
+          #else
+            moreMenu(item)
+          #endif
+        }
       }
       .frame(minWidth: 72, alignment: .trailing)
     }
@@ -575,10 +680,10 @@ public struct MediaViewer: View {
     return date.formatted(.dateTime.hour().minute())
   }
 
-  private var toolbar: some View {
+  private func toolbar(_ item: ViewerItem?) -> some View {
     GlassEffectContainer {
       HStack(spacing: 12) {
-        switch current {
+        switch item {
         case .device(let asset, _): deviceButtons(asset)
         case .cloud(let item, let library, _): cloudButtons(item, library: library)
         case .file(let file, _, _): fileButtons(file)
@@ -598,7 +703,7 @@ public struct MediaViewer: View {
 
   @ViewBuilder private func deviceButtons(_ asset: PHAsset) -> some View {
     PhotoShareButton(
-      items: [SharedAsset(asset)], ids: [asset.localIdentifier], videoCount: asset.mediaType == .video ? 1 : 0
+      items: [SharedAsset(asset)], identities: currentShareIdentity, videoCount: asset.mediaType == .video ? 1 : 0
     ) {
       Image(systemName: "square.and.arrow.up").font(.title3).frame(width: 36, height: 36)
     }
@@ -618,7 +723,7 @@ public struct MediaViewer: View {
   /// A folder file is shared or looked up here; it's removed from its folder by cleanup,
   /// after it's backed up, never from the viewer.
   @ViewBuilder private func fileButtons(_ file: FolderItemInfo) -> some View {
-    PhotoShareButton(items: [FileSharedItem(item: file)], ids: [file.id], videoCount: file.isVideo ? 1 : 0) {
+    PhotoShareButton(items: [FileSharedItem(item: file)], identities: currentShareIdentity, videoCount: file.isVideo ? 1 : 0) {
       Image(systemName: "square.and.arrow.up").font(.title3).frame(width: 36, height: 36)
     }
     .accessibilityLabel("Share")
@@ -633,7 +738,7 @@ public struct MediaViewer: View {
 
   @ViewBuilder private func cloudButtons(_ item: RemoteItemSummary, library: CloudLibrary) -> some View {
     PhotoShareButton(
-      items: [RemoteSharedItem(library: library, item: item)], ids: [item.thumbnailID],
+      items: [RemoteSharedItem(library: library, item: item)], identities: currentShareIdentity,
       videoCount: item.kind == .video ? 1 : 0
     ) {
       Image(systemName: "square.and.arrow.up").font(.title3).frame(width: 36, height: 36)
@@ -672,7 +777,7 @@ public struct MediaViewer: View {
 
   private func favoriteButton(_ isFavorite: Bool, action: @escaping @MainActor () async throws -> Void) -> some View {
     Button {
-      run(action)
+      if !isScrubbing { run(action) }
     } label: {
       Image(systemName: isFavorite ? "heart.fill" : "heart").font(.title3)
         .frame(width: 44, height: 44)
@@ -687,7 +792,7 @@ public struct MediaViewer: View {
 
   private var infoButton: some View {
     Button {
-      showsInfo.toggle()
+      if !isScrubbing { showsInfo.toggle() }
     } label: {
       Image(systemName: showsInfo ? "info.circle.fill" : "info.circle").font(.title3)
         .frame(width: 44, height: 44)
@@ -707,7 +812,7 @@ public struct MediaViewer: View {
     #endif
   }
 
-  @ViewBuilder private var moreMenu: some View {
+  @ViewBuilder private func moreMenu(_ current: ViewerItem?) -> some View {
     switch current {
     case .device(let asset, _):
       Menu {
@@ -738,18 +843,18 @@ public struct MediaViewer: View {
   }
 
   #if os(macOS)
-    private var macTitle: String {
-      current?.date?.formatted(.dateTime.day().month(.wide).year()) ?? ""
+    private func macTitle(_ item: ViewerItem?) -> String {
+      item?.date?.formatted(.dateTime.day().month(.wide).year()) ?? ""
     }
 
-    private var macSubtitle: String {
-      guard let current, let date = current.date else { return "" }
+    private func macSubtitle(_ item: ViewerItem?) -> String {
+      guard let current = item, let date = current.date else { return "" }
       return subtitle(for: current, date: date)
     }
 
     /// As in Photos on the Mac: back on the left, the item's actions on the right of the
     /// window's toolbar, with the usual shortcuts.
-    @ToolbarContentBuilder private var macToolbar: some ToolbarContent {
+    @ToolbarContentBuilder private func macToolbar(_ viewerItem: ViewerItem?) -> some ToolbarContent {
       ToolbarItem(placement: .navigation) {
         Button("Back", systemImage: "chevron.backward", action: close)
           .help("Back to the grid (Esc)")
@@ -757,25 +862,25 @@ public struct MediaViewer: View {
       ToolbarItemGroup(placement: .primaryAction) {
         // Always there, so the buttons beside it don't move as an action starts and ends.
         ProgressView().controlSize(.small).opacity(isBusy ? 1 : 0).accessibilityHidden(!isBusy)
-        if let index = position, case .device(let asset, _) = current, asset.mediaSubtypes.contains(.photoLive) {
+        if case .device(let asset, _) = viewerItem, asset.mediaSubtypes.contains(.photoLive) {
           Button {
-            playingLive = playingLive == index ? nil : index
+            playingLive = playingLive == asset.localIdentifier ? nil : asset.localIdentifier
           } label: {
-            Label("Play Live Photo", systemImage: playingLive == index ? "livephoto.play" : "livephoto")
+            Label("Play Live Photo", systemImage: playingLive == asset.localIdentifier ? "livephoto.play" : "livephoto")
           }
           .help("Play Live Photo")
         }
-        switch current {
+        switch viewerItem {
         case .device(let asset, _):
           favoriteToolbarButton(asset.isFavorite) { try await LibraryActions.toggleFavorite([asset]) }
           infoToolbarButton
           PhotoShareButton(
-            items: [SharedAsset(asset)], ids: [asset.localIdentifier], videoCount: asset.mediaType == .video ? 1 : 0
+            items: [SharedAsset(asset)], identities: currentShareIdentity, videoCount: asset.mediaType == .video ? 1 : 0
           ) {
             Label("Share", systemImage: "square.and.arrow.up")
           }
           .help("Share")
-          moreMenu
+          moreMenu(viewerItem)
           deleteToolbarButton.disabled(!asset.canPerform(.delete))
         case .cloud(let item, let library, _):
           if item.trashedAt != nil {
@@ -791,18 +896,18 @@ public struct MediaViewer: View {
             favoriteToolbarButton(item.isFavorite) { try await library.toggleFavorite([item]) }
             infoToolbarButton
             PhotoShareButton(
-              items: [RemoteSharedItem(library: library, item: item)], ids: [item.thumbnailID],
+              items: [RemoteSharedItem(library: library, item: item)], identities: currentShareIdentity,
               videoCount: item.kind == .video ? 1 : 0
             ) {
               Label("Share", systemImage: "square.and.arrow.up")
             }
             .help("Share")
-            moreMenu
+            moreMenu(viewerItem)
             deleteToolbarButton
           }
         case .file(let file, _, _):
           infoToolbarButton
-          PhotoShareButton(items: [FileSharedItem(item: file)], ids: [file.id], videoCount: file.isVideo ? 1 : 0) {
+          PhotoShareButton(items: [FileSharedItem(item: file)], identities: currentShareIdentity, videoCount: file.isVideo ? 1 : 0) {
             Label("Share", systemImage: "square.and.arrow.up")
           }
           .help("Share")
@@ -839,7 +944,7 @@ public struct MediaViewer: View {
 
     private var deleteToolbarButton: some View {
       Button(role: .destructive) {
-        confirmsDelete = true
+        askToDelete()
       } label: {
         Label(isTrashed ? "Delete Forever" : isCloud ? "Move to Trash" : "Delete", systemImage: "trash")
       }
@@ -859,9 +964,31 @@ public struct MediaViewer: View {
     .accessibilityLabel(Text(label))
   }
 
+  /// What Delete would remove now: the item, and the Google Photos copy that goes with it.
+  private var deleteTarget: String? {
+    position.map { "\(source.itemID(at: $0))|\(source.cloudCopy(at: $0)?.item.mediaKey ?? "")" }
+  }
+
+  /// The strip is moving, so the open item isn't the one on screen (iPhone).
+  private var isScrubbing: Bool {
+    #if os(iOS)
+      filmstrip.isMoving
+    #else
+      false
+    #endif
+  }
+
+  private func askToDelete() {
+    guard !isScrubbing else { return }
+    deletingTarget = deleteTarget
+    confirmsDelete = true
+  }
+
   private func deleteCurrent(includingCopy: Bool = true) {
     guard let index = position else { return }
     let id = source.itemID(at: index)
+    // The list can change under the open dialog: only what it asked about is deleted.
+    guard deleteTarget == deletingTarget else { return }
     let removed = { removingID = id }
     switch current {
     case .device(let asset, _):
@@ -936,3 +1063,45 @@ extension RemoteLibraryGridModel: MediaViewerSource {
     item(at: index).map { LibraryIndexer.searchID(cloudMediaKey: $0.mediaKey) }
   }
 }
+
+private struct ViewerTitle: View {
+  let item: ViewerItem?
+  let subtitle: (ViewerItem, Date) -> String
+
+  var body: some View {
+    if let item, let date = item.date {
+      VStack(spacing: 0) {
+        Text(date, format: .dateTime.day().month().year()).font(.headline)
+        Text(subtitle(item, date)).font(.caption).foregroundStyle(.secondary)
+      }
+      .padding(.horizontal, 14)
+      .padding(.vertical, 6)
+      .glassEffect()
+    }
+  }
+}
+
+#if os(iOS)
+  private struct DisabledWhileScrubbing: ViewModifier {
+    let link: FilmstripLink
+
+    func body(content: Content) -> some View {
+      content.allowsHitTesting(!link.isMoving).accessibilityHidden(link.isMoving)
+    }
+  }
+
+  /// Follows the filmstrip without the rest of the viewer.
+  private struct ScrubTitle<Content: View>: View {
+    let link: FilmstripLink
+    let source: any MediaViewerSource
+    let item: ViewerItem?
+    @ViewBuilder let content: (ViewerItem?) -> Content
+
+    var body: some View {
+      let scrubbed = link.scrubbedIndex.flatMap {
+        source.itemCount > $0 && !source.thumbnailIdentity(at: $0).isLocked ? source.viewerItem(at: $0) : nil
+      }
+      content(scrubbed ?? item)
+    }
+  }
+#endif

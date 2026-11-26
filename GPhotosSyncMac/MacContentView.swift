@@ -5,14 +5,14 @@ import UniformTypeIdentifiers
 struct MacContentView: View {
   @Bindable var store: MacSyncStore
   @Bindable var router: MacRouter
-  @State private var library = UnifiedLibraryModel()
+  @State private var library = UnifiedLibraryModel(waitsForInitialFolders: true)
   @State private var indexer = LibraryIndexer()
   /// Albums and media types, shared by the sidebar and Collections.
   @State private var collections = PhotoCollectionsModel()
   @State private var searchQuery = ""
   @FocusState private var isSearchFocused: Bool
   @State private var searchPath = NavigationPath()
-  @State private var collectionsPath = NavigationPath()
+  @State private var collectionsPath: [CollectionRoute] = []
 
   var body: some View {
     NavigationSplitView {
@@ -58,42 +58,35 @@ struct MacContentView: View {
       store.presentSignIn = false
       router.isSigningIn = true
     }
-    // A Google Photos view has nothing to show once its account is signed out.
-    .onChange(of: store.cloudLibrary == nil) { _, signedOut in
-      guard signedOut, case .collection(let route) = router.selection else { return }
-      switch route {
-      case .cloud, .cloudAlbums: router.show(.library)
-      default: break
+    .onChange(of: store.cloudLibrary?.accountEmail) { _, email in
+      if let firstInvalid = collectionsPath.firstIndex(where: { email == nil ? $0.usesCloudAccount : $0.isCloudAlbum }) {
+        collectionsPath.removeSubrange(firstInvalid...)
+      }
+      guard case .collection(let route) = router.selection, route.usesCloudAccount else { return }
+      if email == nil {
+        router.show(.library)
+      } else if route.isCloudAlbum {
+        router.selection = .collection(.cloudAlbums)
       }
     }
     .task { await store.start() }
     .task { await collections.load() }
     // Places, in Collections and Search, shows the merged library.
     .environment(library)
-    // Search and sidebar Places stay current while the Library view isn't mounted.
-    .onChange(of: store.cloudLibrary?.accountEmail, initial: true) { _, _ in
-      guard router.section != .library else { return }
-      library.setCloudLibrary(store.cloudLibrary)
-      Task { await library.start(records: store.records) }
-    }
-    .onChange(of: store.cloudLibrary?.revision) {
-      guard router.section != .library else { return }
-      Task { await library.cloudChanged() }
-    }
-    .onChange(of: store.recordsRevision) {
-      guard router.section != .library else { return }
-      Task { await library.recordsChanged(store.records) }
-    }
-    .onChange(of: store.settings.uploadsOnMeteredNetworks, initial: true) { _, allowed in
-      LibraryIndexer.usesMeteredNetworks.withLock { $0 = allowed }
-      if library.isLoaded { indexer.update(from: library) }
-    }
-    .onChange(of: library.reloadToken) {
-      indexer.update(from: library)
-      WidgetPublisher.shared.libraryChanged(library)
-    }
-    .onChange(of: store.backupStatus, initial: true) { _, status in
-      WidgetPublisher.shared.backupChanged(status, backedUpCount: store.accountRecordCounts.sent)
+    .environment(
+      \.showLibraryFilter,
+      ShowLibraryFilterAction { filter in
+        if filter == .all {
+          router.show(.library)
+        } else {
+          router.selection = .collection(.libraryFilter(filter))
+        }
+        Task { await library.setFilter(filter) }
+      }
+    )
+    .background {
+      MacLibraryObservers(store: store, library: library, indexer: indexer)
+      MacBackupWidgetObserver(store: store)
     }
     .onOpenURL { url in
       switch WidgetLink(url: url) {
@@ -104,55 +97,65 @@ struct MacContentView: View {
       }
     }
     .onChange(of: SiriLibrary.shared.destination?.token, initial: true) { showSiriDestination() }
+    .onChange(of: library.reloadToken) {
+      if case .collection(let route) = router.selection,
+        let sidebarFilter = route.mergedLibraryFilter, library.filter != sidebarFilter
+      {
+        router.show(.library)
+      }
+    }
     // The photos and videos in watched folders are part of the Library.
     .task(id: [AnyHashable(store.folders), AnyHashable(store.settings.backupExclusions)]) {
+      let disabledIDs = Set(store.folders.lazy.filter { !$0.isEnabled }.map(\.id))
       await library.setFolders(
         store.folders.map {
           LibraryFolder(
             id: $0.id, path: $0.url.path, bookmarkData: $0.bookmarkData, exclusions: store.settings.folderExclusions)
-        })
+        },
+        disabledFolderIDs: disabledIDs)
     }
   }
 
   // MARK: Detail
 
-  @ViewBuilder private var detail: some View {
-    switch router.selection ?? .section(.library) {
-    case .section(let section): sectionView(section)
-    case .collection(let route):
-      NavigationStack {
-        CollectionRouteView(
-          route: route, records: store.records, recordsRevision: store.recordsRevision, cloud: store.cloudLibrary,
-          collections: collections
-        )
-        .collectionDestinations(
-          records: store.records, recordsRevision: store.recordsRevision, cloud: store.cloudLibrary,
-          collections: collections)
+  private var detail: some View {
+    let selection = router.selection ?? .section(.library)
+    let showsLibrary: Bool =
+      switch selection {
+      case .section(.library): true
+      case .collection(let route): route.mergedLibraryFilter != nil
+      default: false
       }
-      // Another sidebar row starts from that collection, not from where this one was.
-      .id(route)
+    return ZStack {
+      MacLibraryPane(store: store, library: library, isActive: showsLibrary)
+        .opacity(showsLibrary ? 1 : 0)
+        .allowsHitTesting(showsLibrary)
+        .accessibilityHidden(!showsLibrary)
+        .disabled(!showsLibrary)
+      switch selection {
+      case .section(let section):
+        sectionView(section)
+      case .collection(let route):
+        if !showsLibrary {
+          MacCollectionPane(store: store, route: route, collections: collections)
+            .id(route.usesCloudAccount ? store.cloudLibrary.map(ObjectIdentifier.init) : nil)
+            .id(route)
+        }
+      }
     }
   }
 
   @ViewBuilder private func sectionView(_ section: MacSection) -> some View {
     switch section {
     case .overview: MacOverviewView(store: store, router: router)
-    case .library:
-      UnifiedLibraryView(
-        model: library, cloudLibrary: store.cloudLibrary, records: store.records, recordsRevision: store.recordsRevision,
-        accountsLoaded: store.hasLoadedAccounts)
+    case .library: EmptyView()
     case .search:
-      NavigationStack(path: $searchPath) {
-        SearchView(
-          library: library, indexer: indexer, cloud: store.cloudLibrary, records: store.records, query: $searchQuery, path: $searchPath,
-          isEditing: isSearchFocused, finishSearch: { isSearchFocused = false })
-      }
+      MacSearchPane(
+        store: store, library: library, indexer: indexer, query: $searchQuery, path: $searchPath,
+        isEditing: isSearchFocused, finishSearch: { isSearchFocused = false })
     case .collections:
-      NavigationStack(path: $collectionsPath) {
-        CollectionsView(
-          records: store.records, recordsRevision: store.recordsRevision, cloud: store.cloudLibrary,
-          collections: collections)
-      }
+      MacCollectionsPane(store: store, collections: collections, path: $collectionsPath)
+        .id(store.cloudLibrary.map(ObjectIdentifier.init))
     case .activity: MacActivityView(store: store, router: router, filter: $router.activityFilter)
     case .folders: MacFoldersView(store: store, router: router)
     case .settings: MacSettingsPage(store: store, router: router)
@@ -179,16 +182,129 @@ struct MacContentView: View {
       isSearchFocused = false
       searchQuery = ""
       Task {
-        let name = try? await SiriLibrary.shared.store.people().first { $0.id == id }?.name
+        let name = try? await SiriLibrary.shared.store.personName(id: id)
         var path = NavigationPath()
         path.append(SearchRoute.person(id: id, name: name))
         searchPath = path
       }
     case .album(let album):
       router.show(.collections)
-      var path = NavigationPath()
-      path.append(album.collectionRoute)
-      collectionsPath = path
+      collectionsPath = [album.collectionRoute]
+    }
+  }
+}
+
+/// Keep the grid mounted while keeping manifest updates below the split view.
+private struct MacLibraryPane: View {
+  let store: MacSyncStore
+  let library: UnifiedLibraryModel
+  let isActive: Bool
+
+  var body: some View {
+    UnifiedLibraryView(
+      model: library, cloudLibrary: store.cloudLibrary, records: store.records, recordsRevision: store.recordsRevision,
+      accountsLoaded: store.hasLoadedAccounts, isActive: isActive)
+  }
+}
+
+private struct MacLibraryObservers: View {
+  let store: MacSyncStore
+  let library: UnifiedLibraryModel
+  let indexer: LibraryIndexer
+
+  var body: some View {
+    Color.clear
+      .onChange(of: store.settings.uploadsOnMeteredNetworks, initial: true) { _, allowed in
+        LibraryIndexer.usesMeteredNetworks.withLock { $0 = allowed }
+        if library.isLoaded { indexer.update(from: library) }
+      }
+      .onChange(of: store.isBackupActive, initial: true) { _, isActive in
+        Task { await library.setBackupActive(isActive) }
+      }
+      .onChange(of: [library.reloadToken, library.indexMetadataToken]) {
+        indexer.update(from: library)
+        WidgetPublisher.shared.libraryChanged(library)
+      }
+  }
+}
+
+private struct MacBackupWidgetObserver: View {
+  let store: MacSyncStore
+
+  private struct Snapshot: Equatable {
+    let status: BackupStatus
+    let count: Int
+  }
+
+  var body: some View {
+    Color.clear
+      .onChange(of: Snapshot(status: store.backupStatus, count: store.accountRecordCounts.sent), initial: true) {
+        _, snapshot in
+        WidgetPublisher.shared.backupChanged(snapshot.status, backedUpCount: snapshot.count)
+      }
+  }
+}
+
+private struct MacCollectionPane: View {
+  let store: MacSyncStore
+  let route: CollectionRoute
+  let collections: PhotoCollectionsModel
+
+  var body: some View {
+    NavigationStack {
+      let records = store.records
+      CollectionRouteView(
+        route: route, records: records, recordsRevision: store.recordsRevision, cloud: store.cloudLibrary,
+        collections: collections
+      )
+      .collectionDestinations(
+        records: records, recordsRevision: store.recordsRevision, cloud: store.cloudLibrary, collections: collections)
+    }
+  }
+}
+
+extension CollectionRoute {
+  fileprivate var usesCloudAccount: Bool {
+    switch self {
+    case .cloud, .cloudAlbums, .cloudLocked: true
+    default: false
+    }
+  }
+
+  fileprivate var isCloudAlbum: Bool {
+    if case .cloud(.album) = self { return true }
+    return false
+  }
+}
+
+private struct MacCollectionsPane: View {
+  let store: MacSyncStore
+  let collections: PhotoCollectionsModel
+  @Binding var path: [CollectionRoute]
+
+  var body: some View {
+    NavigationStack(path: $path) {
+      CollectionsView(
+        records: store.records, recordsRevision: store.recordsRevision, cloud: store.cloudLibrary,
+        accountsLoaded: store.hasLoadedAccounts, collections: collections)
+    }
+  }
+}
+
+private struct MacSearchPane: View {
+  let store: MacSyncStore
+  let library: UnifiedLibraryModel
+  let indexer: LibraryIndexer
+  @Binding var query: String
+  @Binding var path: NavigationPath
+  let isEditing: Bool
+  let finishSearch: () -> Void
+
+  var body: some View {
+    NavigationStack(path: $path) {
+      SearchView(
+        library: library, indexer: indexer, cloud: store.cloudLibrary, records: store.records, query: $query, path: $path,
+        isEditing: isEditing, finishSearch: finishSearch)
     }
   }
 }
@@ -236,15 +352,17 @@ private struct SearchFieldReturnMonitor: NSViewRepresentable {
 /// tint updates synchronous with the glass sidebar and selection pill.
 private struct SidebarSymbol: NSViewRepresentable {
   let systemName: String
+  let focus: SidebarFocus
 
   func makeNSView(context: Context) -> SymbolView {
-    let view = SymbolView()
+    let view = SymbolView(focus: focus)
     view.configure(systemName: systemName)
     return view
   }
 
   func updateNSView(_ view: SymbolView, context: Context) {
     view.configure(systemName: systemName)
+    view.attachObservers()
     view.syncTint()
   }
 
@@ -258,10 +376,11 @@ private struct SidebarSymbol: NSViewRepresentable {
     private weak var observedWindow: NSWindow?
     private var emphasisObservation: NSKeyValueObservation?
     private var selectionObservation: NSKeyValueObservation?
-    private var notificationObservers: [NSObjectProtocol] = []
+    private let focus: SidebarFocus
 
-    override init(frame frameRect: NSRect) {
-      super.init(frame: frameRect)
+    init(focus: SidebarFocus) {
+      self.focus = focus
+      super.init(frame: .zero)
       imageScaling = .scaleProportionallyDown
       setContentHuggingPriority(.required, for: .horizontal)
       setContentHuggingPriority(.required, for: .vertical)
@@ -295,12 +414,11 @@ private struct SidebarSymbol: NSViewRepresentable {
       emphasisObservation = nil
       selectionObservation = nil
       observedRow = nil
-      for token in notificationObservers { NotificationCenter.default.removeObserver(token) }
-      notificationObservers.removeAll()
+      focus.remove(self)
       observedWindow = nil
     }
 
-    private func attachObservers() {
+    func attachObservers() {
       let row = enclosingRowView
       if row !== observedRow {
         emphasisObservation = nil
@@ -317,34 +435,9 @@ private struct SidebarSymbol: NSViewRepresentable {
       }
 
       if window !== observedWindow {
-        for token in notificationObservers { NotificationCenter.default.removeObserver(token) }
-        notificationObservers.removeAll()
+        focus.remove(self)
         observedWindow = window
-        if let window {
-          let center = NotificationCenter.default
-          let windowNames: [Notification.Name] = [
-            NSWindow.didBecomeKeyNotification,
-            NSWindow.didResignKeyNotification,
-            NSWindow.didBecomeMainNotification,
-            NSWindow.didResignMainNotification,
-          ]
-          for name in windowNames {
-            notificationObservers.append(
-              center.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
-                MainActor.assumeIsolated { self?.syncTint() }
-              })
-          }
-          let appNames: [Notification.Name] = [
-            NSApplication.didBecomeActiveNotification,
-            NSApplication.didResignActiveNotification,
-          ]
-          for name in appNames {
-            notificationObservers.append(
-              center.addObserver(forName: name, object: NSApp, queue: nil) { [weak self] _ in
-                MainActor.assumeIsolated { self?.syncTint() }
-              })
-          }
-        }
+        if let window { focus.add(self, in: window) }
       }
     }
 
@@ -358,7 +451,7 @@ private struct SidebarSymbol: NSViewRepresentable {
     }
 
     func syncTint() {
-      let row = enclosingRowView
+      let row = observedRow
       let isEmphasizedSelection = row?.isSelected == true && row?.isEmphasized == true
       let isWindowActive = window?.isKeyWindow == true || window?.isMainWindow == true
       let nextTint: NSColor =
@@ -378,10 +471,54 @@ private struct SidebarSymbol: NSViewRepresentable {
   }
 }
 
+@MainActor
+private final class SidebarFocus {
+  private let symbols = NSHashTable<SidebarSymbol.SymbolView>.weakObjects()
+  private weak var window: NSWindow?
+  private var observers: [NSObjectProtocol] = []
+
+  func add(_ symbol: SidebarSymbol.SymbolView, in window: NSWindow) {
+    symbols.add(symbol)
+    guard self.window !== window else { return }
+    stopObserving()
+    self.window = window
+    let notifications: [(Notification.Name, AnyObject?)] = [
+      (NSWindow.didBecomeKeyNotification, window),
+      (NSWindow.didResignKeyNotification, window),
+      (NSWindow.didBecomeMainNotification, window),
+      (NSWindow.didResignMainNotification, window),
+      (NSApplication.didBecomeActiveNotification, NSApp),
+      (NSApplication.didResignActiveNotification, NSApp),
+    ]
+    observers = notifications.map { name, object in
+      NotificationCenter.default.addObserver(forName: name, object: object, queue: nil) { [weak self] _ in
+        MainActor.assumeIsolated {
+          guard let self else { return }
+          for symbol in self.symbols.allObjects { symbol.syncTint() }
+        }
+      }
+    }
+  }
+
+  func remove(_ symbol: SidebarSymbol.SymbolView) {
+    symbols.remove(symbol)
+    if symbols.count == 0 { stopObserving() }
+  }
+
+  private func stopObserving() {
+    for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    observers.removeAll()
+    window = nil
+  }
+
+  isolated deinit { stopObserving() }
+}
+
 private struct MacSidebar: View {
   let store: MacSyncStore
   @Bindable var router: MacRouter
   let collections: PhotoCollectionsModel
+  @State private var focus = SidebarFocus()
   @State private var isAccountHovered = false
   @State private var isShowingAccount = false
   @AppStorage("sidebarPinnedExpanded") private var isPinnedExpanded = true
@@ -389,6 +526,7 @@ private struct MacSidebar: View {
   @AppStorage("sidebarGoogleExpanded") private var isGoogleExpanded = true
   @AppStorage("sidebarBackupExpanded") private var isBackupExpanded = true
   @Environment(\.openURL) private var openURL
+  @Environment(\.showLibraryFilter) private var showLibraryFilter
 
   var body: some View { sidebar }
 
@@ -407,7 +545,8 @@ private struct MacSidebar: View {
         collectionRow("Recently Added", symbol: "clock", route: .scope(.recentlyAdded, .all))
         collectionRow("Videos", symbol: "video", route: .scope(.mediaKind(.videos), .all))
         collectionRow("Places", symbol: "map", route: .places)
-        collectionRow("Not Backed Up", symbol: "icloud.slash", route: .scope(.all, .notBackedUp))
+        collectionRow("Not Backed Up", symbol: "icloud.slash", route: .libraryFilter(.notBackedUp))
+        collectionRow("Not Included in Backup", symbol: "minus.circle", route: .libraryFilter(.notIncludedInBackup))
         collectionRow("Hidden", symbol: "eye.slash", route: .scope(.hidden, .all))
       }
 
@@ -420,7 +559,7 @@ private struct MacSidebar: View {
         }
       }
 
-      if store.cloudLibrary != nil {
+      if let cloud = store.cloudLibrary {
         Section("Google Photos", isExpanded: $isGoogleExpanded) {
           collectionRow("All Photos", symbol: "photo.on.rectangle.angled", route: .cloud(.library))
           collectionRow("Albums", symbol: "rectangle.stack", route: .cloudAlbums)
@@ -428,6 +567,9 @@ private struct MacSidebar: View {
           collectionRow("Archive", symbol: "archivebox", route: .cloud(.archive))
           collectionRow("Uses Storage", symbol: "externaldrive.badge.icloud", route: .cloud(.usesStorage))
           collectionRow("Trash", symbol: "trash", route: .cloud(.trash))
+          if cloud.isStateLoaded, cloud.hasLockedItems {
+            collectionRow("Locked Folder", symbol: "lock.rectangle.stack", route: .cloudLocked)
+          }
         }
       }
 
@@ -456,6 +598,13 @@ private struct MacSidebar: View {
     Binding {
       router.selection
     } set: { item in
+      if case .collection(let route) = item, let filter = route.mergedLibraryFilter {
+        showLibraryFilter?(filter)
+        return
+      }
+      if item == .section(.library), case .collection(let route) = router.selection, route.mergedLibraryFilter != nil {
+        showLibraryFilter?(.all)
+      }
       router.selection = item
       if item == .section(.search) { router.focusLibrarySearch = true }
     }
@@ -480,14 +629,13 @@ private struct MacSidebar: View {
     Label {
       title
     } icon: {
-      SidebarSymbol(systemName: symbol)
+      SidebarSymbol(systemName: symbol, focus: focus)
     }
   }
 
   private func badge(for section: MacSection) -> Int {
-    let counts = store.accountRecordCounts
-    return switch section {
-    case .activity: counts.failed
+    switch section {
+    case .activity: store.failedRecordCount
     case .folders: store.enabledFoldersNeedingAccess
     case .overview, .library, .collections, .search, .settings: 0
     }
@@ -592,7 +740,7 @@ private struct MacSidebarStatus: View {
   var body: some View {
     DisplayedBackupStatus(store.backupStatus) { status in
       Button {
-        if store.accountRecordCounts.failed > 0, !status.isActive {
+        if store.hasFailedRecords, !status.isActive {
           router.show(.activity, filter: .failed)
         } else {
           router.show(.overview)
@@ -608,18 +756,8 @@ private struct MacSidebarStatus: View {
             Text(status.title)
               .font(.callout.weight(.medium))
               .lineLimit(1)
-            Group {
-              if store.isRunning, store.workerPool.currentTotalBytes > 0 {
-                ProgressView(value: store.workerPool.currentProgress)
-                  .controlSize(.mini)
-              } else {
-                Text(detail)
-                  .font(.caption)
-                  .foregroundStyle(.secondary)
-                  .lineLimit(1)
-              }
-            }
-            .frame(height: 14)
+            MacSidebarProgress(store: store)
+              .frame(height: 14)
           }
           Spacer(minLength: 0)
         }
@@ -637,6 +775,23 @@ private struct MacSidebarStatus: View {
       .accessibilityHint(Text(status.subtitle))
     }
     .padding(.horizontal, 12)
+  }
+
+}
+
+private struct MacSidebarProgress: View {
+  let store: MacSyncStore
+
+  var body: some View {
+    if store.isRunning, store.workerPool.currentTotalBytes > 0 {
+      ProgressView(value: store.workerPool.currentProgress)
+        .controlSize(.mini)
+    } else {
+      Text(detail)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+    }
   }
 
   private var detail: String {

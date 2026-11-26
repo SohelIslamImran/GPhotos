@@ -8,16 +8,23 @@
   extension CloudLibrary {
     /// `cloudLarge` makes 100,000 items, for checking speed at scale.
     public static func preview(itemCount: Int = 600) -> CloudLibrary {
-      let directory = FileManager.default.temporaryDirectory.appending(path: "CloudLibraryPreview-\(UUID().uuidString)")
+      // The launch trace also uses the same generated mirror on relaunch.
+      let tracesLaunch = UserDefaults.standard.bool(forKey: "UITraceLibraryLaunch")
+      let suffix = tracesLaunch ? "launch-\(itemCount)" : UUID().uuidString
+      let directory = FileManager.default.temporaryDirectory.appending(path: "CloudLibraryPreview-\(suffix)")
       return CloudLibrary(
         accountEmail: "preview@example.com", store: RemoteLibraryStore(accountEmail: "preview", directory: directory),
-        fetcher: PreviewFetcher(pages: max(1, itemCount / PreviewFetcher.perPage)), thumbnails: PreviewThumbnailSource(), actionClient: nil)
+        fetcher: PreviewFetcher(
+          pages: max(1, itemCount / PreviewFetcher.perPage),
+          start: tracesLaunch ? 1_700_000_000 : Date().timeIntervalSince1970),
+        thumbnails: PreviewThumbnailSource(stableColors: tracesLaunch), actionClient: nil)
     }
   }
 
   private struct PreviewFetcher: RemoteLibraryFetching {
     static let perPage = 150
     let pages: Int
+    let start: TimeInterval
 
     func libraryState(syncToken: String) async throws -> RemoteLibraryUpdate {
       syncToken.isEmpty
@@ -34,7 +41,6 @@
     }
 
     private func page(_ number: Int) -> RemoteLibraryUpdate {
-      let start = Date().timeIntervalSince1970
       let items = (0..<Self.perPage).map { offset -> RemoteMediaItem in
         let index = number * Self.perPage + offset
         let kind: RemoteMediaItem.Kind = index % 9 == 4 ? .video : (index % 7 == 3 ? .motionPhoto : .photo)
@@ -44,7 +50,7 @@
           quotaChargedBytes: index % 23 == 0 ? 3_000_000 : 0, isOriginalQuality: index % 23 != 0,
           takenAt: Date(timeIntervalSince1970: start - Double(index) * 36_000), timezoneOffsetMinutes: 360,
           uploadedAt: nil, contentVersion: 1, trashedAt: index % 41 == 0 ? Date() : nil, isArchived: index % 37 == 0,
-          isFavorite: index % 11 == 0, isLocked: false, isCanonical: true, isEdited: false, origin: 1,
+          isFavorite: index % 11 == 0, isLocked: index % 97 == 5, isCanonical: true, isEdited: false, origin: 1,
           width: index % 5 == 0 ? 3024 : 4032, height: index % 5 == 0 ? 4032 : 3024, latitude: 48.85, longitude: 2.35,
           locationName: "Paris", cameraMake: "Apple", cameraModel: "iPhone 17 Pro", aperture: 1.8, shutterSpeed: 0.008,
           iso: 80, focalLength: 24, durationMs: kind == .video ? 14_000 : nil)
@@ -57,13 +63,18 @@
 
   /// Soft gradients keyed by item, drawn at the requested size.
   private final class PreviewThumbnailSource: ThumbnailSource, Sendable {
+    let stableColors: Bool
+
+    init(stableColors: Bool) { self.stableColors = stableColors }
+
     func requestImage(
-      id: String, pixelSize: CGSize, quality: ImageRequestQuality, deliver: @escaping @Sendable (CGImage, Bool) -> Void
+      id: String, pixelSize: CGSize, quality: ImageRequestQuality,
+      onUnavailable: @escaping @Sendable () -> Void, deliver: @escaping @Sendable (CGImage, Bool) -> Void
     ) -> ImageRequestToken {
       let side = max(16, min(Int(max(pixelSize.width, pixelSize.height)), 1024))
-      let hue = CGFloat(abs(id.hashValue % 360)) / 360
+      let index = RemoteThumbnailID(id).flatMap { Int($0.mediaKey.replacingOccurrences(of: "preview-", with: "")) } ?? 0
+      let hue = CGFloat(stableColors ? (index % 360) * 137 % 360 : abs(id.hashValue % 360)) / 360
       DispatchQueue.global(qos: .userInitiated).async {
-        let index = RemoteThumbnailID(id).flatMap { Int($0.mediaKey.replacingOccurrences(of: "preview-", with: "")) } ?? 0
         let portrait = index % 5 == 0
         let width = quality == .display && portrait ? side * 3 / 4 : side
         let height = quality == .display && !portrait ? side * 3 / 4 : side
@@ -72,14 +83,17 @@
           let context = CGContext(
             data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: space,
             bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
-        else { return }
+        else {
+          onUnavailable()
+          return
+        }
         let colors = [
           Self.color(hue: hue, brightness: 0.95), Self.color(hue: (hue + 0.12).truncatingRemainder(dividingBy: 1), brightness: 0.6),
         ]
         if let gradient = CGGradient(colorsSpace: space, colors: colors as CFArray, locations: [0, 1]) {
           context.drawLinearGradient(gradient, start: .zero, end: CGPoint(x: width, y: height), options: [])
         }
-        if let image = context.makeImage() { deliver(image, true) }
+        if let image = context.makeImage() { deliver(image, true) } else { onUnavailable() }
       }
       return .none
     }

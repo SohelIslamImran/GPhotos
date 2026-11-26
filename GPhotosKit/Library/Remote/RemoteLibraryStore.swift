@@ -34,7 +34,8 @@ public enum RemoteScope: Hashable, Sendable {
     }
   }
 
-  /// Locked Folder items never leave the server's own app, so they're never shown.
+  /// Locked Folder items are shown only on their own screen, behind device authentication
+  /// (`RemoteLibraryStore.lockedSummaries`), never in a scope.
   var whereClause: String {
     // A shared album holds its own copy of each photo added to it (same hash, not
     // canonical); Google Photos lists only the original outside that album. Google marks
@@ -72,8 +73,14 @@ public struct RemoteItemSummary: Sendable, Equatable, Identifiable {
   public let width: Int?
   public let height: Int?
   public var fileName: String = ""
+  public var sizeBytes: Int64 = 0
   public var latitude: Double?
   public var longitude: Double?
+
+  func hasSameMatchingMetadata(as other: Self) -> Bool {
+    kind == other.kind && width == other.width && height == other.height
+      && fileName == other.fileName && sha1 == other.sha1 && sizeBytes == other.sizeBytes
+  }
 
   public var id: String { mediaKey }
 }
@@ -87,11 +94,15 @@ public struct RemoteLibraryStats: Sendable, Equatable {
   public var chargedBytes: Int64 = 0
   public var trashed = 0
   public var archived = 0
+  /// Items in the Locked Folder, which no scope or count above includes.
+  public var locked = 0
 }
 
 public struct RemoteSyncState: Sendable, Equatable {
   public var syncToken = ""
   public var resumeToken = ""
+  var deltaToken: String?
+  var deltaTriggersNextSync = false
   public var initialSyncDone = false
   public var lastSyncedAt: Date?
 }
@@ -101,10 +112,36 @@ public struct RemoteSyncState: Sendable, Equatable {
 /// interrupted sync resumes where it stopped. The database can always be rebuilt from the
 /// server, so a schema change just starts it over.
 public actor RemoteLibraryStore {
+  /// What a committed page changed. Pages that repeat what the mirror already has change
+  /// nothing, so views don't reload for them.
+  public struct Changes: Sendable, Equatable {
+    /// Items added, changed or deleted.
+    public var items = 0
+    /// Albums added, changed or deleted.
+    public var albums = 0
+    /// Items that left the library: deleted, or moved to the Locked Folder.
+    public var removals = 0
+    /// Items moved to the Locked Folder while the library listed them.
+    public var hidden = 0
+
+    public var isEmpty: Bool { items == 0 && albums == 0 }
+
+    static func + (lhs: Self, rhs: Self) -> Self {
+      Changes(
+        items: lhs.items + rhs.items, albums: lhs.albums + rhs.albums, removals: lhs.removals + rhs.removals,
+        hidden: lhs.hidden + rhs.hidden)
+    }
+  }
+
+  /// A closed store belongs to a library that was switched away from or removed; it never
+  /// opens its database again, so a sync still finishing can't write to it.
+  public struct ClosedError: Error {}
+
   public let accountEmail: String
   private let url: URL
   private var database: SQLiteDatabase?
-  private static let schemaVersion = 3
+  private var isClosed = false
+  private static let schemaVersion = 5
 
   public init(accountEmail: String, directory: URL? = nil) {
     self.accountEmail = accountEmail
@@ -123,11 +160,14 @@ public actor RemoteLibraryStore {
 
   private func db() throws -> SQLiteDatabase {
     if let database { return database }
+    guard !isClosed else { throw ClosedError() }
+    if try Self.hasOlderSchema(url) { removeFiles() }
     let database = try SQLiteDatabase(url: url)
+    // What's deleted or blanked is overwritten too, not only unlinked.
+    try database.query("PRAGMA secure_delete = ON") { _ in }
     var version = 0
     try database.query("PRAGMA user_version") { version = Int($0.int(0)) }
     if version != Self.schemaVersion {
-      try database.execute("DROP TABLE IF EXISTS items; DROP TABLE IF EXISTS state; DROP TABLE IF EXISTS albums;")
       try database.execute(
         """
         CREATE TABLE items (
@@ -143,7 +183,9 @@ public actor RemoteLibraryStore {
         CREATE INDEX items_taken ON items (taken_at DESC);
         CREATE INDEX items_sha1 ON items (sha1);
         CREATE INDEX items_collection ON items (collection_id);
-        CREATE INDEX items_library ON items (taken_at DESC) WHERE trashed_at IS NULL AND archived = 0 AND locked = 0;
+        CREATE INDEX items_library ON items (taken_at DESC)
+          WHERE trashed_at IS NULL AND archived = 0 AND locked = 0 AND canonical = 1;
+        CREATE INDEX items_locked ON items (taken_at DESC) WHERE locked = 1 AND trashed_at IS NULL;
         CREATE TABLE albums (
           media_key TEXT PRIMARY KEY, title TEXT NOT NULL, item_count INTEGER NOT NULL, cover_media_key TEXT,
           start_date REAL, end_date REAL, last_activity REAL
@@ -152,8 +194,18 @@ public actor RemoteLibraryStore {
         PRAGMA user_version = \(Self.schemaVersion);
         """)
     }
+    try database.execute("CREATE TABLE IF NOT EXISTS locked_purges (media_key TEXT PRIMARY KEY)")
+    // A quit between a lock and its checkpoint left the old page in the file.
+    try? database.checkpoint()
     self.database = database
     return database
+  }
+
+  private static func hasOlderSchema(_ url: URL) throws -> Bool {
+    guard FileManager.default.fileExists(atPath: url.path) else { return false }
+    var version = 0
+    try SQLiteDatabase(url: url).query("PRAGMA user_version") { version = Int($0.int(0)) }
+    return version != schemaVersion
   }
 
   // MARK: Sync state
@@ -165,6 +217,8 @@ public actor RemoteLibraryStore {
       switch row.text(0) {
       case "sync_token": state.syncToken = value
       case "resume_token": state.resumeToken = value
+      case "delta_token": state.deltaToken = value
+      case "delta_next": state.deltaTriggersNextSync = value == "1"
       case "initial_done": state.initialSyncDone = value == "1"
       case "synced_at": state.lastSyncedAt = Double(value).map(Date.init(timeIntervalSince1970:))
       default: break
@@ -177,30 +231,114 @@ public actor RemoteLibraryStore {
     try database.run("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", [.text(key), .text(value)])
   }
 
-  /// Applies one page and its tokens in a single transaction. `syncToken` nil keeps the
-  /// stored one (pages after the first don't carry it).
-  public func apply(_ update: RemoteLibraryUpdate, syncToken: String?, now: Date = Date()) throws {
+  /// The next token belongs to a cycle whose pages haven't all been applied.
+  func restartDelta(from token: String) throws {
     let database = try db()
     try database.transaction {
-      for item in update.items { try upsert(item, in: database) }
+      try setState("sync_token", token, in: database)
+      try database.run("DELETE FROM state WHERE key IN ('resume_token', 'delta_token', 'delta_next')")
+    }
+  }
+
+  /// Applies one page and its tokens in a single transaction. `syncToken` nil keeps the
+  /// stored one (pages after the first don't carry it). A delta's first page also records
+  /// the request token until its last page commits. `willLock` is given the items this page moves to the Locked Folder just before it's committed, to delete what's kept of
+  /// them: an app that quits in between applies the page again.
+  @discardableResult
+  public func apply(
+    _ update: RemoteLibraryUpdate, syncToken: String?, now: Date = Date(), deltaToken: String? = nil,
+    willLock: @Sendable (Set<String>) -> Void = { _ in }
+  ) throws -> Changes {
+    let database = try db()
+    var locksItems = false
+    let applied = try database.transaction {
+      var changes = Changes()
+      var locking = Set<String>()
+      for item in update.items {
+        let wasLocked = try isLocked(item.mediaKey, in: database)
+        guard try upsert(item, in: database) else { continue }
+        if wasLocked == true, !item.isLocked { changes.albums += 1 }
+        changes.items += 1
+        if item.isLocked {
+          changes.removals += 1
+          if wasLocked == false { changes.hidden += 1 }
+          // A row that's new here may have been listed before the mirror was rebuilt.
+          if wasLocked != true { locking.insert(item.mediaKey) }
+        }
+      }
       for key in update.deletedMediaKeys {
         try database.run("DELETE FROM items WHERE media_key = ?", [.text(key)])
+        if database.changes > 0 {
+          changes.items += 1
+          changes.removals += 1
+        }
       }
       for album in update.albums {
         try database.run(
-          "INSERT OR REPLACE INTO albums VALUES (?, ?, ?, ?, ?, ?, ?)",
+          Self.albumUpsert,
           [
             .text(album.mediaKey), .text(album.title), .int(Int64(album.itemCount)), .optional(album.coverMediaKey),
             .optional(album.startDate), .optional(album.endDate), .optional(album.lastActivity),
           ])
+        changes.albums += database.changes
       }
       for key in update.deletedAlbumKeys {
         try database.run("DELETE FROM albums WHERE media_key = ?", [.text(key)])
+        changes.albums += database.changes
       }
       if let syncToken, !syncToken.isEmpty { try setState("sync_token", syncToken, in: database) }
       try setState("resume_token", update.resumeToken, in: database)
+      if update.resumeToken.isEmpty {
+        try database.run("DELETE FROM state WHERE key IN ('delta_token', 'delta_next')")
+      } else if let deltaToken {
+        try setState("delta_token", deltaToken, in: database)
+        try setState("delta_next", update.triggersNextSync ? "1" : "0", in: database)
+      }
       try setState("synced_at", String(now.timeIntervalSince1970), in: database)
+      if !locking.isEmpty {
+        try database.run(
+          "INSERT OR IGNORE INTO locked_purges (media_key) SELECT value FROM json_each(?)", [try .list(locking)])
+        willLock(locking)
+        locksItems = true
+      }
+      return changes
     }
+    // Until then the file still holds what these rows were; a busy one is retried at open.
+    if locksItems { try? database.checkpoint() }
+    return applied
+  }
+
+  /// Even a key with no local Siri row may still have an older Spotlight entry.
+  func enqueueExistingLockedKeys() throws {
+    let database = try db()
+    var seeded = false
+    try database.query("SELECT 1 FROM state WHERE key = 'locked_index_reconciliation'") { _ in seeded = true }
+    guard !seeded else { return }
+    try database.transaction {
+      try database.run("INSERT OR IGNORE INTO locked_purges SELECT media_key FROM items WHERE locked = 1")
+      try setState("locked_index_reconciliation", "1", in: database)
+    }
+  }
+
+  /// Items moved to the Locked Folder that the on-device index may still hold, kept from
+  /// the transaction that locks them until `finishLockedPurges`. One unlocked since stays.
+  func pendingLockedPurges() throws -> Set<String> {
+    let database = try db()
+    try database.run("DELETE FROM locked_purges WHERE media_key IN (SELECT media_key FROM items WHERE locked = 0)")
+    var keys = Set<String>()
+    try database.query("SELECT media_key FROM locked_purges") { if let key = $0.text(0) { keys.insert(key) } }
+    return keys
+  }
+
+  func finishLockedPurges(_ keys: Set<String>) throws {
+    try db().run("DELETE FROM locked_purges WHERE media_key IN (SELECT value FROM json_each(?))", [try .list(keys)])
+  }
+
+  /// Nil when the item isn't in the mirror.
+  private func isLocked(_ mediaKey: String, in database: SQLiteDatabase) throws -> Bool? {
+    var locked: Bool?
+    try database.query("SELECT locked FROM items WHERE media_key = ?", [.text(mediaKey)]) { locked = $0.int(0) == 1 }
+    return locked
   }
 
   public func markInitialSyncDone() throws {
@@ -210,17 +348,55 @@ public actor RemoteLibraryStore {
   /// Forgets everything; the next sync starts from scratch.
   public func reset() throws {
     database = nil
+    removeFiles()
+  }
+
+  /// Stops using the database for good; it stays on disk for the next library object.
+  public func close() {
+    isClosed = true
+    database = nil
+  }
+
+  /// Closes the store and deletes the mirror, for sign-out and removed accounts.
+  public func closeAndRemove() {
+    close()
+    removeFiles()
+  }
+
+  private func removeFiles() {
     for suffix in ["", "-wal", "-shm"] {
       try? FileManager.default.removeItem(at: URL(filePath: url.path + suffix))
     }
   }
 
-  private func upsert(_ item: RemoteMediaItem, in database: SQLiteDatabase) throws {
-    try database.run(
+  private static let itemColumns = [
+    "media_key", "dedup_key", "sha1", "file_name", "caption", "kind", "size_bytes", "quota_charged", "original_quality",
+    "taken_at", "tz_offset", "uploaded_at", "content_version", "trashed_at", "archived", "favorite", "locked", "canonical",
+    "edited", "origin", "width", "height", "latitude", "longitude", "location_name", "camera_make", "camera_model",
+    "aperture", "shutter_speed", "iso", "focal_length", "duration_ms", "collection_id",
+  ]
+
+  /// Writes a row only when something in it differs, so `changes` tells a real change from
+  /// a page repeating what's stored.
+  private static func upsertSQL(table: String, columns: [String]) -> String {
+    let updated = columns.dropFirst()
+    return """
+      INSERT INTO \(table) (\(columns.joined(separator: ", "))) VALUES (\(columns.map { _ in "?" }.joined(separator: ", ")))
+      ON CONFLICT(\(columns[0])) DO UPDATE SET \(updated.map { "\($0) = excluded.\($0)" }.joined(separator: ", "))
+      WHERE \(updated.map { "\(table).\($0) IS NOT excluded.\($0)" }.joined(separator: " OR "))
       """
-      INSERT OR REPLACE INTO items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?)
-      """,
+  }
+
+  private static let itemUpsert = upsertSQL(table: "items", columns: itemColumns)
+  private static let albumUpsert = upsertSQL(
+    table: "albums",
+    columns: ["media_key", "title", "item_count", "cover_media_key", "start_date", "end_date", "last_activity"])
+
+  /// True when the row was added or changed.
+  private func upsert(_ item: RemoteMediaItem, in database: SQLiteDatabase) throws -> Bool {
+    if item.isLocked { return try upsertLocked(item, in: database) }
+    try database.run(
+      Self.itemUpsert,
       [
         .text(item.mediaKey), .text(item.dedupKey), .optional(item.sha1), .text(item.fileName), .optional(item.caption),
         .int(Int64(item.kind.rawValue)), .int(item.sizeBytes), .int(item.quotaChargedBytes),
@@ -232,13 +408,30 @@ public actor RemoteLibraryStore {
         .optional(item.aperture), .optional(item.shutterSpeed), .optional(item.iso), .optional(item.focalLength),
         .optional(item.durationMs), .optional(item.collectionID),
       ])
+    return database.changes > 0
+  }
+
+  /// A Locked Folder item keeps only what marks it and lists it (its date, kind and shape):
+  /// no name, caption, hash, place or camera reaches disk, and those stored before it was
+  /// locked go.
+  private func upsertLocked(_ item: RemoteMediaItem, in database: SQLiteDatabase) throws -> Bool {
+    let listed: [String: SQLiteDatabase.Value] = [
+      "media_key": .text(item.mediaKey), "dedup_key": .text(""), "file_name": .text(""), "kind": .int(Int64(item.kind.rawValue)),
+      "size_bytes": .int(0), "quota_charged": .int(0), "original_quality": .bool(false),
+      "taken_at": .double(item.takenAt.timeIntervalSince1970), "content_version": .int(Int64(item.contentVersion)),
+      "trashed_at": .optional(item.trashedAt), "archived": .bool(item.isArchived), "favorite": .bool(false),
+      "locked": .bool(true), "canonical": .bool(item.isCanonical), "edited": .bool(false), "origin": .int(0),
+      "width": .optional(item.width), "height": .optional(item.height), "duration_ms": .optional(item.durationMs),
+    ]
+    try database.run(Self.itemUpsert, Self.itemColumns.map { listed[$0] ?? .null })
+    return database.changes > 0
   }
 
   // MARK: Reading
 
   private static let summaryColumns = """
     media_key, dedup_key, sha1, kind, taken_at, content_version, duration_ms, favorite, trashed_at, width, height,
-      file_name, latitude, longitude
+      file_name, size_bytes, latitude, longitude
     """
 
   private static func summary(_ row: SQLiteDatabase.Row) -> RemoteItemSummary {
@@ -249,7 +442,7 @@ public actor RemoteLibraryStore {
       durationMs: row.optionalInt(6).map(Int.init), isFavorite: row.int(7) == 1,
       trashedAt: row.optionalDouble(8).map(Date.init(timeIntervalSince1970:)),
       width: row.optionalInt(9).map(Int.init), height: row.optionalInt(10).map(Int.init),
-      fileName: row.text(11) ?? "", latitude: row.optionalDouble(12), longitude: row.optionalDouble(13))
+      fileName: row.text(11) ?? "", sizeBytes: row.int(12), latitude: row.optionalDouble(13), longitude: row.optionalDouble(14))
   }
 
   public func summaries(_ scope: RemoteScope) throws -> [RemoteItemSummary] {
@@ -261,9 +454,26 @@ public actor RemoteLibraryStore {
     return result
   }
 
+  /// The Locked Folder, newest first. Only its own screen reads it, once unlocked.
+  public func lockedSummaries() throws -> [RemoteItemSummary] {
+    var result: [RemoteItemSummary] = []
+    try db().query(
+      "SELECT \(Self.summaryColumns) FROM items WHERE locked = 1 AND trashed_at IS NULL ORDER BY taken_at DESC"
+    ) { result.append(Self.summary($0)) }
+    return result
+  }
+
+  /// Everything locked, in Trash too, for `LockedItems`.
+  func lockedKeys() throws -> Set<String> {
+    var keys = Set<String>()
+    try db().query("SELECT media_key FROM items WHERE locked = 1") { if let key = $0.text(0) { keys.insert(key) } }
+    return keys
+  }
+
+  /// Lookups by key (Siri, the info panel) never return a Locked Folder item.
   public func summary(mediaKey: String) throws -> RemoteItemSummary? {
     var result: RemoteItemSummary?
-    try db().query("SELECT \(Self.summaryColumns) FROM items WHERE media_key = ?", [.text(mediaKey)]) {
+    try db().query("SELECT \(Self.summaryColumns) FROM items WHERE media_key = ? AND locked = 0", [.text(mediaKey)]) {
       result = Self.summary($0)
     }
     return result
@@ -271,7 +481,7 @@ public actor RemoteLibraryStore {
 
   public func item(mediaKey: String) throws -> RemoteMediaItem? {
     var item: RemoteMediaItem?
-    try db().query("SELECT * FROM items WHERE media_key = ?", [.text(mediaKey)]) { row in
+    try db().query("SELECT * FROM items WHERE media_key = ? AND locked = 0", [.text(mediaKey)]) { row in
       item = RemoteMediaItem(
         mediaKey: row.text(0) ?? "", dedupKey: row.text(1) ?? "", sha1: row.blob(2), fileName: row.text(3) ?? "",
         caption: row.text(4), kind: RemoteMediaItem.Kind(rawValue: Int(row.int(5))) ?? .photo, sizeBytes: row.int(6),
@@ -299,13 +509,28 @@ public actor RemoteLibraryStore {
         """
         SELECT media_key, COALESCE(location_name, '') || ' ' || COALESCE(camera_make, '') || ' '
           || COALESCE(camera_model, '') || ' ' || COALESCE(caption, '')
-        FROM items WHERE media_key IN (\(Array(repeating: "?", count: chunk.count).joined(separator: ",")))
+        FROM items WHERE locked = 0
+          AND media_key IN (\(Array(repeating: "?", count: chunk.count).joined(separator: ",")))
         """, chunk.map { .text($0) }
       ) { row in
         if let key = row.text(0) { words[key] = row.text(1) }
       }
     }
     return words
+  }
+
+  /// Place names and captions for every non-locked item, in one table scan.
+  public func siriDetails() throws -> [String: RemoteSiriDetails] {
+    var details: [String: RemoteSiriDetails] = [:]
+    try db().query(
+      """
+      SELECT media_key, COALESCE(location_name, ''), COALESCE(caption, '')
+      FROM items WHERE locked = 0 AND (location_name IS NOT NULL OR caption IS NOT NULL)
+      """
+    ) { row in
+      if let key = row.text(0) { details[key] = RemoteSiriDetails(place: row.text(1) ?? "", caption: row.text(2) ?? "") }
+    }
+    return details
   }
 
   /// Place names and captions, for Siri and Spotlight.
@@ -317,7 +542,8 @@ public actor RemoteLibraryStore {
       try database.query(
         """
         SELECT media_key, COALESCE(location_name, ''), COALESCE(caption, '')
-        FROM items WHERE media_key IN (\(Array(repeating: "?", count: chunk.count).joined(separator: ",")))
+        FROM items WHERE locked = 0
+          AND media_key IN (\(Array(repeating: "?", count: chunk.count).joined(separator: ",")))
           AND (location_name IS NOT NULL OR caption IS NOT NULL)
         """, chunk.map { .text($0) }
       ) { row in
@@ -327,9 +553,29 @@ public actor RemoteLibraryStore {
     return details
   }
 
+  /// Media keys among `mediaKeys` that exist in the mirror and are not in the Locked Folder.
+  public func visibleMediaKeys(in mediaKeys: [String]) throws -> Set<String> {
+    guard !mediaKeys.isEmpty else { return [] }
+    var visible = Set<String>()
+    let database = try db()
+    for start in stride(from: 0, to: mediaKeys.count, by: 500) {
+      let chunk = mediaKeys[start..<min(start + 500, mediaKeys.count)]
+      try database.query(
+        """
+        SELECT media_key FROM items WHERE locked = 0
+          AND media_key IN (\(Array(repeating: "?", count: chunk.count).joined(separator: ",")))
+        """, chunk.map { .text($0) }
+      ) { row in
+        if let key = row.text(0) { visible.insert(key) }
+      }
+    }
+    return visible
+  }
+
+  /// Kept thumbnails of these stay; a Locked Folder item's go.
   public func allMediaKeys() throws -> Set<String> {
     var keys = Set<String>()
-    try db().query("SELECT media_key FROM items") { if let key = $0.text(0) { keys.insert(key) } }
+    try db().query("SELECT media_key FROM items WHERE locked = 0") { if let key = $0.text(0) { keys.insert(key) } }
     return keys
   }
 
@@ -353,11 +599,17 @@ public actor RemoteLibraryStore {
     return order.compactMap { groups[$0] }
   }
 
-  /// Albums, most recently active first.
+  /// Albums, most recently active first. A cover moved to the Locked Folder isn't shown.
   public func albums() throws -> [RemoteAlbum] {
     var albums: [RemoteAlbum] = []
     try db().query(
-      "SELECT * FROM albums ORDER BY COALESCE(last_activity, end_date, 0) DESC, title"
+      """
+      SELECT a.media_key, a.title, a.item_count,
+        CASE WHEN EXISTS (SELECT 1 FROM items WHERE media_key = a.cover_media_key AND locked = 1) THEN NULL
+          ELSE a.cover_media_key END,
+        a.start_date, a.end_date, a.last_activity
+      FROM albums a ORDER BY COALESCE(a.last_activity, a.end_date, 0) DESC, a.title
+      """
     ) { row in
       albums.append(
         RemoteAlbum(
@@ -377,14 +629,15 @@ public actor RemoteLibraryStore {
         SUM(trashed_at IS NULL), SUM(trashed_at IS NULL AND kind != 2), SUM(trashed_at IS NULL AND kind = 2),
         TOTAL(CASE WHEN trashed_at IS NULL THEN size_bytes END),
         SUM(trashed_at IS NULL AND quota_charged > 0), TOTAL(CASE WHEN trashed_at IS NULL THEN quota_charged END),
-        SUM(trashed_at IS NOT NULL), SUM(trashed_at IS NULL AND archived = 1)
+        SUM(trashed_at IS NOT NULL), SUM(trashed_at IS NULL AND archived = 1),
+        (SELECT COUNT(*) FROM items WHERE locked = 1 AND trashed_at IS NULL)
       FROM items WHERE locked = 0 AND (canonical = 1 OR trashed_at IS NOT NULL)
       """
     ) { row in
       stats = RemoteLibraryStats(
         items: Int(row.int(0)), photos: Int(row.int(1)), videos: Int(row.int(2)), bytes: Int64(row.double(3)),
         chargedItems: Int(row.int(4)), chargedBytes: Int64(row.double(5)), trashed: Int(row.int(6)),
-        archived: Int(row.int(7)))
+        archived: Int(row.int(7)), locked: Int(row.int(8)))
     }
     return stats
   }

@@ -6,6 +6,8 @@ import Testing
 
 #if os(macOS)
   import AppKit
+#else
+  import UIKit
 #endif
 
 @Suite("Photo grid")
@@ -22,6 +24,27 @@ struct PhotoGridTests {
     #expect(!model.isLoaded)
     #expect(model.itemCount == 0)
     #expect(model.badgeToken == 1)
+  }
+
+  @Test("Adding older rows preserves the newest cells' columns and distance from the bottom")
+  func alignsNewestRow() {
+    for columns in [2, 3, 7] {
+      let preview = PhotoGridLayout(columns: columns, width: 390, itemCount: 96, alignsNewestRow: true)
+      for added in [1, 2, 3, 7, 109] {
+        let merged = PhotoGridLayout(columns: columns, width: 390, itemCount: 96 + added, alignsNewestRow: true)
+        for index in 0..<preview.itemCount {
+          let before = preview.frame(at: index)
+          let after = merged.frame(at: index + added)
+          #expect(before.minX == after.minX)
+          #expect(preview.contentHeight - before.maxY == merged.contentHeight - after.maxY)
+          #expect(merged.index(at: CGPoint(x: after.midX, y: after.midY)) == index + added)
+          #expect(merged.indices(in: after.insetBy(dx: 1, dy: 1)).contains(index + added))
+        }
+        if merged.itemCount % columns != 0 {
+          #expect(merged.index(at: CGPoint(x: 1, y: 1)) == nil)
+        }
+      }
+    }
   }
 
   @Test("Native geometry reports leave the render pass and publish only the latest values")
@@ -53,7 +76,56 @@ struct PhotoGridTests {
     #expect(tops == [3])
   }
 
+  @Test("Row input pauses between a data reload and the native grid replacing its cells")
+  @MainActor
+  func rowInputFollowsInstalledRevision() {
+    let coordinator = PhotoGridCoordinator()
+    var revision = 1
+    coordinator.reloadToken = revision
+    coordinator.options.currentReloadToken = { revision }
+    #expect(coordinator.acceptsRowInput)
+    revision += 1
+    #expect(!coordinator.acceptsRowInput)
+    coordinator.reloadToken = revision
+    #expect(coordinator.acceptsRowInput)
+  }
+
   #if os(macOS)
+    @Test("A rubber-band drag cannot add replacement rows after the grid reloads")
+    @MainActor
+    func dragSelectionAcrossReload() throws {
+      let coordinator = PhotoGridCoordinator()
+      let grid = PhotoGridNSView(frame: NSRect(x: 0, y: 0, width: 360, height: 400))
+      let scroll = NSScrollView(frame: grid.frame)
+      scroll.documentView = grid
+      grid.attach(to: scroll)
+      grid.coordinator = coordinator
+      let data = GridData()
+      grid.setDataSource(data)
+      var updates: [Set<Int>] = []
+      coordinator.onSelect = { updates.append($0) }
+      func event(_ type: NSEvent.EventType, at position: CGPoint) throws -> NSEvent {
+        try #require(
+          NSEvent.mouseEvent(
+            with: type, location: grid.convert(position, to: nil), modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+      }
+      let cell = grid.renderer.layout.frame(at: 0)
+      let gap = CGPoint(x: cell.maxX + 0.5, y: cell.minY + 1)
+      try #require(grid.renderer.index(at: gap) == nil)
+      grid.mouseDown(with: try event(.leftMouseDown, at: gap))
+      let inside = CGPoint(x: cell.midX, y: cell.midY)
+      grid.mouseDragged(with: try event(.leftMouseDragged, at: inside))
+      try #require(updates.last == [0])
+      let before = updates
+      data.prefix = "new-"
+      coordinator.reloadToken += 1
+      grid.setDataSource(data)
+      let anotherRow = grid.renderer.layout.frame(at: 5)
+      grid.mouseDragged(with: try event(.leftMouseDragged, at: .init(x: anotherRow.midX, y: anotherRow.midY)))
+      #expect(updates == before)
+    }
+
     @Test("Image scroll-view focus forwards paging and dismissal to its viewer")
     @MainActor
     func nativeViewerKeys() throws {
@@ -227,16 +299,262 @@ struct PhotoGridTests {
 
   @Test("An asset shows its worst backup state")
   func backupBadges() {
+    let email = "current@example.com"
     func record(_ id: String, _ asset: String, _ status: TransferStatus) -> TransferRecord {
-      TransferRecord(id: id, filename: id, mediaType: "Photo", status: status, assetLocalIdentifier: asset)
+      TransferRecord(
+        id: "\(email)|\(id)", filename: id, mediaType: "Photo", status: status,
+        sentAccountEmails: status == .sent || status == .deleted ? [email] : [], assetLocalIdentifier: asset)
     }
-    let states = PhotoLibraryGridModel.backupStates(from: [
-      record("1", "a", .sent), record("2", "a", .pending),
-      record("3", "b", .failed), record("4", "b", .sent),
-      record("5", "c", .deleted),
-      TransferRecord(id: "6", filename: "f", mediaType: "Photo", status: .sent),
-    ])
+    let states = PhotoLibraryGridModel.backupStates(
+      from: [
+        record("1", "a", .sent), record("2", "a", .pending),
+        record("3", "b", .failed), record("4", "b", .sent),
+        record("5", "c", .deleted),
+        TransferRecord(id: "6", filename: "f", mediaType: "Photo", status: .sent),
+      ], accountEmail: email)
     #expect(states == ["a": .pending, "b": .failed, "c": .backedUp])
+  }
+
+  private final class GridImages: ThumbnailSource, @unchecked Sendable {
+    var requestIDs: [String] = []
+    var warmedIDs: [String] = []
+    var stoppedIDs: [String] = []
+    var alias = "old"
+    var holdRequests = false
+    var cancels: [String] = []
+
+    func requestImage(
+      id: String, pixelSize: CGSize, quality: ImageRequestQuality,
+      onUnavailable: @escaping @Sendable () -> Void, deliver: @escaping @Sendable (CGImage, Bool) -> Void
+    ) -> ImageRequestToken {
+      requestIDs.append(id)
+      if holdRequests { return ImageRequestToken { [self] in cancels.append(id) } }
+      onUnavailable()
+      return .none
+    }
+
+    func cachingTarget(for id: String) -> ThumbnailCachingTarget? {
+      ThumbnailCachingTarget(source: self, id: alias + id)
+    }
+
+    func startCaching(ids: [String], pixelSize: CGSize) { warmedIDs.append(contentsOf: ids) }
+    func stopCaching(ids: [String], pixelSize: CGSize) { stoppedIDs.append(contentsOf: ids) }
+  }
+
+  @MainActor
+  private final class GridData: PhotoGridDataSource {
+    let images = GridImages()
+    var itemCount = 100
+    var prefix = ""
+    var accountEmail: String?
+    var thumbnailRevision = 0
+    var changedIndex: Int?
+    var thumbnailSource: any ThumbnailSource { images }
+    func itemID(at index: Int) -> String { prefix + String(index) }
+    func thumbnailIdentity(at index: Int) -> ThumbnailIdentity {
+      ThumbnailIdentity(
+        id: itemID(at: index), version: changedIndex == nil || index == changedIndex ? Int64(thumbnailRevision) : 0,
+        accountEmail: accountEmail)
+    }
+    func badges(at index: Int) -> PhotoGridBadges { PhotoGridBadges() }
+    func accessibilityLabel(at index: Int) -> String { itemID(at: index) }
+  }
+
+  @Test("Zero bounds and a deferred reload never request the unpositioned grid")
+  @MainActor
+  func populateFinalViewport() {
+    let renderer = PhotoGridRenderer(pipeline: ThumbnailPipeline())
+    let data = GridData()
+    renderer.dataSource = data
+    let layout = PhotoGridLayout(columns: 4, width: 400, itemCount: data.itemCount)
+    let top = CGRect(x: 0, y: 0, width: 400, height: 400)
+    renderer.setLayout(layout, visibleRect: .zero)
+    #expect(data.images.requestIDs.isEmpty)
+    renderer.setLayout(layout, visibleRect: top, populate: false)
+    #expect(data.images.requestIDs.isEmpty)
+    let bottom = top.offsetBy(dx: 0, dy: layout.contentHeight - top.height)
+    renderer.reloadData(visibleRect: bottom)
+    let expected = layout.indices(in: bottom.insetBy(dx: 0, dy: -layout.itemSide)).map { String($0) }
+    #expect(data.images.requestIDs == expected)
+  }
+
+  @Test("Reload stops exactly the identifiers warmed under the previous routing")
+  @MainActor
+  func stopExactWarmWindow() async throws {
+    let renderer = PhotoGridRenderer(pipeline: ThumbnailPipeline())
+    let data = GridData()
+    renderer.dataSource = data
+    let rect = CGRect(x: 0, y: 0, width: 400, height: 400)
+    renderer.setLayout(PhotoGridLayout(columns: 4, width: 400, itemCount: data.itemCount), visibleRect: rect)
+    for _ in 0..<100 where data.images.warmedIDs.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+    let previous = data.images.warmedIDs
+    try #require(!previous.isEmpty)
+    data.prefix = "replacement"
+    data.images.alias = "new"
+    renderer.reloadData(visibleRect: rect)
+    #expect(data.images.stoppedIDs.sorted() == previous.sorted())
+    #expect(data.images.warmedIDs.count > previous.count)
+  }
+
+  @Test("Settle and reconnect retry visible misses")
+  @MainActor
+  func visibleMisses() {
+    let renderer = PhotoGridRenderer(pipeline: ThumbnailPipeline())
+    let data = GridData()
+    renderer.dataSource = data
+    let rect = CGRect(x: 0, y: 0, width: 400, height: 400)
+    renderer.setLayout(PhotoGridLayout(columns: 4, width: 400, itemCount: data.itemCount), visibleRect: rect, populate: false)
+    renderer.update(visibleRect: rect, velocity: 2_000)
+    let requests = data.images.requestIDs
+    #expect(!requests.isEmpty)
+    renderer.update(visibleRect: rect, atRest: true)
+    #expect(data.images.requestIDs.count == requests.count * 2)
+    NotificationCenter.default.post(name: NetworkStatusMonitor.didReconnect, object: nil)
+    #expect(data.images.requestIDs.count == requests.count * 3)
+  }
+
+  @Test("A cell clears stale pixels when its version changes, even if the new request misses")
+  @MainActor
+  func changedCellVersion() throws {
+    let renderer = PhotoGridRenderer(pipeline: ThumbnailPipeline())
+    let data = GridData()
+    let rect = CGRect(x: 0, y: 0, width: 400, height: 100)
+    renderer.dataSource = data
+    renderer.setLayout(PhotoGridLayout(columns: 4, width: 400, itemCount: data.itemCount), visibleRect: rect)
+    let cell = try #require(renderer.cellLayer(at: 0) as? PhotoGridCellLayer)
+    cell.setImage(Self.image())
+    renderer.refreshThumbnailSourceIfNeeded(visibleRect: rect)
+    #expect(cell.contents != nil)
+    data.thumbnailRevision += 1
+    renderer.refreshThumbnailSourceIfNeeded(visibleRect: rect)
+    #expect(cell.itemID == "0")
+    #expect(cell.contents == nil)
+  }
+
+  @Test("An alias change leaves unrelated in-flight and drawn cells alone")
+  @MainActor
+  func aliasChangeOnlyRefreshesChangedCell() throws {
+    let renderer = PhotoGridRenderer(pipeline: ThumbnailPipeline())
+    let data = GridData()
+    data.images.holdRequests = true
+    data.changedIndex = 0
+    renderer.dataSource = data
+    let rect = CGRect(x: 0, y: 0, width: 400, height: 100)
+    renderer.setLayout(PhotoGridLayout(columns: 4, width: 400, itemCount: data.itemCount), visibleRect: rect)
+    let drawn = try #require(renderer.cellLayer(at: 2) as? PhotoGridCellLayer)
+    drawn.cancelImageRequest()
+    drawn.requestState = .ready
+    drawn.setImage(Self.image())
+    let requests = data.images.requestIDs
+    data.images.cancels.removeAll()
+
+    data.thumbnailRevision += 1
+    renderer.refreshThumbnailSourceIfNeeded(visibleRect: rect)
+    #expect(data.images.requestIDs == requests + ["0"])
+    #expect(data.images.cancels == ["0"])
+    #expect(drawn.contents != nil)
+  }
+
+  @Test("Zoom and share previews use the visible photo's versioned identity")
+  @MainActor
+  func versionedPresentationPreviews() throws {
+    let identity = ThumbnailIdentity(id: UUID().uuidString, version: 12)
+    let stale = ThumbnailIdentity(id: identity.id, version: 11)
+    let pipeline = ThumbnailPipeline.shared
+    let gridImage = Self.image()
+    let source = CountingSource()
+    let ticket = pipeline.load(ThumbnailKey(identity: identity, bucket: .small), from: source) { _, _ in }
+    defer { ticket.cancel() }
+    source.pending[0](gridImage, true)
+
+    let zoom = ViewerZoom()
+    zoom.proxy.windowFrameProvider = { _, _ in CGRect(x: 0, y: 0, width: 44, height: 44) }
+    zoom.prepare(index: 0, identity: identity)
+    #expect(zoom.flight?.image === gridImage)
+    zoom.prepare(index: 0, identity: stale)
+    #expect(zoom.flight == nil)
+    #if os(iOS)
+      #expect(SharePresenter.cachedThumbnail(identity) === gridImage)
+      #expect(SharePresenter.cachedThumbnail(stale) == nil)
+    #endif
+
+    let preview = Self.image()
+    pipeline.rememberViewerPreview(preview, for: identity)
+    #expect(ViewerZoom.uncroppedImage(for: identity) === preview)
+    #expect(ViewerZoom.uncroppedImage(for: stale) == nil)
+    #if os(iOS)
+      #expect(SharePresenter.cachedThumbnail(identity) === preview)
+    #endif
+  }
+
+  #if os(iOS)
+    @Test("A safe area arriving late keeps a new grid on its newest row")
+    @MainActor
+    func lateSafeAreaKeepsEnd() {
+      let view = PhotoGridUIView()
+      let coordinator = PhotoGridCoordinator()
+      coordinator.options = PhotoGridOptions(startsAtEnd: true)
+      view.coordinator = coordinator
+      let data = GridData()
+      data.itemCount = 300
+      view.frame = CGRect(x: 0, y: 0, width: 390, height: 800)
+      view.setDataSource(data)
+      view.layoutIfNeeded()
+      // What UIKit does as the bars' insets arrive.
+      view.contentInset.bottom = 83
+      view.contentOffset.y -= 116
+      view.setNeedsLayout()
+      view.layoutIfNeeded()
+      #expect(view.contentOffset.y == view.contentSize.height - view.bounds.height + view.adjustedContentInset.bottom)
+      #expect(coordinator.lastAtEnd)
+      // A scroll of the user's own still leaves the end.
+      view.contentOffset.y -= 400
+      view.layoutIfNeeded()
+      #expect(!coordinator.lastAtEnd)
+    }
+  #endif
+
+  #if os(iOS)
+    @Test("A lock posted from a sync's thread takes a grid's saved screen away")
+    @MainActor
+    func lockFromBackground() async {
+      let view = PhotoGridUIView()
+      let coordinator = PhotoGridCoordinator()
+      view.coordinator = coordinator
+      view.frame = CGRect(x: 0, y: 0, width: 390, height: 800)
+      view.showPlaceholder(Self.image())
+      #expect(view.subviews.contains { $0 is UIImageView })
+      let email = "grid-" + UUID().uuidString + "@example.com"
+      defer { LockedItems.forget(accountEmail: email) }
+      await Task.detached { LockedItems.insert(["locked"], accountEmail: email) }.value
+      for _ in 0..<100 where view.subviews.contains(where: { $0 is UIImageView }) {
+        try? await Task.sleep(for: .milliseconds(10))
+      }
+      #expect(!view.subviews.contains { $0 is UIImageView })
+    }
+  #endif
+
+  @Test("A newly locked cell loses its pixels before the grid has merged")
+  @MainActor
+  func lockedPixelsDuringMerge() throws {
+    let renderer = PhotoGridRenderer(pipeline: ThumbnailPipeline())
+    let data = GridData()
+    let email = "grid-" + UUID().uuidString + "@example.com"
+    data.accountEmail = email
+    data.prefix = "g:1:"
+    let rect = CGRect(x: 0, y: 0, width: 400, height: 100)
+    renderer.dataSource = data
+    renderer.setLayout(PhotoGridLayout(columns: 4, width: 400, itemCount: data.itemCount), visibleRect: rect)
+    let cell = try #require(renderer.cellLayer(at: 0) as? PhotoGridCellLayer)
+    cell.setImage(Self.image())
+    #expect(cell.contents != nil)
+    LockedItems.insert(["0"], accountEmail: email)
+    defer { LockedItems.forget(accountEmail: email) }
+    #expect(cell.contents == nil)
+    #expect(!renderer.hasLockedPixels(in: rect))
+    // Pixels that still got there bar a snapshot.
+    cell.contents = Self.image()
+    #expect(renderer.hasLockedPixels(in: rect))
   }
 
   private final class CountingSource: ThumbnailSource, @unchecked Sendable {
@@ -246,7 +564,8 @@ struct PhotoGridTests {
     var pending: [@Sendable (CGImage, Bool) -> Void] = []
 
     func requestImage(
-      id: String, pixelSize: CGSize, quality: ImageRequestQuality, deliver: @escaping @Sendable (CGImage, Bool) -> Void
+      id: String, pixelSize: CGSize, quality: ImageRequestQuality,
+      onUnavailable: @escaping @Sendable () -> Void, deliver: @escaping @Sendable (CGImage, Bool) -> Void
     ) -> ImageRequestToken {
       lock.withLock {
         requests += 1

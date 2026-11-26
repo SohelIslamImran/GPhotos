@@ -7,62 +7,10 @@ struct MacOverviewView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   var body: some View {
-    DisplayedBackupStatus(store.backupStatus) { shown in
-      content(shown)
-    }
-    .navigationTitle("Backup")
-  }
-
-  private func content(_ shown: BackupStatus) -> some View {
     ScrollView {
       VStack(spacing: 20) {
-        MacStatusCard(store: store, router: router, status: shown)
-        GlassEffectContainer(spacing: 12) {
-          HStack(spacing: 12) {
-            let counts = store.accountRecordCounts
-            let queued = counts.queued + counts.uploading
-            StatTile(
-              "In Progress", value: queued,
-              detail: queued == 0 ? String(localized: "Up to date") : String(localized: "\(queued) remaining"),
-              symbol: "clock.arrow.circlepath", tint: .blue, isActive: queued > 0 && store.isRunning
-            ) {
-              router.show(.activity, filter: .pending)
-            }
-            .contextMenu {
-              Button("Back Up Now") { store.requestSyncNow() }
-                .disabled(store.selectedAccount == nil || !store.hasUsableEnabledFolder)
-            }
-            StatTile(
-              "Uploaded", value: counts.sent, detail: ByteFormat.string(counts.completedBytes),
-              symbol: "checkmark.circle.fill", tint: .green
-            ) {
-              router.show(.activity, filter: .uploaded)
-            }
-            .contextMenu {
-              Button("Clean Up Backed-Up Files…") {
-                router.show(.settings)
-                router.isConfirmingCleanup = true
-              }
-              .disabled(!store.canCleanUp)
-              .help(
-                ProductCopy.cleanupDetail(
-                  isSignedIn: store.selectedAccount != nil, deleteDelay: store.settings.autoDeleteDelay,
-                  isBackingUp: store.isRunning))
-            }
-            StatTile(
-              "Failed", value: counts.failed,
-              detail: counts.failed == 0 ? String(localized: "None") : String(localized: "Needs retry"),
-              symbol: counts.failed == 0 ? "exclamationmark.triangle" : "exclamationmark.triangle.fill",
-              tint: counts.failed == 0 ? .secondary : .red, isActive: counts.failed > 0 && store.isRunning
-            ) {
-              router.show(.activity, filter: .failed)
-            }
-            .contextMenu {
-              Button("Retry All Failed Items") { Task { await store.retryFailedForUser() } }
-                .disabled(counts.failed == 0)
-            }
-          }
-        }
+        OverviewStatus(store: store, router: router)
+        OverviewStats(store: store, router: router)
         // Live uploads lead, above the drop area, where they're seen without scrolling.
         if store.isRunning {
           NowUploadingList(pool: store.workerPool, record: store.uploadingRecord(for:))
@@ -75,17 +23,72 @@ struct MacOverviewView: View {
       .padding(24)
       .frame(maxWidth: .infinity)
     }
+    .navigationTitle("Backup")
   }
 }
 
-extension MacSyncStore {
-  /// The record a worker is sending. Only a file just finished, still on screen for a
-  /// moment, needs the full search.
-  func uploadingRecord(for worker: WorkerState) -> TransferRecord? {
-    guard !worker.itemID.isEmpty else { return nil }
-    return sendingAccountRecords[worker.itemID]
-      ?? sendingAccountRecords.values.first { $0.filename == worker.filename }
-      ?? accountRecords.first { $0.id == worker.itemID }
+private struct OverviewStats: View {
+  let store: MacSyncStore
+  let router: MacRouter
+
+  var body: some View {
+    GlassEffectContainer(spacing: 12) {
+      HStack(spacing: 12) {
+        let counts = store.accountRecordCounts
+        let queued = counts.queued + counts.uploading
+        StatTile(
+          "In Progress", value: queued,
+          detail: queued == 0 ? String(localized: "Up to date") : String(localized: "\(queued) remaining"),
+          symbol: "clock.arrow.circlepath", tint: .blue, isActive: queued > 0 && store.isRunning
+        ) {
+          router.show(.activity, filter: .pending)
+        }
+        .contextMenu {
+          Button("Back Up Now") { store.requestSyncNow() }
+            .disabled(store.selectedAccount == nil || !store.hasUsableEnabledFolder)
+        }
+        StatTile(
+          "Uploaded", value: counts.sent, detail: ByteFormat.string(counts.completedBytes),
+          symbol: "checkmark.circle.fill", tint: .green
+        ) {
+          router.show(.activity, filter: .uploaded)
+        }
+        .contextMenu {
+          Button("Clean Up Backed-Up Files…") {
+            router.show(.settings)
+            router.isConfirmingCleanup = true
+          }
+          .disabled(!store.canCleanUp)
+          .help(
+            ProductCopy.cleanupDetail(
+              isSignedIn: store.selectedAccount != nil, deleteDelay: store.settings.autoDeleteDelay,
+              isBackingUp: store.isRunning))
+        }
+        StatTile(
+          "Failed", value: counts.failed,
+          detail: counts.failed == 0 ? String(localized: "None") : String(localized: "Needs retry"),
+          symbol: counts.failed == 0 ? "exclamationmark.triangle" : "exclamationmark.triangle.fill",
+          tint: counts.failed == 0 ? .secondary : .red, isActive: counts.failed > 0 && store.isRunning
+        ) {
+          router.show(.activity, filter: .failed)
+        }
+        .contextMenu {
+          Button("Retry All Failed Items") { Task { await store.retryFailedForUser() } }
+            .disabled(counts.failed == 0)
+        }
+      }
+    }
+  }
+}
+
+private struct OverviewStatus: View {
+  let store: MacSyncStore
+  let router: MacRouter
+
+  var body: some View {
+    DisplayedBackupStatus(store.backupStatus) { status in
+      MacStatusCard(store: store, router: router, status: status)
+    }
   }
 }
 

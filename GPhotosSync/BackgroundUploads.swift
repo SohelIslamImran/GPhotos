@@ -35,36 +35,59 @@ final class BackgroundUploads {
     }
   }
 
-  /// While busy, the extension starts no uploads: the app uploads itself. The mark is renewed
-  /// while the app runs and lapses on its own once the app is suspended or closed.
+  private nonisolated static let ledgerQueue = DispatchQueue(label: "BackgroundUploads.ledger", qos: .utility)
+  private var isBusy = false
+
+  nonisolated static func readLedger() async -> BackgroundUploadLedger {
+    await withLedger { BackgroundUploadLedgerStore.shared.read() }
+  }
+
+  nonisolated static func withLedger<Value: Sendable>(_ work: @escaping @Sendable () -> Value) async -> Value {
+    await withCheckedContinuation { continuation in
+      ledgerQueue.async { continuation.resume(returning: work()) }
+    }
+  }
+
+  func resetAppClaims() {
+    Self.ledgerQueue.async {
+      BackgroundUploadLedgerStore.shared.update { $0.resetAppClaims() }
+    }
+  }
+
+  /// Serialize the lease and app claims so a worker never races its own batch's lease.
   func setAppBusy(_ busy: Bool) {
-    guard busy else {
-      busyTask?.cancel()
-      busyTask = nil
-      store.update { $0.appBusyUntil = nil }
-      return
-    }
-    guard busyTask == nil else { return }
-    store.update { ledger in
-      ledger.appWorkEpoch = UUID()
-      ledger.appBusyUntil = Date().addingTimeInterval(BackgroundUploader.appBusyWindow)
-    }
+    guard busy != isBusy else { return }
+    isBusy = busy
+    busyTask?.cancel()
+    busyTask = nil
     let store = store
+    Self.ledgerQueue.async {
+      store.update { ledger in
+        if busy { ledger.appWorkEpoch = UUID() }
+        ledger.appBusyUntil = busy ? Date().addingTimeInterval(BackgroundUploader.appBusyWindow) : nil
+      }
+    }
+    guard busy else { return }
     busyTask = Task {
       while !Task.isCancelled {
-        try? await Task.sleep(for: .seconds(BackgroundUploader.appBusyWindow / 3))
-        guard !Task.isCancelled else { return }
-        store.update { $0.appBusyUntil = Date().addingTimeInterval(BackgroundUploader.appBusyWindow) }
+        do { try await Task.sleep(for: .seconds(BackgroundUploader.appBusyWindow / 3)) } catch { return }
+        Self.ledgerQueue.async {
+          store.update { $0.appBusyUntil = Date().addingTimeInterval(BackgroundUploader.appBusyWindow) }
+        }
       }
     }
   }
 
-  nonisolated static func claimForApp(_ recordID: String) -> Bool {
-    BackgroundUploadLedgerStore.shared.persist { $0.claimForApp(recordID) }
+  nonisolated static func claimForApp(_ recordID: String) async -> Bool {
+    await withLedger {
+      BackgroundUploadLedgerStore.shared.persist(notifiesAboutWork: false) { $0.claimForApp(recordID) }
+    }
   }
 
   nonisolated static func releaseAppClaim(_ recordID: String) {
-    BackgroundUploadLedgerStore.shared.update { $0.releaseAppClaim(recordID) }
+    ledgerQueue.async {
+      BackgroundUploadLedgerStore.shared.update { $0.releaseAppClaim(recordID) }
+    }
   }
 
   func finishJobs(timeout: Duration) async {
@@ -74,12 +97,12 @@ final class BackgroundUploads {
   }
 
   /// Retrying failed items includes the ones the extension held back.
-  func forgetFailures() {
-    store.update { $0.failures = [:] }
+  func forgetFailures() async {
+    await Self.withLedger { [store] in store.update { $0.failures = [:] } }
   }
 
-  func forgetFailure(of recordID: String) {
-    store.update { $0.failures[recordID] = nil }
+  func forgetFailure(of recordID: String) async {
+    await Self.withLedger { [store] in store.update { $0.failures[recordID] = nil } }
   }
 
   // MARK: - Transfers the App Is Woken For

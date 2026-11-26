@@ -56,8 +56,10 @@ reproduce them.
   or drag exports as needed; folder files can be shared, never deleted from the Library.
 - **Collections.** Pinned collections, albums, media types, utilities and an interactive
   Places map across the merged library (including Google-only items). Device Hidden items
-  require authentication. Google scopes include Albums, All Photos, Favorites, Videos,
-  Archive, Trash and Uses Storage, with charged bytes reported by library sync.
+  and Google's Locked Folder (view only) require authentication. Google scopes include
+  Albums, All Photos, Favorites, Videos, Archive, Trash and Uses Storage, with charged
+  bytes reported by library sync. Not Backed Up and Not Included in Backup open the
+  Library with that filter.
 - **Google Photos.** A local mirror per account resumes interrupted full syncs and
   follows with delta updates. Browse cloud items, stream videos, save originals,
   edit captions, favorite, archive, add to albums, move to Trash or restore.
@@ -193,7 +195,7 @@ xcodebuild test -project GPhotosSync.xcodeproj -scheme GPhotosSync \
 
 Generate the project after changing `project.yml` or adding source files. See [AGENTS.md](AGENTS.md) for repository conventions and data safety rules.
 
-GitHub Actions tests both platforms. When release signing is configured, a version tag such as `v1.2.0` on `main` builds and publishes the matching Mac release. See the [release setup](docs/releases.md) for signing, versioning and the optional TestFlight job.
+GitHub Actions tests both platforms. When release signing is configured, each merge to `main` that changes the app publishes the next version, and a version tag such as `v1.2.0` on `main` publishes that version. See the [release setup](docs/releases.md) for signing, versioning and the optional TestFlight job.
 
 ## Architecture
 

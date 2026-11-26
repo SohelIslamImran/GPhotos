@@ -21,6 +21,13 @@ public struct PersonEntity: IndexedEntity {
     photoCount = person.faceCount
   }
 
+  public init(_ person: LibraryIndexStore.NamedPerson) {
+    id = String(person.id)
+    name = person.name
+    isFavorite = false
+    photoCount = person.photoCount
+  }
+
   public var personID: Int64? { Int64(id) }
 
   public var displayRepresentation: DisplayRepresentation {
@@ -41,7 +48,7 @@ public struct PersonEntityQuery: EntityStringQuery, EnumerableEntityQuery, Index
 
   /// Only named people: Siri finds people by name.
   public func allEntities() async throws -> [PersonEntity] {
-    try await SiriLibrary.shared.store.people().filter { $0.name?.isEmpty == false }.map(PersonEntity.init)
+    try await SiriLibrary.shared.store.namedPeople().map(PersonEntity.init)
   }
 
   public func entities(for identifiers: [String]) async throws -> [PersonEntity] {

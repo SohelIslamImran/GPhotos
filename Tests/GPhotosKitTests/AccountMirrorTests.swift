@@ -6,6 +6,29 @@ import Testing
 @Suite("Account Mirror and Multi-Account Tests")
 struct AccountMirrorTests {
 
+  @Test("Off-main account snapshots keep Activity and cleanup counts equivalent")
+  func accountBucketParity() async {
+    let email = "primary@example.com"
+    let records = [TransferStatus.pending, .sending, .sent, .deleted, .failed, .failed, .sent].enumerated().map { index, status in
+      var record = TransferRecord(
+        id: "\(index == 6 ? "other" : email)|\(index)", filename: "image-\(index).jpg", mediaType: "Photo",
+        status: status, byteCount: 100)
+      record.isSkipped = index == 5
+      if index == 2 || index == 3 || index == 6 { record.foundInAccounts.insert(email) }
+      return record
+    }
+    let (snapshot, found) = await Task.detached {
+      (AccountTransferBuckets(records: records, accountEmail: email), SyncEngine.foundCounts(in: records))
+    }.value
+    let scoped = records.filter { $0.id.hasPrefix("\(email)|") && !$0.isSkipped }
+    #expect(snapshot.all == scoped)
+    #expect(snapshot.activityCounts == ActivityFilter.counts(in: scoped))
+    #expect(snapshot.queued == scoped.filter { $0.status == .pending })
+    #expect(snapshot.completedBytes == 200)
+    #expect(found[email] == 2)
+    #expect(AccountTransferBuckets(records: records, accountEmail: nil).all.isEmpty)
+  }
+
   // MARK: - Keychain Account Model Round Trip
 
   @Test("An account list that no longer decodes reads as signed out")

@@ -18,7 +18,7 @@ struct ContentView: View {
   @State private var tab: AppTab = .library
   @State private var isRestoringTabBar = false
   @State private var tabBarGrewAt = ContinuousClock.now - .seconds(1)
-  @State private var library = UnifiedLibraryModel()
+  @State private var library = UnifiedLibraryModel(waitsForInitialFolders: true)
   @State private var indexer = LibraryIndexer()
   @State private var searchQuery = ""
   @State private var searchPath = NavigationPath()
@@ -86,78 +86,53 @@ struct ContentView: View {
     return isRestoringTabBar ? .never : .onScrollUp
   }
 
-  /// The system grows the bar back only at the top; Photos does it at the newest row, at
-  /// the bottom. Turning minimization off for a moment grows it. A view that only passes
-  /// the end on its way to a period (after switching Years, Months or All) doesn't count.
-  private func restoreTabBarAtNewest(_ atNewest: Bool) {
-    guard atNewest else { return }
-    Task { @MainActor in
-      try? await Task.sleep(for: .milliseconds(100))
-      guard library.isAtNewest, library.isTabBarMinimized else { return }
-      isRestoringTabBar = true
-      try? await Task.sleep(for: .milliseconds(50))
-      isRestoringTabBar = false
-    }
-  }
-
   /// The tabs and what keeps them in step with the model; `body` adds the presentations.
   private var tabs: some View {
     TabView(selection: tabSelection) {
       Tab("Library", systemImage: "photo.on.rectangle", value: AppTab.library) {
-        NavigationStack {
-          UnifiedLibraryView(
-            model: library, cloudLibrary: model.cloudLibrary, records: model.records,
-            recordsRevision: model.recordsRevision, accountsLoaded: model.hasLoadedAccounts
-          )
-        }
+        LibraryTab(model: model, library: library)
       }
       Tab("Collections", systemImage: "rectangle.stack", value: AppTab.collections) {
-        NavigationStack(path: $collectionsPath) {
-          CollectionsView(records: model.records, recordsRevision: model.recordsRevision, cloud: model.cloudLibrary)
-            .toolbarTitleDisplayMode(.inlineLarge)
-        }
+        CollectionsTab(model: model, path: $collectionsPath)
       }
-      Tab("Backup", systemImage: "arrow.up.circle", value: AppTab.backup) { backupStack }
+      Tab("Backup", systemImage: "arrow.up.circle", value: AppTab.backup) {
+        BackupTab(
+          model: model, path: $path,
+          cleanup: CleanupState(isPreparing: isPreparingCleanup, showsNothingToCleanUp: showsNothingToCleanUp),
+          onCleanUp: startCleanup, onSignIn: { sheet = .signIn },
+          onUpload: { sheet = .uploadSource }, onAccount: openAccount,
+          openPendingActivity: openPendingActivity, openPendingAccountSheet: openPendingAccountSheet)
+      }
       Tab(value: AppTab.search, role: .search) {
-        NavigationStack(path: $searchPath) {
-          SearchView(
-            library: library, indexer: indexer, cloud: model.cloudLibrary, records: model.records, query: $searchQuery, path: $searchPath,
-            isEditing: searchFocused, finishSearch: { searchFocused = false }
-          )
-          .toolbarTitleDisplayMode(.inlineLarge)
-        }
-        .searchable(text: $searchQuery, prompt: searchPrompt)
-        .searchFocused($searchFocused)
+        SearchTab(
+          model: model, library: library, indexer: indexer, query: $searchQuery, path: $searchPath, focused: $searchFocused)
       }
     }
     // Places, in Collections and Search, shows the merged library.
     .environment(library)
-    .onChange(of: model.settings.uploadsOnMeteredNetworks, initial: true) { _, allowed in
-      LibraryIndexer.usesMeteredNetworks.withLock { $0 = allowed }
-      if library.isLoaded { indexer.update(from: library) }
-    }
-    .onChange(of: library.reloadToken) {
-      indexer.update(from: library)
-      WidgetPublisher.shared.libraryChanged(library)
-    }
-    .onChange(of: model.backupStatus, initial: true) { _, status in
-      WidgetPublisher.shared.backupChanged(status, backedUpCount: model.accountSentRecords.count)
-    }
+    .environment(
+      \.showLibraryFilter,
+      ShowLibraryFilterAction { filter in
+        tab = .library
+        Task { await library.setFilter(filter) }
+      }
+    )
+    .background { LibraryObservers(model: model, library: library, indexer: indexer) }
     .onChange(of: SiriLibrary.shared.destination?.token, initial: true) { showSiriDestination() }
-    // Access granted after launch (the first prompt, or Settings): the device photos join.
-    .onChange(of: model.photoLibraryStatus) { _, status in
-      guard status == .authorized || status == .limited else { return }
-      Task { await library.start(records: model.records) }
+    // Grow the bar at the newest row, after the grid settles there.
+    .task(id: tab == .library && library.isAtNewest) {
+      isRestoringTabBar = false
+      guard tab == .library, library.isAtNewest else { return }
+      do {
+        try await Task.sleep(for: .milliseconds(100))
+        guard library.isTabBarMinimized else { return }
+        isRestoringTabBar = true
+        try await Task.sleep(for: .milliseconds(50))
+        isRestoringTabBar = false
+      } catch {
+        // The next task resets the flag before checking the new scroll position.
+      }
     }
-    // The photos and videos in backed-up folders are part of the Library.
-    .task(id: [AnyHashable(model.backedUpFolders), AnyHashable(model.settings.backupExclusions)]) {
-      await library.setFolders(
-        model.backedUpFolders.map {
-          LibraryFolder(
-            id: $0.id, path: $0.path, bookmarkData: $0.bookmarkData, exclusions: model.settings.folderExclusions)
-        })
-    }
-    .onChange(of: library.isAtNewest) { _, atNewest in restoreTabBarAtNewest(atNewest) }
     .onChange(of: library.isTabBarMinimized) { _, minimized in
       if !minimized { tabBarGrewAt = .now }
     }
@@ -232,9 +207,13 @@ struct ContentView: View {
         switch phase {
         case .active:
           model.sceneDidBecomeActive()
-          Task { await library.refreshFolders() }
           if model.manualUploadNeedsSignIn { requestSignIn() }
-          Task { await model.refreshPhotoLibraryStatus() }
+          Task {
+            let folders = FolderMediaScanner.ForegroundRead()
+            async let libraryRead: Void = library.refreshFolders(using: folders)
+            await model.refreshPhotoLibraryStatus(using: folders)
+            await libraryRead
+          }
         case .background:
           model.sceneDidEnterBackground()
           Task { await model.prepareForBackground() }
@@ -286,7 +265,7 @@ struct ContentView: View {
       searchFocused = false
       searchQuery = ""
       Task {
-        let name = try? await SiriLibrary.shared.store.people().first { $0.id == id }?.name
+        let name = try? await SiriLibrary.shared.store.personName(id: id)
         var path = NavigationPath()
         path.append(SearchRoute.person(id: id, name: name))
         searchPath = path
@@ -296,31 +275,6 @@ struct ContentView: View {
       var path = NavigationPath()
       path.append(album.collectionRoute)
       collectionsPath = path
-    }
-  }
-
-  private var backupStack: some View {
-    NavigationStack(path: $path) {
-      Dashboard(
-        model: model,
-        onSignIn: { sheet = .signIn },
-        cleanup: CleanupState(isPreparing: isPreparingCleanup, showsNothingToCleanUp: showsNothingToCleanUp),
-        onCleanUp: startCleanup,
-        onNavigate: { path.append($0) }
-      )
-      .navigationTitle(ProductCopy.name)
-      .navigationDestination(for: Route.self) { route in
-        switch route {
-        case .activity(let filter): ActivityView(model: model, filter: filter)
-        case .folders: BackedUpFoldersView(model: model)
-        case .protectedItems: ProtectedItemsView(model: model)
-        case .excludedAlbums: ExcludedAlbumsView(model: model)
-        }
-      }
-      .toolbar { toolbar }
-      // `initial` also covers a cold launch from a notification tap.
-      .onChange(of: model.pendingActivityFilter, initial: true) { openPendingActivity() }
-      .onChange(of: model.pendingAccountSheet, initial: true) { openPendingAccountSheet() }
     }
   }
 
@@ -334,30 +288,11 @@ struct ContentView: View {
   private func openPendingAccountSheet() {
     guard model.pendingAccountSheet else { return }
     model.pendingAccountSheet = false
-    sheet = model.selectedAccount == nil ? .signIn : .account
+    openAccount()
   }
 
-  @ToolbarContentBuilder
-  private var toolbar: some ToolbarContent {
-    ToolbarItem(placement: .topBarTrailing) {
-      Button("Upload Photos or Files", systemImage: "plus") { sheet = .uploadSource }
-    }
-    ToolbarSpacer(.fixed, placement: .topBarTrailing)
-    ToolbarItem(placement: .topBarTrailing) {
-      Button {
-        sheet = model.selectedAccount == nil ? .signIn : .account
-      } label: {
-        AccountAvatar(email: model.selectedAccount?.email, size: 36)
-          .frame(width: 44, height: 44)
-          // Toolbar items with custom content get a capsule; drawing the glass circle
-          // here keeps the avatar concentric with it and sized like the "+" button.
-          .glassEffect(.regular.interactive(), in: .circle)
-      }
-      .buttonStyle(.plain)
-      .accessibilityLabel(model.selectedAccount == nil ? "Sign In" : "Account Settings")
-      .accessibilityValue(model.selectedAccount?.email ?? "Not signed in")
-    }
-    .sharedBackgroundVisibility(.hidden)
+  private func openAccount() {
+    sheet = model.selectedAccount == nil ? .signIn : .account
   }
 
   private var signInSheet: some View {
@@ -502,6 +437,185 @@ struct ContentView: View {
   #endif
 }
 
+private struct BackupTab: View {
+  let model: AppModel
+  @Binding var path: [ContentView.Route]
+  let cleanup: CleanupState
+  let onCleanUp: () -> Void
+  let onSignIn: () -> Void
+  let onUpload: () -> Void
+  let onAccount: () -> Void
+  let openPendingActivity: () -> Void
+  let openPendingAccountSheet: () -> Void
+
+  var body: some View {
+    NavigationStack(path: $path) {
+      Dashboard(
+        model: model,
+        onSignIn: onSignIn,
+        cleanup: cleanup,
+        onCleanUp: onCleanUp,
+        onNavigate: { path.append($0) }
+      )
+      .navigationTitle(ProductCopy.name)
+      .navigationDestination(for: ContentView.Route.self) { route in
+        switch route {
+        case .activity(let filter): ActivityView(model: model, filter: filter)
+        case .folders: BackedUpFoldersView(model: model)
+        case .protectedItems: ProtectedItemsView(model: model)
+        case .excludedAlbums: ExcludedAlbumsView(model: model)
+        }
+      }
+      .toolbar { toolbar }
+      // `initial` also covers a cold launch from a notification tap.
+      .onChange(of: model.pendingActivityFilter, initial: true) { openPendingActivity() }
+      .onChange(of: model.pendingAccountSheet, initial: true) { openPendingAccountSheet() }
+    }
+  }
+
+  @ToolbarContentBuilder
+  private var toolbar: some ToolbarContent {
+    ToolbarItem(placement: .topBarTrailing) {
+      Button("Upload Photos or Files", systemImage: "plus", action: onUpload)
+    }
+    ToolbarSpacer(.fixed, placement: .topBarTrailing)
+    ToolbarItem(placement: .topBarTrailing) {
+      Button(action: onAccount) {
+        AccountAvatar(email: model.selectedAccount?.email, size: 36)
+          .frame(width: 44, height: 44)
+          // Toolbar items with custom content get a capsule; drawing the glass circle
+          // here keeps the avatar concentric with it and sized like the "+" button.
+          .glassEffect(.regular.interactive(), in: .circle)
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel(model.selectedAccount == nil ? "Sign In" : "Account Settings")
+      .accessibilityValue(model.selectedAccount?.email ?? "Not signed in")
+    }
+    .sharedBackgroundVisibility(.hidden)
+  }
+}
+
+private struct LibraryTab: View {
+  let model: AppModel
+  let library: UnifiedLibraryModel
+
+  var body: some View {
+    NavigationStack {
+      UnifiedLibraryView(
+        model: library, cloudLibrary: model.cloudLibrary, records: model.records, recordsRevision: nil,
+        accountsLoaded: model.hasLoadedAccounts)
+    }
+  }
+}
+
+private struct CollectionsTab: View {
+  let model: AppModel
+  @Binding var path: NavigationPath
+
+  var body: some View {
+    NavigationStack(path: $path) {
+      CollectionsView(
+        records: model.records, recordsRevision: model.recordsRevision, cloud: model.cloudLibrary,
+        accountsLoaded: model.hasLoadedAccounts
+      )
+      .toolbarTitleDisplayMode(.inlineLarge)
+    }
+  }
+}
+
+private struct SearchTab: View {
+  let model: AppModel
+  let library: UnifiedLibraryModel
+  let indexer: LibraryIndexer
+  @Binding var query: String
+  @Binding var path: NavigationPath
+  var focused: FocusState<Bool>.Binding
+
+  var body: some View {
+    NavigationStack(path: $path) {
+      SearchView(
+        library: library, indexer: indexer, cloud: model.cloudLibrary, records: model.records, query: $query, path: $path,
+        isEditing: focused.wrappedValue, finishSearch: { focused.wrappedValue = false }
+      )
+      .toolbarTitleDisplayMode(.inlineLarge)
+    }
+    .searchable(text: $query, prompt: searchPrompt)
+    .searchFocused(focused)
+  }
+}
+
+private struct LibraryObservers: View {
+  let model: AppModel
+  let library: UnifiedLibraryModel
+  let indexer: LibraryIndexer
+  @State private var recordsUpdate: Task<Void, Never>?
+
+  private var revision: Int? {
+    // Track snapshot publication even when the Library tab is offscreen.
+    _ = model.records
+    return model.recordsRevision
+  }
+
+  var body: some View {
+    Color.clear
+      .frame(width: 0, height: 0)
+      .accessibilityHidden(true)
+      .onChange(of: revision) { updateRecords() }
+      .onDisappear { recordsUpdate?.cancel() }
+      .onChange(of: model.settings.uploadsOnMeteredNetworks, initial: true) { _, allowed in
+        LibraryIndexer.usesMeteredNetworks.withLock { $0 = allowed }
+        if library.isLoaded { indexer.update(from: library) }
+      }
+      .onChange(of: model.isBackupActive, initial: true) { _, isActive in
+        Task { await library.setBackupActive(isActive) }
+      }
+      .onChange(of: [library.reloadToken, library.indexMetadataToken]) {
+        indexer.update(from: library)
+        WidgetPublisher.shared.libraryChanged(library)
+      }
+      .onChange(
+        of: WidgetBackupUpdate(status: model.backupStatus, count: model.accountTransferredCount),
+        initial: true
+      ) { _, update in
+        WidgetPublisher.shared.backupChanged(update.status, backedUpCount: update.count)
+      }
+      .onChange(of: model.photoLibraryStatus) { _, status in
+        guard status == .authorized || status == .limited else { return }
+        Task { await library.start(records: model.records) }
+      }
+      // The photos and videos in backed-up folders are part of the Library.
+      .task(id: [AnyHashable(model.backedUpFolders), AnyHashable(model.settings.backupExclusions)]) {
+        let disabledIDs = Set(model.backedUpFolders.lazy.filter { !$0.isEnabled }.map(\.id))
+        await library.setFolders(
+          model.backedUpFolders.map {
+            LibraryFolder(
+              id: $0.id, path: $0.path, bookmarkData: $0.bookmarkData, exclusions: model.settings.folderExclusions)
+          },
+          disabledFolderIDs: disabledIDs)
+      }
+      .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+        Task { await model.manifestStore.purgeSortedCache() }
+      }
+  }
+
+  private func updateRecords() {
+    guard recordsUpdate == nil else { return }
+    recordsUpdate = Task {
+      defer { recordsUpdate = nil }
+      while !Task.isCancelled {
+        let revision = model.recordsRevision
+        await library.recordsChanged(model.records)
+        guard revision != model.recordsRevision else { return }
+      }
+    }
+  }
+
+  private struct WidgetBackupUpdate: Equatable {
+    let status: BackupStatus
+    let count: Int
+  }
+}
+
 // MARK: - Dashboard
 
 struct CleanupState: Equatable {
@@ -605,7 +719,6 @@ private struct AccountCopyCard: View {
   }
 }
 
-/// Kept separate so per-tick upload progress re-renders only this card.
 private struct HeroCard: View {
   let model: AppModel
   let status: BackupStatus
@@ -613,9 +726,7 @@ private struct HeroCard: View {
   @State private var syncTaps = 0
 
   var body: some View {
-    StatusCard(status: status, progress: progress) {
-      actions
-    }
+    StatusCard(status: status, liveProgress: { progress }, actions: { actions })
   }
 
   private var progress: TransferProgressSummary? {
@@ -1015,7 +1126,7 @@ extension AppModel {
 
   /// The record a worker is sending, for its thumbnail.
   func uploadingRecord(for worker: WorkerState) -> TransferRecord? {
-    accountBuckets.indexByID[worker.itemID].map { accountBuckets.all[$0] }
+    accountBuckets.record(id: worker.itemID)
   }
 
   var backupStatus: BackupStatus {

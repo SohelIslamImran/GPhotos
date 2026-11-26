@@ -10,6 +10,7 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
   public let scope: LibraryScope
   public private(set) var filter: LibraryFilter = .all
   public private(set) var reloadToken = 0
+  public private(set) var thumbnailRevision = 0
   public private(set) var badgeToken = 0
   public private(set) var itemCount = 0
   public private(set) var isLoaded = false
@@ -18,7 +19,9 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
   @ObservationIgnored public let thumbnailSource: any ThumbnailSource
   @ObservationIgnored private let imageSource: PhotoKitImageSource
   @ObservationIgnored private var fetchResult: PHFetchResult<PHAsset>?
-  @ObservationIgnored private var backupStates: [String: PhotoGridBadges.Backup] = [:]
+  @ObservationIgnored private var backupEvidence = PhotoBackupEvidence()
+  @ObservationIgnored private var fetchFilter: LibraryFilter = .all
+  @ObservationIgnored private var filteredIndices: [Int]?
   @ObservationIgnored private var isObserving = false
   @ObservationIgnored private var fetchGeneration = 0
   @ObservationIgnored private var fetchInProgress = false
@@ -55,12 +58,25 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
   }
 
   public func load() async {
-    guard Self.hasAccess, fetchResult == nil else { return }
+    guard Self.hasAccess, fetchResult == nil, !fetchInProgress else { return }
     await fetch()
     if !isObserving {
       PHPhotoLibrary.shared().register(self)
       isObserving = true
     }
+  }
+
+  func reloadForAuthorization() async {
+    fetchGeneration &+= 1
+    fetchInProgress = false
+    pendingApply?.cancel()
+    pendingFetch = nil
+    fetchResult = nil
+    filteredIndices = nil
+    itemCount = 0
+    isLoaded = false
+    reloadToken &+= 1
+    await load()
   }
 
   public func setFilter(_ filter: LibraryFilter) async {
@@ -72,24 +88,59 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
   private func fetch() async {
     fetchGeneration &+= 1
     pendingApply?.cancel()
+    let latest = pendingFetch
     pendingFetch = nil
     let generation = fetchGeneration
     fetchInProgress = true
     defer { if generation == fetchGeneration { fetchInProgress = false } }
     let scope = scope
-    let filter = filter
-    let backedUp = filter.dependsOnBackup ? Set(backupStates.filter { $0.value == .backedUp }.keys) : []
-    let result = await Task.detached(priority: .userInitiated) {
-      LibraryFetch.assets(scope: scope, filter: filter, backedUpIDs: backedUp)
-    }.value
+    let predicateFilter = filter.dependsOnBackup ? .all : filter
+    let cached = predicateFilter == fetchFilter ? (latest ?? fetchResult) : nil
+    let result =
+      if let cached {
+        cached
+      } else {
+        await Task.detached(priority: .userInitiated) {
+          LibraryFetch.assets(scope: scope, filter: predicateFilter)
+        }.value
+      }
     guard generation == fetchGeneration else { return }
-    apply(result)
+    await apply(result, predicateFilter: predicateFilter, generation: generation)
   }
 
-  private func apply(_ result: PHFetchResult<PHAsset>) {
+  private func apply(_ result: PHFetchResult<PHAsset>, predicateFilter: LibraryFilter, generation: Int) async {
+    let filter = filter
+    let evidence = backupEvidence
+    let newestAddedFirst = scope == .recentlyAdded
+    let indices =
+      if filter.dependsOnBackup || newestAddedFirst {
+        await Task.detached(priority: .userInitiated) {
+          var indices: [Int] = []
+          // PhotoKit can't sort a fetch by when items were added.
+          var added: [Int: Date] = [:]
+          result.enumerateObjects { asset, index, _ in
+            if newestAddedFirst { added[index] = asset.addedDate ?? .distantPast }
+            if !filter.dependsOnBackup
+              || filter.includesBackupItem(inScope: evidence.scope.includes(asset), backedUp: evidence.state(for: asset) == .backedUp)
+            {
+              indices.append(index)
+            }
+          }
+          if newestAddedFirst {
+            indices.sort { (added[$0] ?? .distantPast, $0) > (added[$1] ?? .distantPast, $1) }
+          }
+          return indices
+        }.value as [Int]?
+      } else {
+        nil as [Int]?
+      }
+    guard generation == fetchGeneration else { return }
+    if fetchResult === result, filteredIndices == indices { return }
     keyIndexCache = [:]
     fetchResult = result
-    itemCount = result.count
+    fetchFilter = predicateFilter
+    filteredIndices = indices
+    itemCount = indices?.count ?? result.count
     isLoaded = true
     reloadToken &+= 1
     rebuildTimeline(result)
@@ -101,9 +152,10 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
       return
     }
     let generation = fetchGeneration
+    let indices = filteredIndices
     Task {
       let index = await Task.detached(priority: .utility) {
-        TimelineIndex.build(count: result.count) { result.object(at: $0).creationDate }
+        TimelineIndex.build(count: indices?.count ?? result.count) { result.object(at: indices?[$0] ?? $0).creationDate }
       }.value
       guard generation == fetchGeneration, fetchResult === result else { return }
       timeline = index
@@ -118,11 +170,19 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
 
   /// The current fetch, for reading many assets off the main actor.
   var currentFetch: PHFetchResult<PHAsset>? { fetchResult }
+  var currentFetchIndices: [Int]? { filteredIndices }
 
   public func index(of asset: PHAsset) -> Int? {
     guard let fetchResult else { return nil }
     let index = fetchResult.index(of: asset)
-    return index == NSNotFound ? nil : index
+    guard index != NSNotFound else { return nil }
+    if let filteredIndices { return filteredIndices.firstIndex(of: index) }
+    return index
+  }
+
+  public func index(ofItemID id: String, near: Int) -> Int? {
+    guard let asset = imageSource.asset(for: id) else { return nil }
+    return index(of: asset)
   }
 
   public func assets(at indices: Set<Int>) -> [PHAsset] {
@@ -132,8 +192,10 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
   /// `assets(at:)` off the main actor, for a selection that may be the whole library.
   public func resolveAssets(at indices: Set<Int>) async -> [PHAsset] {
     guard let fetch = fetchResult, !indices.isEmpty else { return [] }
+    let visible = filteredIndices
+    let count = itemCount
     return await Task.detached(priority: .userInitiated) {
-      indices.sorted().compactMap { $0 < fetch.count ? fetch.object(at: $0) : nil }
+      indices.sorted().compactMap { $0 >= 0 && $0 < count ? fetch.object(at: visible?[$0] ?? $0) : nil }
     }.value
   }
 
@@ -141,9 +203,10 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
   /// main actor; the whole library comes from the saved snapshot and PhotoKit's history.
   public func deviceInfos() async -> [DeviceItemInfo] {
     guard let result = fetchResult else { return [] }
-    let usesSnapshot = scope == .all && filter == .all
+    let usesSnapshot = scope == .all && filter == .all && PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
+    let indices = filteredIndices
     return await Task.detached(priority: .userInitiated) {
-      usesSnapshot ? DeviceInfoSnapshot.infos(for: result) : DeviceInfoSnapshot.readAll(result)
+      usesSnapshot ? DeviceInfoSnapshot.infos(for: result) : DeviceInfoSnapshot.readAll(result, indices: indices)
     }.value
   }
 
@@ -185,18 +248,24 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
 
   public func backupState(at index: Int) -> PhotoGridBadges.Backup? {
     guard let asset = asset(at: index) else { return nil }
-    return backupStates[asset.localIdentifier]
+    return backupEvidence.state(for: asset)
   }
 
   public func asset(at index: Int) -> PHAsset? {
-    guard let fetchResult, index >= 0, index < fetchResult.count else { return nil }
-    return fetchResult.object(at: index)
+    guard let fetchResult, index >= 0, index < itemCount else { return nil }
+    return fetchResult.object(at: filteredIndices?[index] ?? index)
   }
 
   public func itemID(at index: Int) -> String {
     guard let asset = asset(at: index) else { return "" }
     imageSource.remember(asset)
     return asset.localIdentifier
+  }
+
+  public func thumbnailIdentity(at index: Int) -> ThumbnailIdentity {
+    guard let asset = asset(at: index) else { return ThumbnailIdentity(id: "") }
+    imageSource.remember(asset)
+    return PhotoKitImageSource.identity(for: asset)
   }
 
   public func aspectRatio(at index: Int) -> CGFloat? {
@@ -208,11 +277,15 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
     guard let asset = asset(at: index) else { return PhotoGridBadges() }
     return PhotoGridBadges(
       videoDuration: asset.mediaType == .video ? asset.duration : nil, isFavorite: asset.isFavorite,
-      backup: backupStates[asset.localIdentifier])
+      backup: backupEvidence.state(for: asset))
   }
 
   public func accessibilityLabel(at index: Int) -> String {
     guard let asset = asset(at: index) else { return "" }
+    return Self.accessibilityLabel(for: asset, backup: backupEvidence.state(for: asset))
+  }
+
+  static func accessibilityLabel(for asset: PHAsset, backup: PhotoGridBadges.Backup?) -> String {
     let kind =
       switch asset.mediaType {
       case .video: String(localized: "Video")
@@ -221,24 +294,36 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
     var parts = [kind]
     if let date = asset.creationDate { parts.append(date.formatted(date: .abbreviated, time: .shortened)) }
     if asset.isFavorite { parts.append(String(localized: "Favorite")) }
-    if let state = backupStates[asset.localIdentifier] { parts.append(state.title) }
+    if let backup { parts.append(backup.title) }
     return parts.joined(separator: ", ")
   }
 
-  /// Backup badges from the manifest. An asset with several records (RAW, Live Photo
-  /// parts, several accounts) shows its worst state.
   @ObservationIgnored private var backupStateGeneration = 0
 
   public func updateBackupStates(
-    from records: [TransferRecord], confirmedCloudAssets: [String: String] = [:], accountEmail: String? = nil
+    from records: [TransferRecord], confirmedCloudIDs: Set<String> = [], accountEmail: String? = nil
   ) async {
     backupStateGeneration &+= 1
     let generation = backupStateGeneration
-    let states = await Task.detached(priority: .utility) {
-      Self.backupStates(from: records, confirmedCloudIDs: Set(confirmedCloudAssets.values), accountEmail: accountEmail)
+    if backupEvidence.accountEmail != accountEmail {
+      backupEvidence = PhotoBackupEvidence(accountEmail: accountEmail)
+      badgeToken &+= 1
+    }
+    let evidence = await Task.detached(priority: .utility) {
+      PhotoBackupEvidence.read(
+        records, confirmedCloudIDs: confirmedCloudIDs, accountEmail: accountEmail)
     }.value
-    guard generation == backupStateGeneration, states != backupStates else { return }
-    backupStates = states
+    guard generation == backupStateGeneration else { return }
+    await applyBackupEvidence(evidence)
+  }
+
+  var currentBackupEvidence: PhotoBackupEvidence { backupEvidence }
+
+  func applyBackupEvidence(_ evidence: PhotoBackupEvidence) async {
+    let evidence = evidence.usingNewerScope(from: backupEvidence)
+    let changed = evidence != backupEvidence
+    backupEvidence = evidence
+    guard changed else { return }
     badgeToken &+= 1
     if filter.dependsOnBackup && (fetchResult != nil || fetchInProgress) { await fetch() }
   }
@@ -246,40 +331,35 @@ public final class PhotoLibraryGridModel: NSObject, PhotoGridDataSource {
   nonisolated static func backupStates(
     from records: [TransferRecord], confirmedCloudIDs: Set<String> = [], accountEmail: String? = nil
   ) -> [String: PhotoGridBadges.Backup] {
-    var states: [String: PhotoGridBadges.Backup] = [:]
-    states.reserveCapacity(records.count)
-    for record in records {
-      if let accountEmail, !record.id.hasPrefix(accountEmail + "|") { continue }
-      guard let id = record.assetLocalIdentifier else { continue }
-      let state: PhotoGridBadges.Backup
-      switch record.status {
-      case .sent, .deleted: state = .backedUp
-      case .failed: state = .failed
-      default: state = .pending
-      }
-      switch (states[id], state) {
-      case (.failed?, _), (.pending?, .backedUp): continue
-      default: states[id] = state
-      }
-    }
-    for id in confirmedCloudIDs where states[id] == nil { states[id] = .backedUp }
-    return states
+    PhotoBackupEvidence.read(records, confirmedCloudIDs: confirmedCloudIDs, accountEmail: accountEmail).states
   }
+
 }
 
 extension PhotoLibraryGridModel: PHPhotoLibraryChangeObserver {
   nonisolated public func photoLibraryDidChange(_ changeInstance: PHChange) {
     let change = changeInstance
     Task { @MainActor in
+      let evidence = self.backupEvidence
+      if evidence.affectsScope(change) {
+        let refreshed = await Task.detached(priority: .utility) { evidence.refreshedScope() }.value
+        let current = self.backupEvidence
+        let updated = current.usingNewerScope(from: refreshed)
+        let scopeChanged = updated.scope != current.scope
+        await self.applyBackupEvidence(updated)
+        if scopeChanged && !self.buildsTimeline { self.reloadToken &+= 1 }
+      }
       guard let current = self.pendingFetch ?? self.fetchResult, let details = change.changeDetails(for: current)
       else { return }
       let after = details.fetchResultAfterChanges
-      if self.pendingFetch == nil, details.hasIncrementalChanges, !details.hasMoves, details.insertedIndexes == nil,
-        details.removedIndexes == nil
+      if self.buildsTimeline, !self.filter.dependsOnBackup, self.scope != .recentlyAdded, self.pendingFetch == nil,
+        details.hasIncrementalChanges,
+        !details.hasMoves, details.insertedIndexes == nil, details.removedIndexes == nil
       {
-        // Only properties changed (favorites, edits): keep the layout, refresh badges.
+        // Edits may change pixels without changing the layout.
         self.fetchResult = after
         self.badgeToken &+= 1
+        self.thumbnailRevision &+= 1
       } else {
         self.applySoon(after)
       }
@@ -295,8 +375,10 @@ extension PhotoLibraryGridModel: PHPhotoLibraryChangeObserver {
     pendingApply = Task {
       try? await Task.sleep(for: .milliseconds(400))
       guard !Task.isCancelled, let latest = pendingFetch else { return }
-      pendingFetch = nil
-      apply(latest)
+      fetchGeneration &+= 1
+      let generation = fetchGeneration
+      await apply(latest, predicateFilter: fetchFilter, generation: generation)
+      if generation == fetchGeneration, pendingFetch === latest { pendingFetch = nil }
     }
   }
 }
