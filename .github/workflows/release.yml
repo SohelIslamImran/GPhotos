@@ -1,49 +1,83 @@
 name: Release
 
+# Every merge to main publishes the next version (patch, or minor/major with a
+# "release: minor" / "release: major" label on the PR). Pushing a v* tag on main
+# publishes that version instead.
 on:
   push:
+    branches: [main]
     tags: ['v*']
+    paths-ignore: ['**/*.md', 'docs/**', '.github/**']
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
   version:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate release tag
+      - name: Choose the version
         id: version
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Use a version tag such as v1.2.0."
-            exit 1
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ $semver ]]; then
+              echo "::error::Use a version tag such as v1.2.0."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+              echo "::error::Tag a commit on main."
+              exit 1
+            fi
+            tag="$GITHUB_REF_NAME"
+          else
+            if git tag --points-at HEAD | grep -Eq "$semver"; then
+              echo "::notice::This commit is already released."
+              exit 0
+            fi
+            latest=$(git tag -l 'v*' | grep -E "$semver" | sort -V | tail -1)
+            IFS=. read -r major minor patch <<< "${latest:-v0.0.0}"
+            major=${major#v}
+            labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[].labels[].name')
+            if grep -qx 'release: major' <<< "$labels"; then
+              tag="v$((major + 1)).0.0"
+            elif grep -qx 'release: minor' <<< "$labels"; then
+              tag="v$major.$((minor + 1)).0"
+            else
+              tag="v$major.$minor.$((patch + 1))"
+            fi
           fi
-          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
-            echo "::error::Tag a commit on main."
-            exit 1
-          fi
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
   test-macos:
     needs: version
+    if: needs.version.outputs.tag != ''
     uses: ./.github/workflows/ci.yml
     with:
       platforms: '["macOS"]'
 
   test-ios:
     needs: version
+    if: needs.version.outputs.tag != ''
     uses: ./.github/workflows/ci.yml
     with:
       platforms: '["iOS"]'
@@ -89,6 +123,7 @@ jobs:
   ios-ipa:
     name: Package unsigned iOS IPA
     needs: version
+    if: needs.version.outputs.tag != ''
     runs-on: xcode-27
     timeout-minutes: 35
     env:
@@ -113,7 +148,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [macos, test-ios, ios-ipa]
+    needs: [version, macos, test-ios, ios-ipa]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -130,6 +165,7 @@ jobs:
       - name: Publish versioned DMG and IPA
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
         shell: bash
         run: |
           (cd dist && sha256sum --check -- *.sha256)
@@ -141,8 +177,8 @@ jobs:
 
           Each download has a SHA-256 checksum.
           NOTES
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --title "GPhotos $GITHUB_REF_NAME" --notes-file release-notes.md dist/*
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --generate-notes --title "GPhotos $TAG" --notes-file release-notes.md dist/*
 
   testflight:
     name: Upload iOS to App Store Connect

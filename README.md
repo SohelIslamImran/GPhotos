@@ -195,7 +195,7 @@ xcodebuild test -project GPhotosSync.xcodeproj -scheme GPhotosSync \
 
 Generate the project after changing `project.yml` or adding source files. See [AGENTS.md](AGENTS.md) for repository conventions and data safety rules.
 
-GitHub Actions tests both platforms. When release signing is configured, a version tag such as `v1.2.0` on `main` builds and publishes the matching Mac release. See the [release setup](docs/releases.md) for signing, versioning and the optional TestFlight job.
+GitHub Actions tests both platforms. When release signing is configured, each merge to `main` that changes the app publishes the next version, and a version tag such as `v1.2.0` on `main` publishes that version. See the [release setup](docs/releases.md) for signing, versioning and the optional TestFlight job.
 
 ## Architecture
 
