@@ -77,8 +77,9 @@ public struct PhotoGridOptions {
   /// The newest items are last, as in Photos: the grid opens at its end, stays there as
   /// items change, and that end is where the tab bar grows back (iOS).
   public var startsAtEnd = false
-  /// Align the last row and keep a visible item in place when reading more of a timeline.
-  public var alignsNewestRow = false
+  /// Older items still to load, for `PhotoGridLayout.itemsToCome`. Changes come with a
+  /// new reload token.
+  var itemsToCome = 0
   var positionOfItem: ((String) -> Int?)?
   var currentReloadToken: (() -> Int)?
   /// With `startsAtEnd`, the grid reaches or leaves its newest end (iOS).
@@ -97,7 +98,7 @@ public struct PhotoGridOptions {
     menu: ((Set<Int>) -> [PhotoGridMenuItem])? = nil, dragItem: ((Int) -> PhotoGridDragItem?)? = nil,
     proxy: PhotoGridProxy? = nil, onPinchPastDensest: (() -> Void)? = nil,
     onScrolledUnderBarChange: ((Bool) -> Void)? = nil, topPadding: CGFloat = 0, bottomInset: CGFloat? = nil,
-    startsAtEnd: Bool = false, alignsNewestRow: Bool = false, onAtEndChange: ((Bool) -> Void)? = nil, onShowItems: (() -> Void)? = nil
+    startsAtEnd: Bool = false, onAtEndChange: ((Bool) -> Void)? = nil, onShowItems: (() -> Void)? = nil
   ) {
     self.isSelecting = isSelecting
     self.onTopIndexChange = onTopIndexChange
@@ -109,7 +110,6 @@ public struct PhotoGridOptions {
     self.topPadding = topPadding
     self.bottomInset = bottomInset
     self.startsAtEnd = startsAtEnd
-    self.alignsNewestRow = alignsNewestRow
     self.onAtEndChange = onAtEndChange
     self.onShowItems = onShowItems
   }
@@ -770,7 +770,7 @@ final class PhotoGridCoordinator {
       PhotoGridLayout(
         columns: columns, spacing: columns >= 7 ? 1 : 2, width: bounds.width,
         itemCount: itemCount, pixelScale: traitCollection.displayScale,
-        alignsNewestRow: coordinator?.options.alignsNewestRow == true)
+        itemsToCome: coordinator?.options.itemsToCome ?? 0)
     }
 
     override func layoutSubviews() {
@@ -1551,7 +1551,7 @@ final class PhotoGridCoordinator {
       return PhotoGridLayout(
         columns: columns, spacing: target < 100 ? 1 : 2, width: width,
         itemCount: renderer.dataSource?.itemCount ?? 0, pixelScale: backingScale,
-        alignsNewestRow: coordinator?.options.alignsNewestRow == true)
+        itemsToCome: coordinator?.options.itemsToCome ?? 0)
     }
 
     private var backingScale: CGFloat { window?.backingScaleFactor ?? 2 }

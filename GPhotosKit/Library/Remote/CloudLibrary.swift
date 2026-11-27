@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import Observation
+import WebKit
 import os
 
 /// One account's Google Photos library on this device: the synced mirror, its thumbnails
@@ -76,7 +77,11 @@ public final class CloudLibrary {
   nonisolated var isIndexingCurrent: Bool { indexLifetime.withLock { $0 } }
   @ObservationIgnored private let sync: RemoteLibrarySync
   @ObservationIgnored private let indexPurge: LockedIndexPurge
-  /// Nil only in the DEBUG preview library, where actions fail.
+  @ObservationIgnored private let purgeLockedItems: @Sendable (Set<String>) -> Void
+  @ObservationIgnored private var isMovingToLockedFolder = false
+  /// A move reached Google, so the mirror needs a delta to catch up.
+  @ObservationIgnored private var sentLockedFolderMove = false
+  /// Nil only in the DEBUG preview library.
   @ObservationIgnored private let actionClient: GooglePhotosMobileClient?
   @ObservationIgnored private var syncTask: Task<Void, Never>?
   @ObservationIgnored private var uploadRefresh: Task<Void, Never>?
@@ -143,19 +148,21 @@ public final class CloudLibrary {
     self.store = store
     let indexPurge = LockedIndexPurge(store: store, purge: purgeIndex)
     self.indexPurge = indexPurge
+    let purgeLockedItems: @Sendable (Set<String>) -> Void = { keys in
+      LockedItems.insert(keys, accountEmail: accountEmail)
+      Self.purge(keys, accountEmail: accountEmail)
+      invalidateSnapshot()
+      // Reads the mirror, so it waits for the transaction being committed here.
+      Task { await indexPurge.start() }
+      Task { @MainActor in
+        ThumbnailPipeline.shared.purge(ids: keys)
+        await WidgetPublisher.shared.purge(mediaKeys: keys)
+      }
+    }
+    self.purgeLockedItems = purgeLockedItems
     sync = RemoteLibrarySync(
-      store: store, fetcher: fetcher,
-      willLock: { keys in
-        LockedItems.insert(keys, accountEmail: accountEmail)
-        Self.purge(keys, accountEmail: accountEmail)
-        invalidateSnapshot()
-        // Reads the mirror, so it waits for the page being committed here.
-        Task { await indexPurge.start() }
-        Task { @MainActor in
-          ThumbnailPipeline.shared.purge(ids: keys)
-          await WidgetPublisher.shared.purge(mediaKeys: keys)
-        }
-      }, didRelease: { LockedItems.release($0, accountEmail: accountEmail) })
+      store: store, fetcher: fetcher, willLock: purgeLockedItems,
+      didRelease: { LockedItems.release($0, accountEmail: accountEmail) })
     self.thumbnails = thumbnails
     localFirstThumbnails = LocalFirstThumbnailSource(remote: thumbnails, accountEmail: accountEmail)
     localFirstThumbnails.observeRepairs { [weak self] previous, _ in
@@ -260,7 +267,7 @@ public final class CloudLibrary {
 
   /// Syncs if the last sync is older than the refresh interval, or always with `force`.
   public func refresh(force: Bool = false) {
-    guard syncTask == nil, !isRetired else { return }
+    guard syncTask == nil, !isRetired, !isMovingToLockedFolder else { return }
     syncTask = Task {
       defer { syncTask = nil }
       await stateLoad?.value
@@ -317,7 +324,10 @@ public final class CloudLibrary {
     (thumbnails as? GoogleThumbnailSource)?.retire()
     let store = store
     let indexPurge = indexPurge
+    let requests = requests
     Task {
+      // A web move that was already sent may still need to scrub the account's mirror.
+      await requests.drain()
       await indexPurge.close()
       await store.close()
     }
@@ -498,6 +508,93 @@ public final class CloudLibrary {
     try await send { try await $0.setArchived(dedupKeys: items.map(\.dedupKey), isArchived: archived) }
     try? await store.update(mediaKeys: items.map(\.mediaKey), archived: archived)
     await afterLocalChange()
+  }
+
+  var supportsLockedFolderWeb: Bool { actionClient != nil && !isRetired }
+
+  func saveLockedFolderSignIn(from dataStore: WKWebsiteDataStore, page: WebPage) async throws {
+    try await requests.run {
+      try await GooglePhotosWebSession(accountEmail: self.accountEmail).saveSignIn(from: dataStore, page: page)
+    }
+  }
+
+  nonisolated static func lockableItems(_ items: [RemoteItemSummary], excluding locked: Set<String>) -> [RemoteItemSummary] {
+    var seen = locked
+    return items.filter { !$0.dedupKey.isEmpty && $0.trashedAt == nil && seen.insert($0.mediaKey).inserted }
+  }
+
+  func canMoveToLockedFolder(_ item: RemoteItemSummary) -> Bool {
+    !isRetired && !item.dedupKey.isEmpty && item.trashedAt == nil
+      && !LockedItems.contains(item.mediaKey, accountEmail: accountEmail)
+  }
+
+  public func moveToLockedFolder(_ items: [RemoteItemSummary]) async throws {
+    guard !isMovingToLockedFolder else { throw GooglePhotosWebError.unavailable }
+    guard !isRetired else { throw CancellationError() }
+    let items = Self.lockableItems(items, excluding: LockedItems.keys(accountEmail: accountEmail))
+    guard !items.isEmpty else { return }
+    isMovingToLockedFolder = true
+    sentLockedFolderMove = false
+    defer {
+      isMovingToLockedFolder = false
+      if sentLockedFolderMove { refresh(force: true) }
+    }
+    // Finish the current sync so a page fetched before the move can't undo the local lock.
+    await waitForSync()
+    try await requests.run { try await self.moveLockedFolderBatches(items) }
+  }
+
+  private func moveLockedFolderBatches(_ items: [RemoteItemSummary]) async throws {
+    // A resumed page can predate the move even if no sync is running now.
+    guard try await store.syncState().resumeToken.isEmpty else {
+      throw GooglePhotosWebError.syncPending
+    }
+    let session = GooglePhotosWebSession(accountEmail: accountEmail)
+    let page: WebPage?
+    #if DEBUG
+      page = if actionClient == nil { nil } else { try await session.makeSignedInPage() }
+    #else
+      page = try await session.makeSignedInPage()
+    #endif
+    defer { page?.stopLoading() }
+    for batch in LockedFolderWebRequest.batches(of: items) {
+      try Task.checkCancellation()
+      var fresh: [RemoteItemSummary] = []
+      for item in batch {
+        if let current = try await store.summary(mediaKey: item.mediaKey), current.dedupKey == item.dedupKey,
+          canMoveToLockedFolder(current)
+        {
+          fresh.append(current)
+        }
+      }
+      guard !fresh.isEmpty else { continue }
+      if let actionClient, let page {
+        // Someone is watching the progress, so a busy server ends the move instead of a long wait.
+        guard await !actionClient.isRateLimited else { throw GooglePhotosWebError.busy }
+        try Self.checkNoneLocked(fresh.map(\.mediaKey), accountEmail: accountEmail)
+        sentLockedFolderMove = true
+        do {
+          try await session.moveToLockedFolder(dedupKeys: fresh.map(\.dedupKey), on: page)
+          await actionClient.noteRequestSucceeded()
+        } catch let limit as GooglePhotosWebSession.WebRateLimit {
+          await actionClient.noteRateLimited(retryAfter: limit.retryAfter)
+          throw GooglePhotosWebError.busy
+        }
+      }
+      // Once Google accepted a batch, finish its purge even if an account change cancelled us.
+      let keys = Set(fresh.map(\.mediaKey))
+      do {
+        try await store.markLocked(keys, willLock: purgeLockedItems)
+      } catch {
+        // Keep them off-screen and out of caches until a delta can repair the mirror.
+        purgeLockedItems(keys)
+        revision &+= 1
+        throw error
+      }
+      await reloadStats()
+      await reloadAlbums()
+      revision &+= 1
+    }
   }
 
   nonisolated private static func checkNoneLocked(_ keys: [String], accountEmail: String) throws {
@@ -751,6 +848,7 @@ public final class CloudLibrary {
     isRemoved = true
     await retire()
     await store.closeAndRemove()
+    await GooglePhotosWebSession.deleteWebData(forAccountEmail: accountEmail)
     (thumbnails as? GoogleThumbnailSource)?.removeCache()
     KeptThumbnails.removeAll(accountEmail: accountEmail)
     LibrarySnapshot.remove()
@@ -764,6 +862,7 @@ public final class CloudLibrary {
   /// Removes an account's mirror and thumbnails without a library object.
   public static func removeLocalData(forAccountEmail email: String) async {
     await RemoteLibraryStore(accountEmail: email).closeAndRemove()
+    await GooglePhotosWebSession.deleteWebData(forAccountEmail: email)
     try? FileManager.default.removeItem(at: ThumbnailDiskCache.directory(for: email))
     KeptThumbnails.removeAll(accountEmail: email)
     LibrarySnapshot.remove()

@@ -42,9 +42,7 @@ open class SyncEngine: NSObject {
   public private(set) var cloudLibrary: CloudLibrary?
   public let shareObserver = ShareObserverHolder()
   public private(set) var accountGeneration = 0
-  public private(set) var isChangingAccount = false {
-    didSet { if isChangingAccount != oldValue { LibrarySnapshot.holdSaves(isChangingAccount) } }
-  }
+  public private(set) var isChangingAccount = false
   public var canUseSelectedAccount: Bool {
     !isChangingAccount && selectedAccount != nil && credentialError == nil
   }
@@ -259,8 +257,6 @@ open class SyncEngine: NSObject {
   public func prefetchAccounts() {
     guard accountsPrefetch == nil, !hasLoadedAccounts, !isChangingAccount else { return }
     let authService = authService
-    let manifestStore = manifestStore
-    Task.detached(priority: .userInitiated) { await manifestStore.load() }
     accountsPrefetchedAt = .now
     accountsPrefetch = Task.detached(priority: .userInitiated) {
       do { return .success(try await authService.accountsAndSelection()) } catch { return .failure(error) }
@@ -268,17 +264,26 @@ open class SyncEngine: NSObject {
   }
 
   public func loadAccounts() async {
-    await withAccountTransition { await self.reloadAccounts(usePrefetch: true) }
+    await withAccountTransition(keepingLaunchSnapshot: !hasLoadedAccounts && cloudLibrary == nil) {
+      await self.reloadAccounts(usePrefetch: true)
+    }
+  }
+
+  private func beginAccountChange(keepingLaunchSnapshot: Bool = false) {
+    // A change queued during the initial read must also discard the saved screen.
+    if isChangingAccount, keepingLaunchSnapshot { return }
+    LibrarySnapshot.holdSaves(true, keepingSnapshot: keepingLaunchSnapshot)
+    if !isChangingAccount { isChangingAccount = true }
   }
 
   /// Keep the gate closed between queued operations. Cancelling a view task must not
   /// interrupt a credential change. With `keepingPrimary` the primary works on: the gate
   /// closes only if the accounts read turn out to change it.
   private func withAccountTransition<T: Sendable>(
-    keepingPrimary: Bool = false, _ operation: @escaping @MainActor () async -> T
+    keepingPrimary: Bool = false, keepingLaunchSnapshot: Bool = false, _ operation: @escaping @MainActor () async -> T
   ) async -> T {
     let previous = accountTransition
-    if !keepingPrimary, !isChangingAccount { isChangingAccount = true }
+    if !keepingPrimary { beginAccountChange(keepingLaunchSnapshot: keepingLaunchSnapshot) }
     let task = Task { @MainActor in
       await previous?.value
       return await operation()
@@ -290,7 +295,10 @@ open class SyncEngine: NSObject {
       await pending.value
       guard accountTransition == pending else { continue }
       accountTransition = nil
-      if isChangingAccount { isChangingAccount = false }
+      if isChangingAccount {
+        LibrarySnapshot.holdSaves(false)
+        isChangingAccount = false
+      }
       let wakes = pendingWakes
       pendingWakes = []
       // The callback and the wakes may resume uploads. Their network work must stay outside
@@ -499,7 +507,7 @@ open class SyncEngine: NSObject {
       await changeSecondaries(to: stored, removing: email, disablingMirror: disablingMirror)
       return
     }
-    if !isChangingAccount { isChangingAccount = true }
+    if !isChangingAccount { beginAccountChange() }
     let cachedEmail = cloudLibrary?.accountEmail
     let discardingLibrary = signedOut || (email != nil && email == cachedEmail)
     if hasLoadedAccounts || cloudLibrary != nil {
@@ -531,6 +539,10 @@ open class SyncEngine: NSObject {
       await authService.clearCredential()
     }
 
+    if !hasLoadedAccounts {
+      // A keychain failure leaves only device and folder items in the Library.
+      await LibrarySnapshot.validateLaunchAccount(failure == nil ? stored.selected?.email : nil)
+    }
     if failure == nil { await manifestStore.acceptRecords(forAccountEmails: stored.accounts.map(\.email)) }
     accounts = failure == nil ? stored.accounts : []
     selectedAccount = failure == nil ? stored.selected : nil

@@ -169,7 +169,6 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
       }
     }
     self.photoLibraryStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-    startObservingLibraryIfAuthorized()
     backgroundUploads.resetAppClaims()
     workerPool.claimPhotoUpload = BackgroundUploads.claimForApp
     workerPool.releasePhotoUpload = BackgroundUploads.releaseAppClaim
@@ -318,6 +317,7 @@ public final class AppModel: SyncEngine, PHPhotoLibraryChangeObserver {
         if isSceneActive { checkAndRunForegroundMirror() }
       }
     }
+    startObservingLibraryIfAuthorized()
     await loadAccounts()
     await Self.purgeAbandonedPicks()
     await recoverPendingManualUploads()

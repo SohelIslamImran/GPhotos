@@ -71,6 +71,7 @@ public struct CloudLibraryView: View {
   /// The month at the top of the grid; set only when it changes, so scrolling
   /// re-renders the screen once a month, not once a row.
   @State private var topMonth: String?
+  @State private var lockedFolderMove = LockedFolderMove()
   @State private var pendingTrash: [RemoteItemSummary] = []
   @State private var pendingDelete: [RemoteItemSummary] = []
   @State private var busyMessage: String?
@@ -92,6 +93,7 @@ public struct CloudLibraryView: View {
 
   public var body: some View {
     decorated(content)
+      .modifier(LockedFolderMovePresentation(move: lockedFolderMove))
   }
 
   private func decorated(_ view: some View) -> some View {
@@ -477,6 +479,11 @@ public struct CloudLibraryView: View {
         Label(model.scope == .archive ? "Unarchive" : "Archive", systemImage: "archivebox")
       }
       .disabled(empty)
+      if picked.items.contains(where: library.canMoveToLockedFolder) {
+        Button(LockedFolderMove.title, systemImage: LockedFolderMove.symbol) {
+          requestLockedFolderMove(selected)
+        }
+      }
       Button(role: .destructive) {
         pendingTrash = selected
       } label: {
@@ -542,11 +549,21 @@ public struct CloudLibraryView: View {
       PhotoGridMenuItem(String(localized: "Add to Album"), systemImage: "rectangle.stack.badge.plus", group: .organize) {
         albumTargets = CloudAlbumTargets(keys: keys)
       })
+    if items.contains(where: library.canMoveToLockedFolder) {
+      menu.append(
+        PhotoGridMenuItem(LockedFolderMove.title, systemImage: LockedFolderMove.symbol, group: .organize) {
+          requestLockedFolderMove(resolve(keys))
+        })
+    }
     menu.append(
       PhotoGridMenuItem(String(localized: "Move to Trash"), systemImage: "trash", isDestructive: true) {
         pendingTrash = resolve(keys)
       })
     return menu
+  }
+
+  private func requestLockedFolderMove(_ items: [RemoteItemSummary]) {
+    lockedFolderMove.request(items, in: library) { isSelecting = false }
   }
 
   private func save(_ items: [RemoteItemSummary]) {

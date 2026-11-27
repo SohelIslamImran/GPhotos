@@ -227,6 +227,9 @@ public final class UnifiedLibraryModel: MediaViewerSource {
 
   public var badgeToken: Int { mergeBadgeToken &+ device.badgeToken &+ (cloud?.badgeToken ?? 0) }
   public var itemCount: Int { entries.count }
+  /// While the launch preview stands in for the timeline, the older items expected above
+  /// it, from the saved screen's count, so its cells sit where the full timeline puts them.
+  private(set) var itemsToCome = 0
   public var thumbnailSource: any ThumbnailSource { composite }
   public var thumbnailRevision: Int { cloud?.thumbnailRevision ?? 0 }
 
@@ -260,6 +263,7 @@ public final class UnifiedLibraryModel: MediaViewerSource {
       positions = [:]
       timeline = TimelineIndex()
       keyIndexCache = [:]
+      itemsToCome = 0
       isLoaded = false
       hasMerged = false
       mergedCloud = []
@@ -540,6 +544,7 @@ public final class UnifiedLibraryModel: MediaViewerSource {
     entries = result.entries
     positions = result.positions
     timeline = result.timeline
+    itemsToCome = max(0, (LibrarySnapshot.ready?.info.itemCount ?? 0) - result.entries.count)
     isLoaded = true
     launchIsStillEmpty = false
     reloadToken &+= 1
@@ -960,10 +965,14 @@ public final class UnifiedLibraryModel: MediaViewerSource {
       entries = indexed.entries
       positions = indexed.positions
       timeline = indexed.timeline
+      itemsToCome = 0
       reloadToken &+= 1
       #if DEBUG
         traceLaunchPublish()
       #endif
+    } else if itemsToCome != 0 {
+      itemsToCome = 0
+      reloadToken &+= 1
     } else {
       mergeBadgeToken &+= 1
     }
@@ -1388,6 +1397,8 @@ public final class UnifiedLibraryModel: MediaViewerSource {
     public var files: [FolderItemInfo] = []
     /// The Google Photos copies of the picked device items, which Delete also trashes.
     public var cloudCopies: [RemoteItemSummary] = []
+    var folderCloudCopies: [RemoteItemSummary] = []
+    var lockableCloudItems: [RemoteItemSummary] { cloud + cloudCopies + folderCloudCopies }
     public var allFavorites = false
     public var isEmpty: Bool { device.isEmpty && cloud.isEmpty }
   }
@@ -1452,9 +1463,11 @@ public final class UnifiedLibraryModel: MediaViewerSource {
         case .cloud(let cloudIndex):
           let item = cloudItems[cloudIndex]
           if isUnlocked(item) { picked.cloud.append(item) }
-        case .folder(let folderIndex, _):
+        case .folder(let folderIndex, let match):
           let file = folder[folderIndex]
-          if !validating || LocalFirstThumbnailSource.fileAliasIsCurrent(file) { picked.files.append(file) }
+          guard !validating || LocalFirstThumbnailSource.fileAliasIsCurrent(file) else { continue }
+          picked.files.append(file)
+          if let match, isUnlocked(cloudItems[match]) { picked.folderCloudCopies.append(cloudItems[match]) }
         }
       }
       picked.allFavorites = !picked.isEmpty && picked.device.allSatisfy(\.isFavorite) && picked.cloud.allSatisfy(\.isFavorite)
@@ -1488,6 +1501,15 @@ public final class UnifiedLibraryModel: MediaViewerSource {
       let copy = Self.recordedCloudCopy(mergedDevice[index], item, receipts: mergedInputs.uploadedMediaKeys)
     else { return nil }
     return (copy, cloud.library)
+  }
+
+  func googleCopy(at index: Int) -> RemoteItemSummary? {
+    switch entry(at: index) {
+    case .device: cloudCopy(at: index)?.item
+    case .cloud(let cloudIndex): cloudItem(at: cloudIndex)
+    case .folder(_, let match): match.flatMap { cloudItem(at: $0) }
+    case nil: nil
+    }
   }
 
   /// The folder files among `indices`.

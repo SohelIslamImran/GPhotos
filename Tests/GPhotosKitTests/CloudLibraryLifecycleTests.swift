@@ -726,6 +726,25 @@ struct CloudLibraryLifecycleTests {
     #expect(seen.withLock { $0.count } == 1)
   }
 
+  @Test("A confirmed web move scrubs the mirror and queues its purge without advancing sync")
+  func confirmedWebMove() async throws {
+    let store = try await syncedStore()
+    let before = try await store.syncState()
+    let purged = OSAllocatedUnfairLock(initialState: Set<String>())
+    try await store.markLocked(["a"]) { keys in purged.withLock { $0 = keys } }
+
+    #expect(purged.withLock { $0 } == ["a"])
+    #expect(try await store.lockedKeys() == ["a"])
+    #expect(try await store.pendingLockedPurges() == ["a"])
+    #expect(try await store.syncState().syncToken == before.syncToken)
+    #expect(try await store.syncState().lastSyncedAt == before.lastSyncedAt)
+    #expect(try await store.summary(mediaKey: "a") == nil)
+    let locked = try #require(try await store.lockedSummaries().first)
+    #expect(locked.dedupKey.isEmpty)
+    #expect(locked.fileName.isEmpty)
+    #expect(locked.sha1 == nil)
+  }
+
   @Test("The mirror keeps no details of a locked item, including those stored before")
   func lockedDetails() async throws {
     let store = try await syncedStore()

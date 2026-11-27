@@ -26,22 +26,31 @@ struct PhotoGridTests {
     #expect(model.badgeToken == 1)
   }
 
-  @Test("Adding older rows preserves the newest cells' columns and distance from the bottom")
-  func alignsNewestRow() {
+  @Test("The first row is full, and the newest row holds the remainder")
+  func fillsFromTheTop() {
     for columns in [2, 3, 7] {
-      let preview = PhotoGridLayout(columns: columns, width: 390, itemCount: 96, alignsNewestRow: true)
+      let layout = PhotoGridLayout(columns: columns, width: 390, itemCount: 100)
+      #expect(layout.index(at: CGPoint(x: 1, y: 1)) == 0)
+      for column in 0..<columns {
+        #expect(layout.frame(at: column).minY == layout.frame(at: 0).minY)
+      }
+      #expect(layout.frame(at: 99).minX == layout.frame(at: 99 % columns).minX)
+    }
+  }
+
+  @Test("A preview's cells sit where the full timeline puts them when the older items arrive")
+  func previewKeepsColumnsOfFullTimeline() {
+    for columns in [2, 3, 7] {
       for added in [1, 2, 3, 7, 109] {
-        let merged = PhotoGridLayout(columns: columns, width: 390, itemCount: 96 + added, alignsNewestRow: true)
+        let preview = PhotoGridLayout(columns: columns, width: 390, itemCount: 96, itemsToCome: added)
+        let merged = PhotoGridLayout(columns: columns, width: 390, itemCount: 96 + added)
         for index in 0..<preview.itemCount {
           let before = preview.frame(at: index)
           let after = merged.frame(at: index + added)
           #expect(before.minX == after.minX)
           #expect(preview.contentHeight - before.maxY == merged.contentHeight - after.maxY)
-          #expect(merged.index(at: CGPoint(x: after.midX, y: after.midY)) == index + added)
-          #expect(merged.indices(in: after.insetBy(dx: 1, dy: 1)).contains(index + added))
-        }
-        if merged.itemCount % columns != 0 {
-          #expect(merged.index(at: CGPoint(x: 1, y: 1)) == nil)
+          #expect(preview.index(at: CGPoint(x: before.midX, y: before.midY)) == index)
+          #expect(preview.indices(in: before.insetBy(dx: 1, dy: 1)).contains(index))
         }
       }
     }
