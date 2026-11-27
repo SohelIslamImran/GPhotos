@@ -27,19 +27,26 @@ struct LaunchPathTests {
     #expect(TransferManifestStore.standardizedPath(path) == URL(fileURLWithPath: path).standardizedFileURL.path)
   }
 
-  @Test("Removing a snapshot invalidates the completed load too")
-  func snapshotRemovalInvalidatesLoad() async throws {
+  @Test("The launch snapshot survives account loading only for the same account")
+  @MainActor
+  func launchSnapshotFollowsAccount() async throws {
     let context = try #require(
       CGContext(
         data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 0,
         space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
     let image = try #require(context.makeImage())
     let info = LibrarySnapshot.Info(
-      width: 2, height: 2, scale: 1, isDark: false, itemCount: 1, isScrolledUnderBar: false)
+      width: 2, height: 2, scale: 1, isDark: false, itemCount: 1, isScrolledUnderBar: false,
+      accountEmail: "first@example.com")
     LibrarySnapshot.saveNow(image, info: info)
-    defer { LibrarySnapshot.remove() }
-    #expect(await LibrarySnapshot.load()?.info == info)
-    LibrarySnapshot.remove()
+    LibrarySnapshot.holdSaves(true, keepingSnapshot: true)
+    defer {
+      LibrarySnapshot.holdSaves(false)
+      LibrarySnapshot.remove()
+    }
+    await LibrarySnapshot.validateLaunchAccount("first@example.com")
+    #expect(LibrarySnapshot.ready?.info == info)
+    await LibrarySnapshot.validateLaunchAccount("second@example.com")
     #expect(LibrarySnapshot.ready == nil)
     #expect(await LibrarySnapshot.load() == nil)
   }

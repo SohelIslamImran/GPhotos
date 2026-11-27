@@ -62,7 +62,7 @@ public struct UnifiedLibraryView: View {
   /// lives in its own object and only the title reads it; the screen doesn't re-render.
   @State private var top = TopOfGrid()
   /// Photos are under the bar: it darkens and the title turns white, as in Photos.
-  @State private var isScrolledUnderBar = LibrarySnapshot.ready?.info.isScrolledUnderBar ?? false
+  @State private var isScrolledUnderBar = false
   /// The grid shows its newest photos: the title says how many items there are, as in
   /// Photos; anywhere else it shows the day at the top.
   @State private var isAtNewest = true
@@ -75,6 +75,7 @@ public struct UnifiedLibraryView: View {
     get { model.timelineMode }
     nonmutating set { model.timelineMode = newValue }
   }
+  @State private var lockedFolderMove = LockedFolderMove()
   @State private var pendingDelete: PendingDelete?
   @State private var albumTargets: AlbumTargets?
   @State private var busyMessage: String?
@@ -220,7 +221,11 @@ public struct UnifiedLibraryView: View {
       .onChange(of: model.hasResolvedFilter) { _, complete in
         if complete, model.itemCount == 0 { hideSnapshot() }
       }
-      .onChange(of: scenePhase) { Task { await model.contentProbeConditionsChanged() } }
+      .onChange(of: scenePhase) { _, phase in
+        // Changes made in Google Photos elsewhere come in on return, within the sync interval.
+        if phase == .active { cloudLibrary?.refresh() }
+        Task { await model.contentProbeConditionsChanged() }
+      }
       .onChange(of: model.device.reloadToken) { Task { await model.startLocal() } }
   }
 
@@ -369,6 +374,7 @@ public struct UnifiedLibraryView: View {
 
   private func dialogs(_ view: some View) -> some View {
     view
+      .modifier(LockedFolderMovePresentation(move: lockedFolderMove))
       .confirmationDialog(
         deleteTitle, isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
         titleVisibility: .visible
@@ -444,7 +450,6 @@ public struct UnifiedLibraryView: View {
         .task {
           guard snapshot == nil, showsSnapshot, let loaded = await LibrarySnapshot.load(), showsSnapshot else { return }
           snapshot = loaded
-          isScrolledUnderBar = loaded.info.isScrolledUnderBar
         }
         .onChange(of: scenePhase) { _, phase in
           if phase == .background { saveSnapshot() }
@@ -500,7 +505,9 @@ public struct UnifiedLibraryView: View {
   #if os(iOS)
     /// Photos scrolled under the bar turn it dark with white text, as in Photos; at the top
     /// edge the grid starts below the title on the plain background.
-    private var isOverPhotos: Bool { (model.itemCount > 0 || showsSnapshotImage) && isScrolledUnderBar }
+    private var isOverPhotos: Bool {
+      shownSnapshot?.info.isScrolledUnderBar ?? (model.itemCount > 0 && isScrolledUnderBar)
+    }
 
     private var showsSnapshotImage: Bool { shownSnapshot != nil }
   #endif
@@ -673,7 +680,9 @@ public struct UnifiedLibraryView: View {
     }
 
     private var shownSnapshot: LibrarySnapshot? {
-      guard let snapshot, canShowSnapshot(snapshot), mode == .all, !isSelecting, snapshot.info.scale == displayScale,
+      // Prefetch can finish after State was initialized but before this first body pass.
+      guard let snapshot = snapshot ?? LibrarySnapshot.ready, canShowSnapshot(snapshot), mode == .all, !isSelecting,
+        snapshot.info.scale == displayScale,
         snapshot.info.isDark == (colorScheme == .dark),
         let screen = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds.size,
         abs(screen.width - snapshot.info.width) < 1, abs(screen.height - snapshot.info.height) < 1
@@ -788,7 +797,7 @@ public struct UnifiedLibraryView: View {
         hasDrawnGrid = true
         withAnimation(animates ? .smooth(duration: 0.25) : nil) { isScrolledUnderBar = scrolled }
       },
-      topPadding: 14, startsAtEnd: true, alignsNewestRow: true,
+      topPadding: 14, startsAtEnd: true,
       onAtEndChange: { atEnd in
         withAnimation(reduceMotion ? nil : .smooth(duration: 0.25)) { isAtNewest = atEnd }
         model.isAtNewest = atEnd
@@ -796,6 +805,7 @@ public struct UnifiedLibraryView: View {
       onShowItems: { hideSnapshot() })
     options.positionOfItem = { model.index(ofItemID: $0, near: 0) }
     options.currentReloadToken = { model.reloadToken }
+    options.itemsToCome = model.itemsToCome
     #if os(iOS)
       options.placeholderCount = model.itemCount == 0 ? shownSnapshot?.info.itemCount ?? 0 : 0
       options.placeholderImage = shownSnapshot?.image
@@ -1002,6 +1012,11 @@ public struct UnifiedLibraryView: View {
         Label("Save to Device", systemImage: "arrow.down.circle")
       }
     }
+    if let cloudLibrary, picked.lockableCloudItems.contains(where: cloudLibrary.canMoveToLockedFolder) {
+      Button(LockedFolderMove.title, systemImage: LockedFolderMove.symbol) {
+        requestLockedFolderMove(selectedIDs)
+      }
+    }
     Button(role: .destructive) {
       requestDelete(selectedIDs)
     } label: {
@@ -1018,6 +1033,16 @@ public struct UnifiedLibraryView: View {
       let fresh = await model.resolveSelection(rows)
       guard !fresh.isEmpty || !fresh.files.isEmpty else { return }
       action(fresh)
+    }
+  }
+
+  private func requestLockedFolderMove(_ rows: Set<UnifiedLibraryModel.SelectionID>) {
+    guard let library = model.cloud?.library else { return }
+    withFreshSelection(rows) { fresh in
+      guard library === model.cloud?.library else { return }
+      lockedFolderMove.request(
+        fresh.lockableCloudItems, in: library, keepsLocalCopies: !fresh.cloudCopies.isEmpty || !fresh.folderCloudCopies.isEmpty
+      ) { isSelecting = false }
     }
   }
 
@@ -1105,6 +1130,11 @@ public struct UnifiedLibraryView: View {
           } else {
             Button("Save to Device", systemImage: "arrow.down.circle") { withFreshSelection(selectedIDs) { save($0.cloud) } }
           }
+          if let cloudLibrary, picked.lockableCloudItems.contains(where: cloudLibrary.canMoveToLockedFolder) {
+            Button(LockedFolderMove.title, systemImage: LockedFolderMove.symbol) {
+              requestLockedFolderMove(selectedIDs)
+            }
+          }
         }
       } label: {
         Label("More", systemImage: "ellipsis")
@@ -1149,6 +1179,16 @@ public struct UnifiedLibraryView: View {
         items.append(PhotoGridMenuItem(String(localized: "Share"), systemImage: "square.and.arrow.up") { share(rows) })
       }
     #endif
+    if let cloudLibrary,
+      indices.contains(where: { index in
+        model.googleCopy(at: index).map(cloudLibrary.canMoveToLockedFolder) == true
+      })
+    {
+      items.append(
+        PhotoGridMenuItem(LockedFolderMove.title, systemImage: LockedFolderMove.symbol, group: .organize) {
+          requestLockedFolderMove(rows)
+        })
+    }
     guard !device.isEmpty || !cloud.isEmpty else { return items }
     let allFavorites = device.allSatisfy(\.isFavorite) && cloud.allSatisfy(\.isFavorite)
     items.append(

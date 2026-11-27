@@ -24,8 +24,12 @@
       // A fresh state, not the stored one: an activity from an older build may not decode.
       let state = State(
         phase: .ended, completedCount: 0, totalCount: 0, bytesSent: 0, bytesTotal: 0, etaText: "", outcome: .stopped)
-      for activity in Activity<BackupActivityAttributes>.activities {
-        Task { await activity.end(.init(state: state, staleDate: nil), dismissalPolicy: .immediate) }
+      Task.detached(priority: .utility) { [weak self] in
+        let activities = Activity<BackupActivityAttributes>.activities
+        let activeID = await self?.activity?.id
+        for activity in activities where activity.id != activeID {
+          await activity.end(.init(state: state, staleDate: nil), dismissalPolicy: .immediate)
+        }
       }
     }
 

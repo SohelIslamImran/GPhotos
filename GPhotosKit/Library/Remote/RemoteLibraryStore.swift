@@ -296,8 +296,7 @@ public actor RemoteLibraryStore {
       }
       try setState("synced_at", String(now.timeIntervalSince1970), in: database)
       if !locking.isEmpty {
-        try database.run(
-          "INSERT OR IGNORE INTO locked_purges (media_key) SELECT value FROM json_each(?)", [try .list(locking)])
+        try enqueueLockedPurges(locking, in: database)
         willLock(locking)
         locksItems = true
       }
@@ -306,6 +305,23 @@ public actor RemoteLibraryStore {
     // Until then the file still holds what these rows were; a busy one is retried at open.
     if locksItems { try? database.checkpoint() }
     return applied
+  }
+
+  /// Applies a confirmed web move without changing the mobile sync cursor.
+  func markLocked(_ keys: Set<String>, willLock: @Sendable (Set<String>) -> Void) throws {
+    let database = try db()
+    try database.transaction {
+      for key in keys {
+        if let item = try item(mediaKey: key) { _ = try upsertLocked(item, in: database) }
+      }
+      try enqueueLockedPurges(keys, in: database)
+      willLock(keys)
+    }
+    try? database.checkpoint()
+  }
+
+  private func enqueueLockedPurges(_ keys: Set<String>, in database: SQLiteDatabase) throws {
+    try database.run("INSERT OR IGNORE INTO locked_purges (media_key) SELECT value FROM json_each(?)", [try .list(keys)])
   }
 
   /// Even a key with no local Siri row may still have an older Spotlight entry.

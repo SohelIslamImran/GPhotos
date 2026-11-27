@@ -869,17 +869,27 @@ public actor GooglePhotosMobileClient {
   /// wait doubles up to ten minutes and a success resets it. `Retry-After` is honoured when
   /// Google sends a longer one.
   private func waitOutRateLimit(after response: HTTPURLResponse) async throws {
-    let now = Date()
-    if rateLimitedUntil.map({ $0 <= now }) ?? true {
-      let header = response.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init) ?? 0
-      let retryAfter = header.isFinite ? header : 0
-      rateLimitedUntil = now.addingTimeInterval(max(rateLimitDelay, retryAfter))
-      rateLimitDelay = min(rateLimitDelay * 2, Self.rateLimitMaxDelay)
-    }
+    let retryAfter = response.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init) ?? 0
+    try await waitOutRateLimit(retryAfter: retryAfter)
+  }
+
+  private func waitOutRateLimit(retryAfter: TimeInterval) async throws {
+    noteRateLimited(retryAfter: retryAfter)
     try await waitForRateLimit()
   }
 
-  private func noteRequestSucceeded() {
+  /// Starts (or keeps) the account's back-off without waiting it out.
+  func noteRateLimited(retryAfter: TimeInterval) {
+    let now = Date()
+    guard rateLimitedUntil.map({ $0 <= now }) ?? true else { return }
+    let retryAfter = retryAfter.isFinite ? retryAfter : 0
+    rateLimitedUntil = now.addingTimeInterval(max(rateLimitDelay, retryAfter))
+    rateLimitDelay = min(rateLimitDelay * 2, Self.rateLimitMaxDelay)
+  }
+
+  var isRateLimited: Bool { rateLimitedUntil.map { $0 > Date() } ?? false }
+
+  func noteRequestSucceeded() {
     if rateLimitedUntil.map({ $0 <= Date() }) ?? false {
       rateLimitedUntil = nil
       rateLimitDelay = Self.rateLimitBaseDelay

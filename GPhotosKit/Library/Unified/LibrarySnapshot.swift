@@ -129,11 +129,24 @@ public struct LibrarySnapshot: Sendable {
     try? data.write(to: fileURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
   }
 
-  /// Forgets the snapshot (an account's photos were removed).
-  /// Set while the account changes: what's on screen then may be the old account's.
-  public static func holdSaves(_ holds: Bool) {
+  /// Pauses captures during account transitions. Only the initial read can keep the previous screen.
+  public static func holdSaves(_ holds: Bool, keepingSnapshot: Bool = false) {
     held.withLock { $0 = holds }
-    if holds { remove() }
+    if holds, !keepingSnapshot { remove() }
+  }
+
+  /// The initial account read may keep the previous screen, provided it still belongs to
+  /// the selected account. Join only the read that launch already started.
+  @MainActor
+  static func validateLaunchAccount(_ email: String?) async {
+    let snapshot: LibrarySnapshot?
+    if let ready {
+      snapshot = ready
+    } else {
+      snapshot = await pending.withLock({ $0 })?.value
+    }
+    guard let snapshot, snapshot.generation == currentGeneration else { return }
+    if snapshot.info.accountEmail != email { remove() }
   }
 
   private static let held = OSAllocatedUnfairLock(initialState: false)

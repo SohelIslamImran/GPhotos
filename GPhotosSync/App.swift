@@ -13,8 +13,6 @@ struct GPhotosSyncApp: App {
   init() {
     // Read while the rest starts up, so the Library's first frame can draw it.
     LibrarySnapshot.prefetch()
-    // Collections opens complete, instead of filling in (and shifting) as it loads.
-    Task { await PhotoCollectionsModel.shared.loadIfNeeded(priority: .utility) }
     let model = AppModel()
     model.prefetchAccounts()
     _model = State(initialValue: model)
@@ -60,6 +58,10 @@ struct GPhotosSyncApp: App {
   var body: some Scene {
     WindowGroup {
       root
+        .task(priority: .utility) {
+          // Warm Collections once the window appears so its scan starts behind the Library.
+          await PhotoCollectionsModel.shared.loadIfNeeded(priority: .utility)
+        }
     }
     .onChange(of: scenePhase) { _, phase in
       if phase == .background {

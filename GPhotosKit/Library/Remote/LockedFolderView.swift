@@ -2,7 +2,7 @@ import AVFoundation
 import LocalAuthentication
 import SwiftUI
 
-/// The account's Google Photos Locked Folder, read only, behind Face ID, Touch ID or the
+/// The account's Google Photos Locked Folder behind Face ID, Touch ID or the
 /// device passcode as Hidden is. It locks again when the app goes to the background, the
 /// screen is left or the account changes, and covers itself in the app switcher.
 ///
@@ -16,6 +16,7 @@ struct LockedFolderView: View {
   @State private var access = LockedFolderAccess()
   @State private var opened: Int?
   @State private var promptedOnOpen = false
+  @State private var showsWebManagement = false
   @Environment(\.scenePhase) private var scenePhase
 
   private var session: LockedFolderSession? { access.session }
@@ -29,6 +30,16 @@ struct LockedFolderView: View {
       }
     }
     .navigationTitle("Locked Folder")
+    .toolbar {
+      if session != nil, opened == nil, library.supportsLockedFolderWeb {
+        ToolbarItem {
+          Button("Manage in Google Photos", systemImage: "arrow.up.right.square") { showsWebManagement = true }
+        }
+      }
+    }
+    .sheet(isPresented: $showsWebManagement, onDismiss: { library.refresh(force: true) }) {
+      GooglePhotosWebSheet(library: library, mode: .manage) {}
+    }
     .overlay {
       if let session, let opened {
         LockedFolderViewer(session: session, index: opened) { self.opened = nil }
@@ -115,6 +126,7 @@ struct LockedFolderView: View {
   }
 
   private func lock() {
+    showsWebManagement = false
     opened = nil
     access.lock()
   }

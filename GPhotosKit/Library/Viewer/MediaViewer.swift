@@ -163,6 +163,7 @@ public struct MediaViewer: View {
   @State private var pageSize: CGSize = .zero
   @State private var neighborRequests = ViewerNeighborRequests()
   @State private var playingLive: String?
+  @State private var lockedFolderMove = LockedFolderMove()
   @State private var errorMessage: String?
   @State private var isBusy = false
   #if os(macOS)
@@ -341,6 +342,7 @@ public struct MediaViewer: View {
       } message: {
         Text(errorMessage ?? "")
       }
+      .modifier(LockedFolderMovePresentation(move: lockedFolderMove))
       .sensoryFeedback(.impact(weight: .light), trigger: playingLive) { _, playing in playing != nil }
       #if os(iOS)
         // As in Photos, a video that starts by itself tucks the controls away after a moment;
@@ -820,6 +822,7 @@ public struct MediaViewer: View {
           Button("Copy", systemImage: "doc.on.doc") { run { try await LibraryActions.copy(asset) } }
         }
         Button("Hide", systemImage: "eye.slash") { run { try await LibraryActions.setHidden([asset], hidden: true) } }
+        if let copy = currentCloudCopy { moveToLockedFolderButton(copy.item, library: copy.library, keepsLocalCopy: true) }
       } label: {
         moreLabel
       }
@@ -833,12 +836,31 @@ public struct MediaViewer: View {
           }
         }
         Button("Archive", systemImage: "archivebox") { run { try await library.setArchived([item], archived: true) } }
+        moveToLockedFolderButton(item, library: library)
+      } label: {
+        moreLabel
+      }
+      .moreMenuStyle()
+    case .file(_, _, let copy?) where copy.library.canMoveToLockedFolder(copy.item):
+      Menu {
+        moveToLockedFolderButton(copy.item, library: copy.library, keepsLocalCopy: true)
       } label: {
         moreLabel
       }
       .moreMenuStyle()
     default:
       EmptyView()
+    }
+  }
+
+  @ViewBuilder private func moveToLockedFolderButton(
+    _ item: RemoteItemSummary, library: CloudLibrary, keepsLocalCopy: Bool = false
+  ) -> some View {
+    if library.canMoveToLockedFolder(item) {
+      Button(LockedFolderMove.title, systemImage: LockedFolderMove.symbol) {
+        lockedFolderMove.request([item], in: library, keepsLocalCopies: keepsLocalCopy)
+      }
+      .disabled(lockedFolderMove.isMoving)
     }
   }
 
@@ -911,6 +933,7 @@ public struct MediaViewer: View {
             Label("Share", systemImage: "square.and.arrow.up")
           }
           .help("Share")
+          moreMenu(viewerItem)
           Button("Show in Finder", systemImage: "folder") { NSWorkspace.shared.activateFileViewerSelecting([file.url]) }
             .help("Show in Finder")
         case nil:

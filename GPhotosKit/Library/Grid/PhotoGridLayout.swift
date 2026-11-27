@@ -11,11 +11,13 @@ public struct PhotoGridLayout: Equatable, Sendable {
   public var insets: PhotoGridInsets
   /// Cells round down to whole pixels of this scale, so their edges stay crisp.
   public var pixelScale: CGFloat
-  public var alignsNewestRow: Bool
+  /// Older items still to load above these. Their share of the first row is left empty,
+  /// so the newest cells keep their columns when those items arrive.
+  public var itemsToCome: Int
 
   public init(
     columns: Int, spacing: CGFloat = 2, width: CGFloat, itemCount: Int, insets: PhotoGridInsets = .zero,
-    pixelScale: CGFloat = 1, alignsNewestRow: Bool = false
+    pixelScale: CGFloat = 1, itemsToCome: Int = 0
   ) {
     self.pixelScale = max(1, pixelScale)
     self.columns = max(1, columns)
@@ -23,7 +25,7 @@ public struct PhotoGridLayout: Equatable, Sendable {
     self.width = max(0, width)
     self.itemCount = max(0, itemCount)
     self.insets = insets
-    self.alignsNewestRow = alignsNewestRow
+    self.itemsToCome = max(0, itemsToCome)
   }
 
   public var itemSide: CGFloat {
@@ -31,12 +33,13 @@ public struct PhotoGridLayout: Equatable, Sendable {
     return max(1, (available / CGFloat(columns) * pixelScale).rounded(.down) / pixelScale)
   }
 
-  public var rowCount: Int { itemCount / columns + (itemCount % columns == 0 ? 0 : 1) }
-
-  /// Put an incomplete row at the oldest end, so prepending items cannot move newer cells.
-  private var leadingEmptyCells: Int {
-    alignsNewestRow ? (columns - itemCount % columns) % columns : 0
+  public var rowCount: Int {
+    guard itemCount > 0 else { return 0 }
+    let cells = itemCount + leadingEmptyCells
+    return cells / columns + (cells % columns == 0 ? 0 : 1)
   }
+
+  private var leadingEmptyCells: Int { itemsToCome % columns }
 
   private var rowPitch: CGFloat { itemSide + spacing }
 
