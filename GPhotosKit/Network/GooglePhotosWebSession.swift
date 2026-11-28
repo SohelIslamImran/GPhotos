@@ -271,12 +271,12 @@ struct GooglePhotosWebSession {
   }
 
   /// Reads only the selected item's key from Google's reauthenticated folder.
-  func moveOutOfLockedFolder(mediaKey: String, on page: WebPage) async throws -> Bool {
+  func moveOutOfLockedFolder(mediaKey: String, on page: WebPage) async throws -> String? {
     guard
       try await evaluate(
         "return typeof window.WIZ_global_data?.Dbw5Ud === 'string' && !!window.WIZ_global_data.Dbw5Ud;", on: page
       ) as? Bool == true
-    else { return false }
+    else { return nil }
 
     var cursor: String?
     var seen = Set<String>()
@@ -290,7 +290,7 @@ struct GooglePhotosWebSession {
       {
         _ = try await send(
           LockedFolderWebRequest.moveOutRPC, payload: [[key]], on: page, requiresReauthentication: true)
-        return true
+        return key
       }
       cursor = result[0] as? String
     } while cursor.map({ !$0.isEmpty && seen.insert($0).inserted }) == true

@@ -16,22 +16,22 @@ struct GooglePhotosWebSheet: View {
   @State private var page: WebPage?
   @State private var needsSignIn = false
   @State private var showsPage = false
+  @State private var hasShownPage = false
   @State private var error: String?
   @State private var isMovingOut = false
   @State private var didMove = false
   @State private var isUpdatingLibrary = false
-  @State private var showsManualInstructions = false
   @State private var attempt = 0
   @Environment(\.dismiss) private var dismiss
   @Environment(\.openURL) private var openURL
   @Environment(\.scenePhase) private var scenePhase
 
   private var isSigningIn: Bool { mode == .signIn || needsSignIn }
+  private var isCompact: Bool { didMove || !hasShownPage }
 
   var body: some View {
     NavigationStack {
       VStack(spacing: 0) {
-        if !didMove { accountHeader }
         ZStack {
           if let page {
             let visible = showsPage && (mode == .signIn || scenePhase == .active)
@@ -46,9 +46,9 @@ struct GooglePhotosWebSheet: View {
             if isUpdatingLibrary {
               ProgressView("Updating Library…")
             } else {
-              ContentUnavailableView(
-                "Moved in Google Photos", systemImage: "checkmark.circle",
-                description: Text("The item will appear in your Library when Google Photos finishes syncing."))
+              Label("Moved. Library sync pending.", systemImage: "checkmark.circle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             }
           } else if let error {
             ContentUnavailableView {
@@ -70,54 +70,42 @@ struct GooglePhotosWebSheet: View {
         isSigningIn ? "Sign In to Google Photos" : moveOutMediaKey == nil ? "Manage Locked Folder" : "Move Out of Locked Folder"
       )
       .toolbar {
+        if !didMove {
+          ToolbarItem(placement: .primaryAction) {
+            Button("Open in Browser", systemImage: "safari") {
+              onOpenBrowser()
+              openURL(mode == .signIn ? GooglePhotosWebSession.libraryURL : GooglePhotosWebSession.lockedFolderURL)
+            }
+            .labelStyle(.iconOnly)
+            .help("Open in Browser")
+          }
+        }
         ToolbarItem(placement: .confirmationAction) {
           Button(isSigningIn ? "Cancel" : "Done") { dismiss() }
         }
       }
     }
     #if os(macOS)
-      .frame(minWidth: 540, idealWidth: 720, minHeight: 560, idealHeight: 660)
+      .frame(
+        minWidth: isCompact ? 360 : 500, idealWidth: isCompact ? 360 : 640,
+        minHeight: isCompact ? 160 : 480, idealHeight: isCompact ? 180 : 580)
     #else
-      .presentationDetents([.large])
+      .presentationDetents(isCompact ? [.height(error == nil ? 160 : 280)] : [.large])
     #endif
     .task(id: attempt) { await open() }
+    .onChange(of: showsPage) { _, visible in
+      if visible { hasShownPage = true }
+    }
     .onChange(of: library.isRetired) { _, retired in if retired { dismiss() } }
     .onChange(of: scenePhase) { _, phase in
       if mode == .manage, phase == .background { dismiss() }
     }
   }
 
-  private var accountHeader: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      Label(library.accountEmail, systemImage: "person.crop.circle")
-        .font(.subheadline.weight(.semibold))
-        .lineLimit(1)
-        .truncationMode(.middle)
-      if isSigningIn {
-        Text("Sign in with this Google account to let the app move items.")
-      } else if showsManualInstructions || (moveOutMediaKey == nil && showsPage) {
-        Text("Select your items on the Google Photos page and choose Move.")
-      } else if moveOutMediaKey != nil {
-        Text("Google may ask you to verify your account before moving this item.")
-      }
-      Button("Use Passkey in Browser", systemImage: "arrow.up.right.square") {
-        onOpenBrowser()
-        openURL(mode == .signIn ? GooglePhotosWebSession.libraryURL : GooglePhotosWebSession.lockedFolderURL)
-      }
-      .buttonStyle(.borderless)
-      Text("Finish the move in your browser. Browser sign-in stays in the browser.")
-    }
-    .font(.footnote)
-    .foregroundStyle(.secondary)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(.horizontal, 20)
-    .padding(.vertical, 12)
-  }
-
   private func move(_ key: String, on page: WebPage) async throws -> Bool {
     isMovingOut = true
     defer { isMovingOut = false }
-    guard try await library.moveOutOfLockedFolder(mediaKey: key, on: page) else { return false }
+    guard let dedupKey = try await library.moveOutOfLockedFolder(mediaKey: key, on: page) else { return false }
     if let lockedSession, !lockedSession.isClosed, !library.isRetired {
       lockedSession.reauthenticatedPage = page
     }
@@ -126,7 +114,7 @@ struct GooglePhotosWebSheet: View {
     isUpdatingLibrary = true
     onMoveOutConfirmed()
     // The server already accepted the move, so sync even if the sheet is dismissed.
-    let updates = Task { await library.reconcileLockedFolder(mediaKey: key) }
+    let updates = Task { await library.reconcileLockedFolder(mediaKey: key, dedupKey: dedupKey) }
     let isInLibrary = await updates.value
     isUpdatingLibrary = false
     if isInLibrary, !Task.isCancelled { dismiss() }
@@ -136,7 +124,6 @@ struct GooglePhotosWebSheet: View {
   private func open() async {
     guard !library.isRetired else { return }
     error = nil
-    showsManualInstructions = false
     showsPage = false
     page = nil
     if !isSigningIn, let key = moveOutMediaKey, let authorized = lockedSession?.reauthenticatedPage {
@@ -153,7 +140,7 @@ struct GooglePhotosWebSheet: View {
     let session = GooglePhotosWebSession(accountEmail: library.accountEmail)
     let store = WKWebsiteDataStore.nonPersistent()
     do {
-      let signingIn = isSigningIn
+      var signingIn = isSigningIn
       let webPage =
         if signingIn {
           session.makePage(store: store)
@@ -187,11 +174,13 @@ struct GooglePhotosWebSheet: View {
                   handedOff = true
                   onSignIn(webPage)
                   dismiss()
-                } else {
-                  needsSignIn = false
-                  attempt += 1
+                  return
                 }
-                return
+                signingIn = false
+                needsSignIn = false
+                showsPage = false
+                _ = webPage.load(GooglePhotosWebSession.lockedFolderURL)
+                continue
               }
               try await session.verifyAccount(on: webPage, waitingUpTo: .seconds(8))
               if let key = pendingMove {
@@ -202,7 +191,6 @@ struct GooglePhotosWebSheet: View {
                 } catch {
                   // Google Photos remains available for moving the item directly.
                   pendingMove = nil
-                  showsManualInstructions = true
                   try await session.verifyAccount(on: webPage)
                 }
               }

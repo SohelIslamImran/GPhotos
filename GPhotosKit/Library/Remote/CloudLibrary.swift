@@ -267,6 +267,15 @@ public final class CloudLibrary {
 
   /// Syncs if the last sync is older than the refresh interval, or always with `force`.
   public func refresh(force: Bool = false) {
+    refresh(force: force, rescan: false)
+  }
+
+  /// Repairs items missing from the incremental feed without erasing the mirror.
+  func rescanLibrary() {
+    refresh(force: true, rescan: true)
+  }
+
+  private func refresh(force: Bool, rescan: Bool) {
     guard syncTask == nil, !isRetired, !isMovingToLockedFolder else { return }
     syncTask = Task {
       defer { syncTask = nil }
@@ -284,6 +293,7 @@ public final class CloudLibrary {
       published = RemoteLibraryStore.Changes()
       status = .syncing(RemoteLibrarySync.Progress())
       do {
+        if rescan { try await store.restartFullSync() }
         _ = try await sync.sync { progress in
           Task { @MainActor in self.pageCommitted(progress, generation: generation) }
         }
@@ -518,7 +528,7 @@ public final class CloudLibrary {
     }
   }
 
-  func moveOutOfLockedFolder(mediaKey: String, on page: WebPage) async throws -> Bool {
+  func moveOutOfLockedFolder(mediaKey: String, on page: WebPage) async throws -> String? {
     guard supportsLockedFolderWeb, LockedItems.contains(mediaKey, accountEmail: accountEmail) else {
       throw GooglePhotosWebError.rejected
     }
@@ -535,20 +545,20 @@ public final class CloudLibrary {
     }
   }
 
-  /// A move can reach the web app before it appears in the mobile API delta.
+  /// The mobile delta can lag behind the web or omit a restored item.
   @discardableResult
-  func reconcileLockedFolder(mediaKey: String? = nil) async -> Bool {
-    for delay in [0, 1, 2, 4] {
+  func reconcileLockedFolder(mediaKey: String? = nil, dedupKey: String? = nil) async -> Bool {
+    for attempt in 0..<3 {
       do {
-        if delay > 0 { try await Task.sleep(for: .seconds(delay)) }
+        if attempt == 1 { try await Task.sleep(for: .seconds(1)) }
         await waitForSync()
         try Task.checkCancellation()
         guard !isRetired else { return false }
-        refresh(force: true)
+        refresh(force: true, rescan: attempt == 2)
         await waitForSync()
         guard let mediaKey else { return true }
-        if try await store.summary(mediaKey: mediaKey) != nil,
-          !LockedItems.contains(mediaKey, accountEmail: accountEmail)
+        if let restored = try await store.restoredSummary(mediaKey: mediaKey, dedupKey: dedupKey),
+          !LockedItems.contains(restored.mediaKey, accountEmail: accountEmail)
         {
           return true
         }

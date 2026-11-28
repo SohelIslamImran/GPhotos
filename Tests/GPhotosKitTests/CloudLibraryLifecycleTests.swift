@@ -460,6 +460,27 @@ struct CloudLibraryLifecycleTests {
     await library.retire()
   }
 
+  @Test func moveOutRecoversAReplacementMissingFromTheDelta() async throws {
+    let email = "\(UUID())@example.com"
+    defer { LockedItems.forget(accountEmail: email) }
+    let store = makeStore(email: email)
+    let oldKey = "locked-item"
+    try await store.apply(try update(Page.page(items: [.init(key: oldKey, locked: true), .init(key: "existing")])), syncToken: "S1")
+    try await store.markInitialSyncDone()
+    let fetcher = CloudLibrarySyncTests.FakeFetcher()
+    await fetcher.set(states: [
+      "S1": Page.page(sync: "S2", deleted: [oldKey]),
+      "": Page.page(sync: "S3", items: [.init(key: "restored", takenMs: 1_600_000_000_000, dedup: "match")]),
+    ])
+    let library = makeLibrary(store: store, email: email, fetcher: fetcher)
+    #expect(await library.reconcileLockedFolder(mediaKey: oldKey, dedupKey: "match"))
+    let rows = try await store.summaries(.library)
+    #expect(Set(rows.map(\.mediaKey)) == ["existing", "restored"])
+    #expect(rows.first(where: { $0.mediaKey == "restored" })?.takenAt == Date(timeIntervalSince1970: 1_600_000_000))
+    #expect(try await store.lockedSummaries().isEmpty)
+    await library.retire()
+  }
+
   @Test func playbackRotationRefitsWithoutReplacingThePlayer() {
     let controls = VideoPlayback()
     let player = AVPlayer()

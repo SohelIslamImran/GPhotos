@@ -41,7 +41,13 @@ struct LockedFolderView: View {
     .toolbar {
       if session != nil, library.supportsLockedFolderWeb {
         ToolbarItem {
-          Button("Move Out of Locked Folder", systemImage: "lock.open") { openWebManagement(nil) }
+          Menu {
+            Button("Move Out of Locked Folder", systemImage: "lock.open") { openWebManagement(nil) }
+            Button("Rescan Google Photos", systemImage: "arrow.clockwise") { library.rescanLibrary() }
+              .disabled(library.isSyncing)
+          } label: {
+            Label("Locked Folder Actions", systemImage: "ellipsis.circle")
+          }
         }
       }
     }

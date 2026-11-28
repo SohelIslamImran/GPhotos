@@ -183,7 +183,7 @@ struct GooglePhotosWebSessionTests {
     for try await event in page.load(simulatedRequest: request, responseHTML: html) {
       if event == .finished { break }
     }
-    #expect(try await session.moveOutOfLockedFolder(mediaKey: "selected", on: page))
+    #expect(try await session.moveOutOfLockedFolder(mediaKey: "selected", on: page) == "selected-key")
     let calls = try await page.callJavaScript("return JSON.stringify(calls);", contentWorld: .page) as? String
     #expect(calls == #"[["nMFwOc",[null]],["nMFwOc",["next"]],["Pp2Xxe",[["selected-key"]]]]"#)
   }
