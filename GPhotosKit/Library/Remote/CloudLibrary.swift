@@ -267,6 +267,15 @@ public final class CloudLibrary {
 
   /// Syncs if the last sync is older than the refresh interval, or always with `force`.
   public func refresh(force: Bool = false) {
+    refresh(force: force, rescan: false)
+  }
+
+  /// Repairs items missing from the incremental feed without erasing the mirror.
+  func rescanLibrary() {
+    refresh(force: true, rescan: true)
+  }
+
+  private func refresh(force: Bool, rescan: Bool) {
     guard syncTask == nil, !isRetired, !isMovingToLockedFolder else { return }
     syncTask = Task {
       defer { syncTask = nil }
@@ -284,6 +293,7 @@ public final class CloudLibrary {
       published = RemoteLibraryStore.Changes()
       status = .syncing(RemoteLibrarySync.Progress())
       do {
+        if rescan { try await store.restartFullSync() }
         _ = try await sync.sync { progress in
           Task { @MainActor in self.pageCommitted(progress, generation: generation) }
         }
@@ -518,6 +528,48 @@ public final class CloudLibrary {
     }
   }
 
+  func moveOutOfLockedFolder(mediaKey: String, on page: WebPage) async throws -> String? {
+    guard supportsLockedFolderWeb, LockedItems.contains(mediaKey, accountEmail: accountEmail) else {
+      throw GooglePhotosWebError.rejected
+    }
+    return try await requests.run {
+      let client = try await self.client()
+      guard await !client.isRateLimited else { throw GooglePhotosWebError.busy }
+      do {
+        let session = GooglePhotosWebSession(accountEmail: self.accountEmail)
+        return try await session.moveOutOfLockedFolder(mediaKey: mediaKey, on: page)
+      } catch let limit as GooglePhotosWebSession.WebRateLimit {
+        await client.noteRateLimited(retryAfter: limit.retryAfter)
+        throw GooglePhotosWebError.busy
+      }
+    }
+  }
+
+  /// The mobile delta can lag behind the web or omit a restored item.
+  @discardableResult
+  func reconcileLockedFolder(mediaKey: String? = nil, dedupKey: String? = nil) async -> Bool {
+    for attempt in 0..<3 {
+      do {
+        if attempt == 1 { try await Task.sleep(for: .seconds(1)) }
+        await waitForSync()
+        try Task.checkCancellation()
+        guard !isRetired else { return false }
+        refresh(force: true, rescan: attempt == 2)
+        await waitForSync()
+        guard let mediaKey else { return true }
+        if let restored = try await store.restoredSummary(mediaKey: mediaKey, dedupKey: dedupKey),
+          !LockedItems.contains(restored.mediaKey, accountEmail: accountEmail)
+        {
+          return true
+        }
+        if case .failed = status { return false }
+      } catch {
+        return false
+      }
+    }
+    return false
+  }
+
   nonisolated static func lockableItems(_ items: [RemoteItemSummary], excluding locked: Set<String>) -> [RemoteItemSummary] {
     var seen = locked
     return items.filter { !$0.dedupKey.isEmpty && $0.trashedAt == nil && seen.insert($0.mediaKey).inserted }
@@ -528,7 +580,8 @@ public final class CloudLibrary {
       && !LockedItems.contains(item.mediaKey, accountEmail: accountEmail)
   }
 
-  public func moveToLockedFolder(_ items: [RemoteItemSummary]) async throws {
+  func moveToLockedFolder(_ items: [RemoteItemSummary], signedInPage: WebPage?) async throws {
+    defer { signedInPage?.stopLoading() }
     guard !isMovingToLockedFolder else { throw GooglePhotosWebError.unavailable }
     guard !isRetired else { throw CancellationError() }
     let items = Self.lockableItems(items, excluding: LockedItems.keys(accountEmail: accountEmail))
@@ -541,21 +594,25 @@ public final class CloudLibrary {
     }
     // Finish the current sync so a page fetched before the move can't undo the local lock.
     await waitForSync()
-    try await requests.run { try await self.moveLockedFolderBatches(items) }
+    try await requests.run { try await self.moveLockedFolderBatches(items, signedInPage: signedInPage) }
   }
 
-  private func moveLockedFolderBatches(_ items: [RemoteItemSummary]) async throws {
+  private func moveLockedFolderBatches(_ items: [RemoteItemSummary], signedInPage: WebPage?) async throws {
     // A resumed page can predate the move even if no sync is running now.
     guard try await store.syncState().resumeToken.isEmpty else {
       throw GooglePhotosWebError.syncPending
     }
     let session = GooglePhotosWebSession(accountEmail: accountEmail)
     let page: WebPage?
-    #if DEBUG
-      page = if actionClient == nil { nil } else { try await session.makeSignedInPage() }
-    #else
-      page = try await session.makeSignedInPage()
-    #endif
+    if let signedInPage {
+      page = signedInPage
+    } else {
+      #if DEBUG
+        page = if actionClient == nil { nil } else { try await session.makeSignedInPage() }
+      #else
+        page = try await session.makeSignedInPage()
+      #endif
+    }
     defer { page?.stopLoading() }
     for batch in LockedFolderWebRequest.batches(of: items) {
       try Task.checkCancellation()

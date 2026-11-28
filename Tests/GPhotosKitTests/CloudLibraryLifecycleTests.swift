@@ -439,6 +439,66 @@ struct CloudLibraryLifecycleTests {
     #expect(controls.player == nil)
   }
 
+  @Test func moveOutWaitsForAnUnlockedDeltaBeforePublishingTheItem() async throws {
+    let email = "\(UUID())@example.com"
+    defer { LockedItems.forget(accountEmail: email) }
+    let store = makeStore(email: email)
+    let key = "moved-out"
+    try await store.apply(try update(Page.page(items: [.init(key: key, locked: true)])), syncToken: "S1")
+    try await store.markInitialSyncDone()
+    let fetcher = CloudLibrarySyncTests.FakeFetcher()
+    await fetcher.set(states: [
+      "S1": Page.page(sync: "S2"),
+      "S2": Page.page(sync: "S3", items: [.init(key: key)]),
+    ])
+    let library = makeLibrary(store: store, email: email, fetcher: fetcher)
+    #expect(try await store.summaries(.library).isEmpty)
+    #expect(await library.reconcileLockedFolder(mediaKey: key))
+    #expect(try await store.summaries(.library).map(\.mediaKey) == [key])
+    #expect(try await store.lockedSummaries().isEmpty)
+    #expect(await fetcher.calls == ["state:S1", "state:S2"])
+    await library.retire()
+  }
+
+  @Test func moveOutRecoversAReplacementMissingFromTheDelta() async throws {
+    let email = "\(UUID())@example.com"
+    defer { LockedItems.forget(accountEmail: email) }
+    let store = makeStore(email: email)
+    let oldKey = "locked-item"
+    try await store.apply(try update(Page.page(items: [.init(key: oldKey, locked: true), .init(key: "existing")])), syncToken: "S1")
+    try await store.markInitialSyncDone()
+    let fetcher = CloudLibrarySyncTests.FakeFetcher()
+    await fetcher.set(states: [
+      "S1": Page.page(sync: "S2", deleted: [oldKey]),
+      "": Page.page(sync: "S3", items: [.init(key: "restored", takenMs: 1_600_000_000_000, dedup: "match")]),
+    ])
+    let library = makeLibrary(store: store, email: email, fetcher: fetcher)
+    #expect(await library.reconcileLockedFolder(mediaKey: oldKey, dedupKey: "match"))
+    let rows = try await store.summaries(.library)
+    #expect(Set(rows.map(\.mediaKey)) == ["existing", "restored"])
+    #expect(rows.first(where: { $0.mediaKey == "restored" })?.takenAt == Date(timeIntervalSince1970: 1_600_000_000))
+    #expect(try await store.lockedSummaries().isEmpty)
+    await library.retire()
+  }
+
+  @Test func playbackRotationRefitsWithoutReplacingThePlayer() {
+    let controls = VideoPlayback()
+    let player = AVPlayer()
+    controls.attach(player)
+    let size = CGSize(width: 1080, height: 1920)
+    for turns in [1, 2, 3, 0] {
+      controls.setOrientation(turns)
+      #expect(controls.quarterTurns == turns)
+      #expect(controls.player === player)
+      let expected = turns.isMultiple(of: 2) ? size : CGSize(width: 1920, height: 1080)
+      #expect(PlaybackOrientation.size(size, quarterTurns: controls.quarterTurns) == expected)
+    }
+    controls.setOrientation(1)
+    controls.attach(AVPlayer())
+    #expect(controls.quarterTurns == 0)
+    controls.attach(nil)
+  }
+
   @Test("Viewer positions use the Google ID map beyond the old search window and after a delete")
   func remoteViewerLooksUpMovedAndDeletedItems() async throws {
     let store = makeStore()

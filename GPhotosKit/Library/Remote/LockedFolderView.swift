@@ -1,6 +1,7 @@
 import AVFoundation
 import LocalAuthentication
 import SwiftUI
+import WebKit
 
 /// The account's Google Photos Locked Folder behind Face ID, Touch ID or the
 /// device passcode as Hidden is. It locks again when the app goes to the background, the
@@ -17,6 +18,11 @@ struct LockedFolderView: View {
   @State private var opened: Int?
   @State private var promptedOnOpen = false
   @State private var showsWebManagement = false
+  @State private var moveOutMediaKey: String?
+  @State private var refreshAfterWebManagement = true
+  @State private var browserRefresh: (library: CloudLibrary, mediaKey: String?)?
+  @State private var viewerTransition = ViewerZoom()
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.scenePhase) private var scenePhase
 
   private var session: LockedFolderSession? { access.session }
@@ -25,36 +31,71 @@ struct LockedFolderView: View {
     Group {
       if let session {
         LockedFolderGrid(session: session, opened: $opened)
+          .accessibilityHidden(opened != nil)
+          .allowsHitTesting(opened == nil)
       } else {
         locked
       }
     }
     .navigationTitle("Locked Folder")
     .toolbar {
-      if session != nil, opened == nil, library.supportsLockedFolderWeb {
+      if session != nil, library.supportsLockedFolderWeb {
         ToolbarItem {
-          Button("Manage in Google Photos", systemImage: "arrow.up.right.square") { showsWebManagement = true }
+          Menu {
+            Button("Move Out of Locked Folder", systemImage: "lock.open") { openWebManagement(nil) }
+            Button("Rescan Google Photos", systemImage: "arrow.clockwise") { library.rescanLibrary() }
+              .disabled(library.isSyncing)
+          } label: {
+            Label("Locked Folder Actions", systemImage: "ellipsis.circle")
+          }
         }
       }
     }
-    .sheet(isPresented: $showsWebManagement, onDismiss: { library.refresh(force: true) }) {
-      GooglePhotosWebSheet(library: library, mode: .manage) {}
-    }
-    .overlay {
-      if let session, let opened {
-        LockedFolderViewer(session: session, index: opened) { self.opened = nil }
+    .sheet(
+      isPresented: $showsWebManagement,
+      onDismiss: {
+        moveOutMediaKey = nil
+        if refreshAfterWebManagement, browserRefresh == nil {
+          Task { await library.reconcileLockedFolder() }
+        }
+      }
+    ) {
+      if let session {
+        GooglePhotosWebSheet(
+          library: library, mode: .manage, moveOutMediaKey: moveOutMediaKey, lockedSession: session,
+          onMoveOutConfirmed: { refreshAfterWebManagement = false },
+          onOpenBrowser: { browserRefresh = (library, moveOutMediaKey) }
+        ) { _ in }
       }
     }
+    #if os(iOS)
+      .background {
+        OverFullScreen(
+          key: viewerKey,
+          onDismiss: {
+            if moveOutMediaKey != nil, session != nil { showsWebManagement = true }
+          }
+        ) {
+          viewer
+        }
+      }
+    #else
+      .overlay { viewer }
+    #endif
     .overlay {
       if session != nil, covers { cover }
     }
-    #if os(iOS)
-      .toolbar(opened != nil ? .hidden : .automatic, for: .navigationBar, .tabBar)
-    #endif
     .onChange(of: scenePhase) { _, phase in
       if phase == .background { lock() }
+      if phase == .active, let pending = browserRefresh {
+        browserRefresh = nil
+        if pending.library === library {
+          Task { await library.reconcileLockedFolder(mediaKey: pending.mediaKey) }
+        }
+      }
       #if os(iOS)
         // Covered (the app switcher, Control Center), nothing plays on behind it.
+        session?.isCovered = phase != .active
         if phase != .active { session?.pauseVideo() }
       #endif
     }
@@ -85,6 +126,23 @@ struct LockedFolderView: View {
       }
     #endif
     .onDisappear { lock() }
+  }
+
+  #if os(iOS)
+    private var viewerKey: ViewerPresentationKey? {
+      guard opened != nil, let session else { return nil }
+      return ViewerPresentationKey(
+        source: ObjectIdentifier(session), zoom: ObjectIdentifier(viewerTransition), reduceMotion: reduceMotion)
+    }
+  #endif
+
+  @ViewBuilder private var viewer: some View {
+    if let session, let opened {
+      LockedFolderViewer(
+        session: session, index: opened, pull: viewerTransition,
+        onMoveOut: library.supportsLockedFolderWeb ? openWebManagement : nil
+      ) { self.opened = nil }
+    }
   }
 
   /// In the app switcher (iPhone), the screen shows a cover instead of the photos.
@@ -125,8 +183,24 @@ struct LockedFolderView: View {
       .ignoresSafeArea()
   }
 
+  private func openWebManagement(_ mediaKey: String?) {
+    guard session != nil else { return }
+    moveOutMediaKey = mediaKey
+    refreshAfterWebManagement = true
+    session?.stopVideo()
+    #if os(iOS)
+      if opened != nil {
+        opened = nil
+        return
+      }
+    #endif
+    opened = nil
+    showsWebManagement = true
+  }
+
   private func lock() {
     showsWebManagement = false
+    moveOutMediaKey = nil
     opened = nil
     access.lock()
   }
@@ -199,6 +273,7 @@ final class LockedFolderSession {
   private(set) var isLoaded = false
   private(set) var loadFailed = false
   private(set) var isClosed = false
+  var isCovered = false
   /// The video playing, or paused, and the item it belongs to.
   private(set) var player: AVPlayer?
   private(set) var playingKey: String?
@@ -207,6 +282,7 @@ final class LockedFolderSession {
   /// A photo is open: the list stays as it is until it's closed.
   @ObservationIgnored var isHeld = false
   let playback = VideoPlayback()
+  @ObservationIgnored var reauthenticatedPage: WebPage?
   /// Images that came back, and requests Google refused or that failed.
   private(set) var loadedImages = 0
   private(set) var failedImages = 0
@@ -311,10 +387,7 @@ final class LockedFolderSession {
     starting?.cancel()
     starting = nil
     startingKey = nil
-    guard let player else { return }
-    player.pause()
-    playback.attach(nil)
-    playback.attach(player)
+    playback.pause()
   }
 
   func stopVideo() {
@@ -335,6 +408,8 @@ final class LockedFolderSession {
   func close() {
     isClosed = true
     load?.cancel()
+    reauthenticatedPage?.stopLoading()
+    reauthenticatedPage = nil
     stopVideo()
     images.removeAllObjects()
     items = []
@@ -498,20 +573,26 @@ struct LockedFolderCell: View {
   }
 }
 
-/// The Locked Folder's own viewer: the photo fitted to the screen with native zoom, paged
-/// by swiping (iPhone) or the arrow keys (Mac). It has no Info, Share or other actions.
+/// Uses the Library's pager while keeping Locked Folder images in the unlocked session.
 struct LockedFolderViewer: View {
   let session: LockedFolderSession
+  let onMoveOut: ((String) -> Void)?
   let onClose: () -> Void
-  @State private var index: Int
+  @State private var index: Int?
   @State private var chromeHidden = false
+  @State private var moveOutKey: String?
+  let pull: ViewerZoom
+  @State private var closingPull: CGFloat?
   #if os(macOS)
     @FocusState private var isFocused: Bool
   #endif
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @Environment(\.colorScheme) private var colorScheme
 
-  init(session: LockedFolderSession, index: Int, onClose: @escaping () -> Void) {
+  init(session: LockedFolderSession, index: Int, pull: ViewerZoom, onMoveOut: ((String) -> Void)?, onClose: @escaping () -> Void) {
     self.session = session
+    self.pull = pull
+    self.onMoveOut = onMoveOut
     self.onClose = onClose
     _index = State(initialValue: index)
   }
@@ -523,32 +604,49 @@ struct LockedFolderViewer: View {
 
   var body: some View {
     GeometryReader { proxy in
-      pages(size: proxy.size)
+      PagedViewer(count: session.items.count, index: $index, pageID: pageID) { offset in
+        page(offset, size: proxy.size)
+      }
+      .environment(\.viewerZoom, pull)
     }
-    .background(chromeHidden ? Color.black : Color.clear)
-    .background(.background)
-    .ignoresSafeArea()
+    .background {
+      LockedViewerFade(pull: pull, distance: 260, closingPull: closingPull) {
+        Rectangle().fill(chromeHidden ? AnyShapeStyle(.black) : AnyShapeStyle(.background))
+      }
+    }
+    #if os(iOS)
+      .ignoresSafeArea()
+    #endif
     .overlay(alignment: .top) {
-      if !chromeHidden { header }
+      if !chromeHidden {
+        LockedViewerFade(pull: pull, distance: 40, closingPull: closingPull) { header }
+      }
     }
     .overlay(alignment: .bottom) {
       if !chromeHidden, session.player != nil {
-        VideoControls(playback: session.playback)
-          .frame(maxWidth: 520)
-          .padding(.horizontal, 26)
-          .padding(.bottom, 40)
+        LockedViewerFade(pull: pull, distance: 40, closingPull: closingPull) {
+          VideoControls(playback: session.playback)
+            .frame(maxWidth: 520)
+            .padding(.horizontal, 26)
+            #if os(macOS)
+              .padding(.bottom, 12)
+            #endif
+        }
       }
     }
-    #if os(macOS)
+    .environment(\.colorScheme, chromeHidden ? .dark : colorScheme)
+    .opacity(closingPull == nil ? 1 : 0)
+    .allowsHitTesting(closingPull == nil)
+    #if os(iOS)
+      .accessibilityHidden(session.isCovered || session.isClosed)
       .overlay {
-        HStack {
-          stepButton(-1, symbol: "chevron.left", label: "Previous")
-          Spacer()
-          stepButton(1, symbol: "chevron.right", label: "Next")
+        if session.isCovered || session.isClosed {
+          Rectangle().fill(.background).ignoresSafeArea()
         }
-        .padding()
-        .opacity(chromeHidden ? 0 : 1)
       }
+    #endif
+    .onAppear { pull.pull = 0 }
+    #if os(macOS)
       .focusable()
       .focusEffectDisabled()
       .focused($isFocused)
@@ -561,96 +659,108 @@ struct LockedFolderViewer: View {
         step(1)
         return .handled
       }
-      .onKeyPress(.escape) {
-        onClose()
-        return .handled
-      }
     #endif
-    .onChange(of: session.items.count) { _, count in
-      if count == 0 { onClose() } else if index >= count { index = count - 1 }
+    .onChange(of: index) { _, _ in
+      session.stopVideo()
+      pull.pull = 0
+    }
+    .onDisappear { session.stopVideo() }
+    .confirmationDialog(
+      "Move 1 Item Out of Locked Folder?",
+      isPresented: Binding(get: { moveOutKey != nil }, set: { if !$0 { moveOutKey = nil } }),
+      titleVisibility: .visible, presenting: moveOutKey
+    ) { key in
+      Button("Move Out") { onMoveOut?(key) }
+    } message: { _ in
+      Text("The item will be visible in your Google Photos library again.")
     }
   }
 
-  @ViewBuilder private func pages(size: CGSize) -> some View {
-    #if os(iOS)
-      TabView(selection: $index) {
-        ForEach(Array(session.items.enumerated()), id: \.element.id) { offset, item in
-          LockedFolderPage(
-            session: session, item: item, isCurrent: offset == index, size: size, onTap: toggleChrome, onDismiss: onClose
-          )
-          .tag(offset)
-        }
-      }
-      .tabViewStyle(.page(indexDisplayMode: .never))
-    #else
-      if session.items.indices.contains(index) {
-        LockedFolderPage(
-          session: session, item: session.items[index], isCurrent: true, size: size, onTap: toggleChrome, onDismiss: onClose
-        )
-        .id(session.items[index].id)
-      }
-    #endif
+  private func pageID(_ index: Int) -> String {
+    session.items.indices.contains(index) ? session.items[index].mediaKey : ""
+  }
+
+  @ViewBuilder private func page(_ offset: Int, size: CGSize) -> some View {
+    if session.items.indices.contains(offset) {
+      let item = session.items[offset]
+      LockedFolderPage(
+        session: session, item: item, isCurrent: offset == index, size: size, onTap: toggleChrome, onDismiss: close
+      )
+      #if os(macOS)
+        .padding(.top, chromeHidden ? 0 : 60)
+        .padding(.bottom, !chromeHidden && item.kind == .video ? 70 : 8)
+      #endif
+      .id(item.mediaKey)
+    }
   }
 
   private var header: some View {
     HStack {
-      Button(action: onClose) {
-        Label("Close", systemImage: "xmark")
-      }
-      .labelStyle(.iconOnly)
-      .buttonStyle(.glass)
-      .buttonBorderShape(.circle)
-      #if os(iOS)
-        .controlSize(.large)
-      #endif
-      .keyboardShortcut(.cancelAction)
+      headerButton("chevron.backward", label: "Back", action: close)
+        .keyboardShortcut(.cancelAction)
       Spacer()
-      if session.items.indices.contains(index) {
+      if let index, session.items.indices.contains(index) {
+        let date = session.items[index].takenAt
         VStack(spacing: 0) {
-          Text(session.items[index].takenAt.formatted(date: .abbreviated, time: .omitted)).font(.headline)
-          Text(session.items[index].takenAt.formatted(date: .omitted, time: .shortened))
+          Text(date.formatted(date: .abbreviated, time: .omitted)).font(.headline)
+          Text(date.formatted(date: .omitted, time: .shortened))
             .font(.caption)
             .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
-        .glassEffect()
+        .glassEffect(in: .capsule)
       }
       Spacer()
-      // Balances the close button, so the date stays centred.
-      Color.clear.frame(width: 44, height: 44)
+      if onMoveOut != nil, let index, session.items.indices.contains(index) {
+        headerButton("lock.open", label: "Move Out of Locked Folder") {
+          moveOutKey = session.items[index].mediaKey
+        }
+      } else {
+        Color.clear.frame(width: 44, height: 44)
+      }
     }
-    .padding(.horizontal)
-    #if os(iOS)
-      .padding(.top, 8)
-    #else
-      .padding(.top, 60)
-    #endif
+    .padding(.horizontal, 20)
+    .padding(.top, 8)
   }
 
-  #if os(macOS)
-    private func stepButton(_ offset: Int, symbol: String, label: LocalizedStringKey) -> some View {
-      Button {
-        step(offset)
-      } label: {
-        Label(label, systemImage: symbol)
-      }
-      .labelStyle(.iconOnly)
-      .buttonStyle(.glass)
-      .buttonBorderShape(.circle)
-      .controlSize(.large)
-      .disabled(!session.items.indices.contains(index + offset))
+  private func headerButton(_ symbol: String, label: LocalizedStringKey, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      Image(systemName: symbol).font(.title3).frame(width: 36, height: 36)
     }
-  #endif
+    .buttonStyle(.glass)
+    .buttonBorderShape(.circle)
+    .accessibilityLabel(Text(label))
+  }
 
   private func step(_ offset: Int) {
-    let next = index + offset
-    guard session.items.indices.contains(next) else { return }
-    index = next
+    guard let index, session.items.indices.contains(index + offset) else { return }
+    self.index = index + offset
+  }
+
+  private func close() {
+    guard closingPull == nil else { return }
+    withAnimation(reduceMotion ? nil : .smooth(duration: 0.24), completionCriteria: .removed) {
+      // The scroll view springs back after release; keep the header and grid reveal where the drag left them.
+      closingPull = pull.pull
+    } completion: {
+      onClose()
+    }
   }
 
   private func toggleChrome() {
     withAnimation(reduceMotion ? nil : .smooth) { chromeHidden.toggle() }
+  }
+}
+
+private struct LockedViewerFade<Content: View>: View {
+  let pull: ViewerZoom
+  let distance: CGFloat
+  let closingPull: CGFloat?
+  @ViewBuilder let content: Content
+
+  var body: some View {
+    content.opacity(max(0, 1 - (closingPull ?? pull.pull) / distance))
   }
 }
 
@@ -678,7 +788,9 @@ private struct LockedFolderPage: View {
 
   var body: some View {
     ZStack {
-      ZoomableImage(image: image, pixelSize: pixelSize, onTap: onTap, onDismiss: onDismiss, player: player)
+      ZoomableImage(
+        image: image, pixelSize: pixelSize, onTap: onTap, onDismiss: onDismiss, player: player,
+        quarterTurns: session.playback.quarterTurns)
       if isCurrent, session.startingKey == item.mediaKey {
         ViewerLoadingIndicator(isLoading: true)
       } else if image == nil, player == nil {
@@ -721,13 +833,7 @@ private struct LockedFolderPage: View {
         failed = true
       }
     }
-    .onChange(of: isCurrent) { _, current in
-      if !current { session.stopVideo() }
-    }
-    .onDisappear {
-      if isCurrent { session.stopVideo() }
-      image = nil
-    }
+    .onDisappear { image = nil }
   }
 
   /// Any square thumbnail the grid decoded for this item.

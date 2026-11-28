@@ -13,6 +13,7 @@ final class VideoPlayback {
   /// 0 at the start, 1 at the end.
   private(set) var progress: Double = 0
   private(set) var isMuted = false
+  private(set) var quarterTurns = 0
   /// Bumped each time a video starts on its own, so the viewer can tuck its controls away.
   private(set) var autoplayCount = 0
 
@@ -33,6 +34,7 @@ final class VideoPlayback {
     guard newPlayer !== player else { return }
     detach()
     player = newPlayer
+    quarterTurns = 0
     progress = 0
     isBuffering = false
     guard let newPlayer else { return }
@@ -76,6 +78,17 @@ final class VideoPlayback {
       if progress >= 0.999 { player.seek(to: .zero) }
       player.play()
     }
+  }
+
+  func setOrientation(_ quarterTurns: Int) {
+    guard player != nil else { return }
+    self.quarterTurns = quarterTurns
+  }
+
+  func pause() {
+    isScrubbing = false
+    resumesAfterScrub = false
+    player?.pause()
   }
 
   func toggleMuted() {
@@ -141,6 +154,23 @@ struct VideoControls: View {
       }
       .accessibilityLabel(Text(playback.isPlaying ? "Pause" : "Play"))
       VideoProgressBar(playback: playback)
+      Menu {
+        Picker("Playback Orientation", selection: Binding(get: { playback.quarterTurns }, set: playback.setOrientation)) {
+          Text("Original").tag(0)
+          Text("90° Clockwise").tag(1)
+          Text("180°").tag(2)
+          Text("90° Counterclockwise").tag(3)
+        }
+      } label: {
+        Image(systemName: "rotate.right")
+          .font(.body)
+          .frame(width: 36, height: 36)
+          .contentShape(.rect)
+      }
+      .menuIndicator(.hidden)
+      .accessibilityLabel("Playback Orientation")
+      .accessibilityValue(Text("\(playback.quarterTurns * 90)°"))
+      .disabled(playback.player == nil)
       Button {
         playback.toggleMuted()
       } label: {

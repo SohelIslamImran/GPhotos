@@ -361,6 +361,22 @@ public actor RemoteLibraryStore {
     try setState("initial_done", "1", in: try db())
   }
 
+  /// Replay the server's full listing while keeping the existing mirror available.
+  func restartFullSync() throws {
+    try db().run("DELETE FROM state WHERE key IN ('initial_done', 'sync_token', 'resume_token', 'delta_token', 'delta_next')")
+  }
+
+  func restoredSummary(mediaKey: String, dedupKey: String?) throws -> RemoteItemSummary? {
+    let database = try db()
+    let scope = RemoteScope.library
+    var result: RemoteItemSummary?
+    try database.query(
+      "SELECT \(Self.summaryColumns) FROM items WHERE \(scope.whereClause) AND (media_key = ? OR dedup_key = ?) LIMIT 1",
+      [.text(mediaKey), .optional(dedupKey)]
+    ) { result = Self.summary($0) }
+    return result
+  }
+
   /// Forgets everything; the next sync starts from scratch.
   public func reset() throws {
     database = nil

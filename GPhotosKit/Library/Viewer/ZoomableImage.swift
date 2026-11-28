@@ -69,6 +69,7 @@ struct ZoomableImage: View {
   var onSwipeUp: () -> Void = {}
   /// A video drawn over the image once it has a frame, zooming and moving with it.
   var player: AVPlayer?
+  var quarterTurns = 0
   @Environment(\.viewerZoom) private var zoom
   @Environment(\.viewerItemID) private var itemID
   @Environment(\.viewerThumbnailIdentity) private var thumbnailIdentity
@@ -102,9 +103,11 @@ struct ZoomableImage: View {
     let cropped = sharper == nil && previewIsCropped
     let size = AspectFit.orientedSize(
       decoded: videoSize == .zero ? (cropped ? pixelSize : decoded) : videoSize, metadata: pixelSize)
+    let turns = player == nil ? 0 : quarterTurns
     ZoomableImageRepresentable(
-      image: displayed, pixelSize: size, cropped: cropped, liveText: liveText, onZoom: onZoom, onTap: onTap,
-      onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player,
+      image: displayed, pixelSize: PlaybackOrientation.size(size, quarterTurns: turns), cropped: cropped, liveText: liveText,
+      onZoom: onZoom, onTap: onTap,
+      onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player, quarterTurns: turns,
       onPull: zoom.map { zoom in
         { pull, frame in
           zoom.pull = pull
@@ -141,6 +144,26 @@ struct ZoomableImage: View {
   }
 }
 
+enum PlaybackOrientation {
+  static func size(_ size: CGSize, quarterTurns: Int) -> CGSize {
+    quarterTurns.isMultiple(of: 2) ? size : CGSize(width: size.height, height: size.width)
+  }
+
+  static func layout(_ layer: AVPlayerLayer, in bounds: CGRect, quarterTurns: Int) {
+    #if os(macOS)
+      let direction: CGFloat = -1
+    #else
+      let direction: CGFloat = 1
+    #endif
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    layer.bounds = CGRect(origin: .zero, size: size(bounds.size, quarterTurns: quarterTurns))
+    layer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+    layer.setAffineTransform(CGAffineTransform(rotationAngle: direction * CGFloat(quarterTurns) * .pi / 2))
+    CATransaction.commit()
+  }
+}
+
 extension EnvironmentValues {
   @Entry var viewerItemID = ""
   @Entry var viewerThumbnailIdentity = ThumbnailIdentity(id: "")
@@ -163,12 +186,13 @@ extension EnvironmentValues {
     let onDismiss: () -> Void
     let onSwipeUp: () -> Void
     let player: AVPlayer?
+    let quarterTurns: Int
     let onPull: ((CGFloat, CGRect?) -> Void)?
 
     func makeUIView(context: Context) -> ZoomingImageScrollView { ZoomingImageScrollView() }
 
     func updateUIView(_ view: ZoomingImageScrollView, context: Context) {
-      view.setPlayer(player)
+      view.setPlayer(player, quarterTurns: quarterTurns)
       view.onPull = onPull
       view.onZoom = onZoom
       view.onTap = onTap
@@ -181,12 +205,20 @@ extension EnvironmentValues {
 
   /// The video over the still: hidden until it has a frame, so the still shows meanwhile.
   private final class PlayerLayerView: UIView {
-    override static var layerClass: AnyClass { AVPlayerLayer.self }
-    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    let playerLayer = AVPlayerLayer()
+    var quarterTurns = 0 {
+      didSet { if quarterTurns != oldValue { setNeedsLayout() } }
+    }
+
+    override func layoutSubviews() {
+      super.layoutSubviews()
+      PlaybackOrientation.layout(playerLayer, in: bounds, quarterTurns: quarterTurns)
+    }
     private var readyObservation: NSKeyValueObservation?
 
     override init(frame: CGRect) {
       super.init(frame: frame)
+      layer.addSublayer(playerLayer)
       playerLayer.videoGravity = .resizeAspect
       isHidden = true
       readyObservation = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
@@ -202,13 +234,7 @@ extension EnvironmentValues {
     private let imageView = UIImageView()
     private var liveTextEnabled = false
     private var analysisTask: Task<Void, Never>?
-    private lazy var analysisInteraction: ImageAnalysisInteraction = {
-      let interaction = ImageAnalysisInteraction()
-      interaction.preferredInteractionTypes = .automatic
-      imageView.addInteraction(interaction)
-      imageView.isUserInteractionEnabled = true
-      return interaction
-    }()
+    private var analysisInteraction: ImageAnalysisInteraction?
     private var pixelSize: CGSize = .zero
     private var fittedForBounds: CGSize = .zero
     private weak var currentImage: CGImage?
@@ -279,22 +305,32 @@ extension EnvironmentValues {
     private func scheduleAnalysis() {
       analysisTask?.cancel()
       guard liveTextEnabled, LiveTextAnalyzer.isSupported, let image = currentImage else {
-        if LiveTextAnalyzer.isSupported, !liveTextEnabled { analysisInteraction.analysis = nil }
+        if !liveTextEnabled, let analysisInteraction {
+          imageView.removeInteraction(analysisInteraction)
+          self.analysisInteraction = nil
+        }
         return
       }
       analysisTask = Task { [weak self] in
         // Paging past a photo shouldn't analyze it.
         try? await Task.sleep(for: .milliseconds(600))
-        guard !Task.isCancelled, let analysis = await LiveTextAnalyzer.analyze(image), !Task.isCancelled else { return }
-        self?.analysisInteraction.analysis = analysis
-        self?.updateLiveTextInsets()
+        guard !Task.isCancelled, let analysis = await LiveTextAnalyzer.analyze(image), !Task.isCancelled, let self else { return }
+        let interaction = analysisInteraction ?? ImageAnalysisInteraction()
+        if analysisInteraction == nil {
+          interaction.preferredInteractionTypes = .automatic
+          imageView.addInteraction(interaction)
+          imageView.isUserInteractionEnabled = true
+          analysisInteraction = interaction
+        }
+        interaction.analysis = analysis
+        updateLiveTextInsets()
       }
     }
 
     /// Keeps the Live Text button (bottom right of the photo) out from under the header
     /// and toolbar when the photo reaches the screen's edges.
     private func updateLiveTextInsets() {
-      guard liveTextEnabled, LiveTextAnalyzer.isSupported, zoomScale > 0 else { return }
+      guard liveTextEnabled, let analysisInteraction, zoomScale > 0 else { return }
       let onScreen = imageView.frame.offsetBy(dx: -contentOffset.x, dy: -contentOffset.y)
       let top = max(0, Self.chromeInsets.top - onScreen.minY) / zoomScale
       let bottom = max(0, onScreen.maxY - (bounds.height - Self.chromeInsets.bottom)) / zoomScale
@@ -312,14 +348,18 @@ extension EnvironmentValues {
 
     private var videoView: PlayerLayerView?
 
-    func setPlayer(_ player: AVPlayer?) {
-      guard player !== videoView?.playerLayer.player else { return }
+    func setPlayer(_ player: AVPlayer?, quarterTurns: Int) {
+      guard player !== videoView?.playerLayer.player else {
+        videoView?.quarterTurns = quarterTurns
+        return
+      }
       videoView?.removeFromSuperview()
       videoView = nil
       guard let player else { return }
       let view = PlayerLayerView(frame: imageView.bounds)
       view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
       view.isUserInteractionEnabled = false
+      view.quarterTurns = quarterTurns
       view.playerLayer.player = player
       imageView.addSubview(view)
       videoView = view
@@ -552,12 +592,13 @@ extension EnvironmentValues {
     let onDismiss: () -> Void
     let onSwipeUp: () -> Void
     let player: AVPlayer?
+    let quarterTurns: Int
     let onPull: ((CGFloat, CGRect?) -> Void)?
 
     func makeNSView(context: Context) -> ZoomingImageScrollView { ZoomingImageScrollView() }
 
     func updateNSView(_ view: ZoomingImageScrollView, context: Context) {
-      view.setPlayer(player)
+      view.setPlayer(player, quarterTurns: quarterTurns)
       view.onZoom = onZoom
       view.setContent(image: image, pixelSize: pixelSize, cropped: cropped)
       view.setLiveText(liveText && !cropped)
@@ -599,12 +640,21 @@ extension EnvironmentValues {
   /// The video over the still: hidden until it has a frame, so the still shows meanwhile.
   private final class PlayerLayerView: NSView {
     let playerLayer = AVPlayerLayer()
+    var quarterTurns = 0 {
+      didSet { if quarterTurns != oldValue { needsLayout = true } }
+    }
+
+    override func layout() {
+      super.layout()
+      PlaybackOrientation.layout(playerLayer, in: bounds, quarterTurns: quarterTurns)
+    }
+
     private var readyObservation: NSKeyValueObservation?
 
     override init(frame: NSRect) {
       super.init(frame: frame)
       wantsLayer = true
-      layer = playerLayer
+      layer?.addSublayer(playerLayer)
       playerLayer.videoGravity = .resizeAspect
       isHidden = true
       readyObservation = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
@@ -680,13 +730,17 @@ extension EnvironmentValues {
 
     private var videoView: PlayerLayerView?
 
-    func setPlayer(_ player: AVPlayer?) {
-      guard player !== videoView?.playerLayer.player else { return }
+    func setPlayer(_ player: AVPlayer?, quarterTurns: Int) {
+      guard player !== videoView?.playerLayer.player else {
+        videoView?.quarterTurns = quarterTurns
+        return
+      }
       videoView?.removeFromSuperview()
       videoView = nil
       guard let player else { return }
       let view = PlayerLayerView(frame: imageView.bounds)
       view.autoresizingMask = [.width, .height]
+      view.quarterTurns = quarterTurns
       view.playerLayer.player = player
       imageView.addSubview(view)
       videoView = view

@@ -33,7 +33,8 @@ struct FileViewerPage: View {
       isLoading: isLoadingImage, didFail: didFail,
       isBuffering: item.isVideo && (player == nil || (playback.player === player && playback.isBuffering)),
       liveText: isCurrent && !item.isVideo,
-      onZoom: loadDetail, onTap: onTap, onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player
+      onZoom: loadDetail, onTap: onTap, onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player,
+      quarterTurns: isCurrent ? playback.quarterTurns : 0
     )
     .accessibilityElement(children: .contain)
     .accessibilityLabel(Text(item.fileName))

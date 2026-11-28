@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 @MainActor
 @Observable
@@ -45,20 +46,20 @@ final class LockedFolderMove {
     pending = Target(library: library, items: eligible, keepsLocalCopies: keepsLocalCopies, didMove: didMove)
   }
 
-  func move(_ target: Target, canSignIn: Bool = true) {
+  func move(_ target: Target, signedInPage: WebPage? = nil) {
     pending = nil
     guard !isMoving else { return }
     isMoving = true
     Task {
       defer { isMoving = false }
       do {
-        try await target.library.moveToLockedFolder(target.items)
+        try await target.library.moveToLockedFolder(target.items, signedInPage: signedInPage)
         target.didMove()
       } catch is CancellationError {
-      } catch GooglePhotosWebError.signInRequired where canSignIn {
+      } catch GooglePhotosWebError.signInRequired where signedInPage == nil {
         signingIn = target
         showsSignIn = true
-      } catch GooglePhotosWebError.wrongAccount where canSignIn {
+      } catch GooglePhotosWebError.wrongAccount where signedInPage == nil {
         signingIn = target
         showsSignIn = true
       } catch {
@@ -67,16 +68,16 @@ final class LockedFolderMove {
     }
   }
 
-  func signInDismissed(succeeded: Bool) {
+  func signInDismissed(page: WebPage?) {
     let target = signingIn
     signingIn = nil
-    if succeeded, let target { move(target, canSignIn: false) }
+    if let page, let target { move(target, signedInPage: page) }
   }
 }
 
 struct LockedFolderMovePresentation: ViewModifier {
   @Bindable var move: LockedFolderMove
-  @State private var signedIn = false
+  @State private var signedInPage: WebPage?
 
   func body(content: Content) -> some View {
     content
@@ -99,12 +100,12 @@ struct LockedFolderMovePresentation: ViewModifier {
       .sheet(
         isPresented: $move.showsSignIn,
         onDismiss: {
-          move.signInDismissed(succeeded: signedIn)
-          signedIn = false
+          move.signInDismissed(page: signedInPage)
+          signedInPage = nil
         }
       ) {
         if let target = move.signingIn {
-          GooglePhotosWebSheet(library: target.library, mode: .signIn) { signedIn = true }
+          GooglePhotosWebSheet(library: target.library, mode: .signIn) { signedInPage = $0 }
         }
       }
       .alert("Couldn’t Finish Moving", isPresented: Binding(get: { move.error != nil }, set: { if !$0 { move.error = nil } })) {
