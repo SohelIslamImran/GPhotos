@@ -1,13 +1,37 @@
 # GPhotos
 
-GPhotos is an independent, native macOS app for uploading photos and videos to Google Photos. Watch folders, drop files from Finder, and browse your local and cloud media in one library. The native iPhone and iPad companion backs up the Photos library and folders from Files.
+A small, fast, native Mac app that backs up your photos and videos to Google Photos in
+original quality. It's a 6 MB download. Point it at your folders, drop files on it, and
+browse your Mac's and Google's photos in one library.
 
-Both apps use SwiftUI and Liquid Glass and require macOS 27 or iOS 27. They use Google Photos’ unofficial mobile interface for account sign-in, uploads and library sync. Uploads are configured to count toward Google Account storage. GPhotos is unaffiliated with Google.
+GPhotos is written in Swift and SwiftUI. There's no bundled web runtime and nothing to
+install alongside it. It watches folders with FSEvents, draws its grid with one Core
+Animation layer per visible cell, and is tested with 100,000 items in the library.
+Uploads go straight from your Mac to Google, with no server of ours in between.
+
+An iPhone and iPad companion backs up the Photos library and folders from Files. Both
+apps need macOS 27 or iOS 27. They use Google Photos' unofficial mobile interface to
+sign in, upload and sync, and uploads count toward your Google Account storage.
+GPhotos isn't affiliated with Google.
+
+## Why GPhotos
+
+- **Light.** A 6 MB disk image for Apple silicon. One app with a menu bar extra, a share
+  extension and widgets. No helper apps, no bundled browser engine.
+- **Original quality.** Photos, videos, RAW files, bursts and Live Photos upload at full
+  resolution.
+- **Fast on big libraries.** The grid places cells with arithmetic instead of measuring
+  them, so its cost doesn't grow with the library. Thumbnails load only for what's on
+  screen.
+- **Private by default.** Search, people and memories are computed on your device. Your
+  credential stays in the Keychain.
+- **Careful with your files.** Nothing is deleted until Google Photos confirms it has the
+  upload for the account you're using.
 
 ## Screenshots
 
-Screens captured from Debug builds with generated Google library data and simulated
-uploads, without a Google sign-in. See [the capture guide](docs/screenshots/README.md) to
+Captured from Debug builds with a generated Google library and simulated uploads, with
+no Google account signed in. See [the capture guide](docs/screenshots/README.md) to
 reproduce them.
 
 ### Mac
@@ -44,123 +68,112 @@ reproduce them.
 
 ### Library, Collections and search
 
-- **One Library.** Browse device photos, backed-up folder media and Google Photos in
-  Years, Months or All. Matching local and cloud items appear once with backup badges.
-  Pinch to change grid density, filter media, select items and open context menus.
-  Backed-up folders remain visible without Photos access. On iPhone, drag-to-select
-  keeps scrolling while your finger rests near either edge.
-- **Viewer.** Zoom out of the grid cell into full-screen photos and videos, scrub the
-  filmstrip, zoom natively, play Live Photos, and open the floating Info panel to edit
-  captions or inspect capture dates, EXIF camera details, location maps and storage
-  status. Google Photos show a quick uncropped preview first and sharpen in place. Share
-  or drag exports as needed; folder files can be shared, never deleted from the Library.
-- **Collections.** Pinned collections, albums, media types, utilities and an interactive
-  Places map across the merged library (including Google-only items). Device Hidden items
-  and Google's Locked Folder (view only) require authentication. Google scopes include
-  Albums, All Photos, Favorites, Videos, Archive, Trash and Uses Storage, with charged
-  bytes reported by library sync. Not Backed Up and Not Included in Backup open the
-  Library with that filter.
-- **Google Photos.** A local mirror per account resumes interrupted full syncs and
-  follows with delta updates. Browse cloud items, stream videos, save originals,
-  edit captions, favorite, archive, add to albums, move to Trash or restore.
-  Destructive actions ask first and affect only the browsed account. Deleting a
-  backed-up device item also moves its Google copy to Trash; only items already in Trash
-  can be deleted forever (**Delete Forever**).
-- **On-device search and People.** Search metadata, text (OCR), places, dates and Vision
-  labels across device and Google-only photos—matching everyday concepts, plurals, short
-  words, unspaced scripts (CJK/Thai) and Indic marks, with word suggestions ranked by
-  photo count. Explore categories, revisit On This Day and trips, and review similar
-  photos or Google duplicates. **People** fills in progressively during indexing, levels
-  tilted faces, and lets you name, hide or manually merge people. Google-only items are
-  analyzed on this device from a small thumbnail each, fetched on Wi-Fi (or on cellular
-  with Use Cellular Data on), and never cached for indexing.
-- **Siri, Spotlight and Shortcuts.** Every Library item (device, Google Photos and folder
-  files) is in the Spotlight semantic index with what on-device analysis found in it, so
+- **One library.** Device photos, backed-up folders and Google Photos in one timeline,
+  by Years, Months or All. A photo that's both on your device and in Google appears
+  once, with a backup badge. Pinch to change the grid, filter, select, and right-click
+  for actions. Backed-up folders show even without Photos access.
+- **Viewer.** Zoom from the grid into full-screen photos and videos, scrub the
+  filmstrip, and play Live Photos. The floating Info panel shows capture dates, camera
+  details, location and storage status, and lets you edit captions. Google photos show
+  a quick preview first and sharpen in place.
+- **Collections.** Pinned items, albums, media types, utilities and a Places map of the
+  whole library, Google-only photos included. Hidden items and Google's Locked Folder
+  open only after Touch ID, Face ID or your password. Google scopes cover Albums, All
+  Photos, Favorites, Videos, Archive, Trash and Uses Storage.
+- **Google Photos.** Each account gets a local mirror that syncs in full once and then
+  only picks up changes. Stream videos, save originals, edit captions, favorite,
+  archive, add to albums, move to Trash or restore. Every destructive action asks first
+  and touches only the account you're browsing. Delete Forever works only on items
+  already in Trash.
+- **Locked Folder.** Move photos to Google's Locked Folder from the library or the
+  viewer. GPhotos does this through your photos.google.com session, which you sign in
+  to once inside the app, and checks it's the same account first. To move items out,
+  open the Locked Folder in Google Photos without leaving the app. Locked Folder photos are
+  never saved to disk.
+- **On-device search and People.** Search text in photos, places, dates and what Vision
+  recognizes, across device and Google-only photos. Browse categories, On This Day,
+  trips, similar photos and Google duplicates. Name, hide or merge people. Google-only
+  photos are analyzed from a small thumbnail fetched on Wi-Fi, or on cellular if you
+  allow it, and the thumbnail isn't kept.
+- **Siri, Spotlight and Shortcuts.** Every item is in Spotlight's semantic index, so
   Siri can find "photos of Sam at the beach last summer", open them, share them or add
-  them to an album, and knows which photo is on screen. Named people and albums are known
-  to Siri too. Spoken periods ("July 2024", "last month"), videos and favorites narrow
-  results in both Siri and Search. App Shortcuts on iPhone and Mac include **Back Up Now**,
-  **Back Up Files**, **Back Up to Google Photos** (iPhone), **Backup Status**, **Search
-  Library**, **Find Photos** and **Open Album**. All of it stays on the device.
-- **After cleanup.** A small retained thumbnail keeps removed device photos visible
-  in the Library while originals load from Google. Keep Recently Viewed can delay
-  cleanup for photos opened recently.
+  them to an album. Shortcuts include Back Up Now, Back Up Files, Backup Status, Search
+  Library, Find Photos and Open Album, plus Back Up to Google Photos on iPhone.
+  Everything stays on the device.
+- **After cleanup.** Photos removed from the device keep a small thumbnail in the
+  library while the original loads from Google. Keep Recently Viewed holds back photos
+  you opened lately.
 
 ### Backup
-- **Original-quality uploads.** Uploads photos, videos and RAW files
-  at full resolution, using your Google Account storage quota.
-- **iPhone Photos library.** Backs up new photos automatically, including every frame of
-  a burst, the RAW file of RAW+JPEG shots, and Live Photos with their motion. Only items
-  that actually changed trigger work, so it stays light on battery.
-- **Folders and skip rules.** On iPhone, add folders from the Files app (On My iPhone,
-  iCloud Drive, external drives). On Mac, watch any folder; changes are picked up as they
-  happen. Files still being copied are left alone until they settle. Live Photos in
-  folders are paired by Apple's content identifier, so renamed files still pair. Exclude
-  specific names or wildcards (`CapCut`, `*.tmp`) or chosen folder paths on both
-  platforms; queued items matching a new rule are dropped automatically.
-- **Don't Back Up.** Choose iPhone albums whose photos are skipped.
-- **Uploads you choose.** Pick photos or files with **+** (iPhone) or drop them on the
-  window, the Dock icon, or use **Share › GPhotos** (both platforms).
-- **Albums.** Mirror your Photos albums (iPhone) or create albums named after folders.
-  Albums past Google's 20,000-item limit continue in "Name (2)".
-- **More accounts.** One primary account backs up as usual. Every other account you add
-  gets its own copy, uploaded only at idle time: while the iPhone is charging, or while
-  the Mac is plugged in and you're away. Secondary copies never hold open a lingering
-  Live Activity, and each account has its own sign-in session.
-- **Reliable.** Uploads resume after network blips, retry with backoff, keep working on
-  battery and in Low Data Mode, and continue in the background on iPhone. On iOS 27,
-  the Photos upload extension can run even after the app is closed, on iOS's schedule.
-  Network recovery resumes pending work; Stop cancels an owed resume. On Mac, turning
-  Auto-Sync off prevents stopped work from restarting at launch.
+
+- **Watched folders on Mac.** Watch any folder and changes are picked up as they happen.
+  Files still being copied are left alone until they settle. Live Photos in folders pair
+  by Apple's content identifier, so renamed files still pair.
+- **iPhone Photos library.** New photos back up on their own, including every burst
+  frame, the RAW half of RAW+JPEG shots, and Live Photo motion. Only real changes cause
+  work, which keeps battery use low.
+- **Skip rules.** Exclude names or wildcards (`CapCut`, `*.tmp`) or whole folders. Items
+  already queued that match a new rule are dropped. On iPhone, choose albums to skip.
+- **Uploads you pick.** Drop files on the window or the Dock icon, use Share › GPhotos,
+  or tap + on iPhone.
+- **Albums.** Mirror your Photos albums (iPhone) or name albums after folders. Albums
+  past Google's 20,000-item limit continue in "Name (2)".
+- **More accounts.** The primary account backs up as usual. Each extra account gets its
+  own copy, uploaded only while your iPhone charges or your Mac is plugged in and idle.
+- **Reliable.** Uploads resume after network drops, retry with backoff, and keep going
+  on battery and in Low Data Mode. On iOS 27 the photo upload extension can run after
+  the app is closed, on iOS's schedule.
 
 ### Free up space
+
 - **Delete After Backup.** After a delay you choose, remove items that are verifiably in
-  Google Photos. Choose **Only When Low on Space** to wait until less than 5 GB is free,
-  then remove the oldest items first, only as much as needed.
-- **Folder files** are removed automatically and silently after the delay.
-- **iPhone Photos library items** need your confirmation: iOS always asks before an app
-  deletes photos, so GPhotos notifies you when items are ready and asks once.
-  Deleted photos go to Recently Deleted for 30 days.
-- **Protected Items.** Favorites, chosen albums and chosen folders are never removed.
-- **Safety first.** Nothing is removed unless its upload to your current account is
-  verified and freshly confirmed with Google Photos, including Live Photo motion.
-  Hash matches alone do not prove original quality; removing items found in Google
-  requires the separate Remove Items Found in Google Photos setting. Edited items, Live Photos or RAW files that aren't fully uploaded, incomplete
-  bursts, shared iCloud items and protected items are always kept. File contents are
-  re-checked against the upload before anything is deleted.
+  Google Photos. With Only When Low on Space, GPhotos waits until less than 5 GB is free
+  and removes the oldest items first, only as many as it needs.
+- **Folder files** are removed quietly once the delay passes.
+- **iPhone Photos items** need one confirmation, because iOS always asks before an app
+  deletes photos. They stay in Recently Deleted for 30 days.
+- **Protected items.** Favorites, chosen albums and chosen folders are never removed.
+- **Checked twice.** An item is removed only after its upload to your current account is
+  verified and Google Photos confirms it again, Live Photo motion included. A hash match
+  alone doesn't prove original quality, so items found that way need their own setting.
+  Edited items, partly uploaded Live Photos or RAW files, incomplete bursts and shared
+  iCloud items are always kept. File contents are compared with the upload before
+  anything is deleted.
 
 ### Stay informed
-- **Notifications** when a backup finishes, items fail (with **Retry**), or an account
-  needs you to sign in again. Only while the app is in the background, one per batch.
-- **Live Activity** on the iPhone Lock Screen and Dynamic Island while backing up.
-- **Widgets** on the iPhone Home Screen and Lock Screen and the Mac desktop: Memories
-  (On This Day, trips, or your best photos), People (someone you choose, framed on their
-  face) and Backup status. The app picks the photos from the whole library, Google-only
-  items included, and saves small copies in the App Group for the widgets.
-- **Thumbnails** in Activity, read from Photos and the system thumbnail cache; nothing
-  extra is stored.
+
+- **Notifications** when a backup finishes, items fail (with Retry), or an account needs
+  you to sign in again. One per batch, and only while the app is in the background.
+- **Menu bar** progress on Mac, and a Live Activity on the iPhone Lock Screen and Dynamic
+  Island.
+- **Widgets** on the Mac desktop and the iPhone Home and Lock Screens: Memories, People
+  and Backup status.
 
 ### Apps
 
-- **iPhone:** Library, Collections, Search and Backup tabs; Activity, Folders with skip
-  rules, Don't Back Up, Protected Items, accounts, share extension, Live Activity,
-  widgets, and App Shortcuts. The last screen and a Library snapshot speed up reopening.
-- **Mac:** Native macOS sidebar with a persistent search field, Library, Collections,
-  Search, collapsible Pinned, Albums and Google Photos sections, plus Backup, a sortable
-  Activity table, Folders with skip rules, and Settings; menu bar popover with live
-  progress, notifications, drag and drop, keyboard shortcuts, desktop widgets, App
-  Shortcuts, and Launch at Login. Backup recovery and failure handling share the iPhone's
-  engine.
+- **Mac:** a sidebar with search, Library, Collections, Pinned, Albums and Google Photos
+  sections, Backup, a sortable Activity table, Folders and Settings. Also a menu bar
+  popover, drag and drop, keyboard shortcuts, desktop widgets, Shortcuts and Launch at
+  Login through the system's login items.
+- **iPhone:** Library, Collections, Search and Backup tabs, plus Activity, Folders, Don't
+  Back Up, Protected Items, accounts, a share extension, a Live Activity, widgets and
+  Shortcuts. The Library draws its last screen the moment the app opens.
 
 ## Download and install
 
 ### Mac
 
-Download the Mac DMG from [GitHub Releases](https://github.com/SohelIslamImran/GPhotos/releases). Open it, drag GPhotos to Applications, and open the app from there. The disk image and app are signed with Developer ID, and Apple notarizes the disk image. The release requires an Apple silicon Mac.
+Download the DMG (about 6 MB) from
+[GitHub Releases](https://github.com/SohelIslamImran/GPhotos/releases), drag GPhotos to
+Applications, and open it from there. The app and disk image are signed with Developer
+ID, and Apple notarizes the disk image. It needs an Apple silicon Mac.
 
 ### iPhone and iPad
 
-The [GitHub release](https://github.com/SohelIslamImran/GPhotos/releases) includes an unsigned iOS IPA for self-signing. Use your own Apple signing identity and profiles for the app and its extensions. Features that share data across targets need a common App Group. You can also build and install from source in Xcode with your Apple Developer team. The release workflow also supports uploading an iOS build to App Store Connect for TestFlight when the maintainer enables it and configures signing. Public beta access requires Apple's review and a TestFlight invitation.
+Each release includes an unsigned IPA for self-signing. Sign the app and its extensions
+with your own identity and profiles, and give them one shared App Group. You can also
+build and install from source in Xcode with your Apple Developer team. TestFlight
+builds are possible when the maintainer turns them on, after Apple's review.
 
 ## Build from source
 
@@ -200,8 +213,7 @@ GitHub Actions tests both platforms. When release signing is configured, each me
 ## Architecture
 
 See [the library implementation and roadmap](docs/library-client-plan.md) for current
-capabilities, mobile protocol and remaining work.
-
+capabilities, the mobile protocol and remaining work.
 
 | Module | Responsibility |
 |---|---|
@@ -229,16 +241,15 @@ capabilities, mobile protocol and remaining work.
 
 ## Sign-in
 
-Open the sign-in sheet and either **Sign in with Google** in the embedded page or
-**Paste a Token**: sign in at Google in a browser, copy the `oauth_token` cookie and
-paste it. The credential is exchanged for a Google Photos token and stored only in the
-device's Keychain. A raw Android credential can also be pasted, including token-bound
-ones (`token_binding_alias`).
+Open the sign-in sheet and choose **Sign in with Google**, or **Paste a Token**: sign in
+to Google in a browser, copy the `oauth_token` cookie and paste it. GPhotos exchanges it
+for a Google Photos token and stores that only in the device's Keychain. A raw Android
+credential works too, including token-bound ones (`token_binding_alias`).
 
-Add more accounts from the account sheet (iPhone) or **Settings › Accounts** (Mac). Make
-any of them primary, turn **Keep a Copy** off, or remove one; removing an account never
-deletes anything from Google Photos. While any account keeps a copy, nothing is removed
-from your devices until that copy is uploaded too.
+Add more accounts from the account sheet (iPhone) or Settings › Accounts (Mac). You can
+make any account primary, turn Keep a Copy off, or remove it. Removing an account never
+deletes anything from Google Photos. While any account keeps a copy, nothing leaves your
+devices until that copy is uploaded too.
 
 ## Third-party notices
 
