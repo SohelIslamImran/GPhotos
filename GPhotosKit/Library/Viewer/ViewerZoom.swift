@@ -265,7 +265,7 @@ private struct PhotoViewerPresentation: ViewModifier {
 }
 
 #if os(iOS)
-  private struct ViewerPresentationKey: Equatable {
+  struct ViewerPresentationKey: Equatable {
     let source: ObjectIdentifier
     let zoom: ObjectIdentifier
     let reduceMotion: Bool
@@ -273,8 +273,9 @@ private struct PhotoViewerPresentation: ViewModifier {
 
   /// Presents `content` over the whole screen without an animation, keeping what's below
   /// on screen (a full-screen cover takes it away), so the viewer can fade in over it.
-  private struct OverFullScreen<Content: View>: UIViewControllerRepresentable {
+  struct OverFullScreen<Content: View>: UIViewControllerRepresentable {
     let key: ViewerPresentationKey?
+    var onDismiss: () -> Void = {}
     @ViewBuilder let content: () -> Content
 
     final class Coordinator {
@@ -302,7 +303,7 @@ private struct PhotoViewerPresentation: ViewModifier {
         }
       } else if let presented = coordinator.presented {
         coordinator.presented = nil
-        presented.dismiss(animated: false)
+        presented.dismiss(animated: false, completion: onDismiss)
       }
     }
 

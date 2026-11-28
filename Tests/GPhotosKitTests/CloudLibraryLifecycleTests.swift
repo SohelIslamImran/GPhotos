@@ -439,6 +439,27 @@ struct CloudLibraryLifecycleTests {
     #expect(controls.player == nil)
   }
 
+  @Test func moveOutWaitsForAnUnlockedDeltaBeforePublishingTheItem() async throws {
+    let email = "\(UUID())@example.com"
+    defer { LockedItems.forget(accountEmail: email) }
+    let store = makeStore(email: email)
+    let key = "moved-out"
+    try await store.apply(try update(Page.page(items: [.init(key: key, locked: true)])), syncToken: "S1")
+    try await store.markInitialSyncDone()
+    let fetcher = CloudLibrarySyncTests.FakeFetcher()
+    await fetcher.set(states: [
+      "S1": Page.page(sync: "S2"),
+      "S2": Page.page(sync: "S3", items: [.init(key: key)]),
+    ])
+    let library = makeLibrary(store: store, email: email, fetcher: fetcher)
+    #expect(try await store.summaries(.library).isEmpty)
+    #expect(await library.reconcileLockedFolder(mediaKey: key))
+    #expect(try await store.summaries(.library).map(\.mediaKey) == [key])
+    #expect(try await store.lockedSummaries().isEmpty)
+    #expect(await fetcher.calls == ["state:S1", "state:S2"])
+    await library.retire()
+  }
+
   @Test func playbackRotationRefitsWithoutReplacingThePlayer() {
     let controls = VideoPlayback()
     let player = AVPlayer()

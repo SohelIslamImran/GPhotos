@@ -1,6 +1,7 @@
 import AVFoundation
 import LocalAuthentication
 import SwiftUI
+import WebKit
 
 /// The account's Google Photos Locked Folder behind Face ID, Touch ID or the
 /// device passcode as Hidden is. It locks again when the app goes to the background, the
@@ -18,6 +19,10 @@ struct LockedFolderView: View {
   @State private var promptedOnOpen = false
   @State private var showsWebManagement = false
   @State private var moveOutMediaKey: String?
+  @State private var refreshAfterWebManagement = true
+  @State private var browserRefresh: (library: CloudLibrary, mediaKey: String?)?
+  @State private var viewerTransition = ViewerZoom()
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.scenePhase) private var scenePhase
 
   private var session: LockedFolderSession? { access.session }
@@ -34,7 +39,7 @@ struct LockedFolderView: View {
     }
     .navigationTitle("Locked Folder")
     .toolbar {
-      if session != nil, opened == nil, library.supportsLockedFolderWeb {
+      if session != nil, library.supportsLockedFolderWeb {
         ToolbarItem {
           Button("Move Out of Locked Folder", systemImage: "lock.open") { openWebManagement(nil) }
         }
@@ -44,31 +49,47 @@ struct LockedFolderView: View {
       isPresented: $showsWebManagement,
       onDismiss: {
         moveOutMediaKey = nil
-        Task {
-          await library.waitForSync()
-          library.refresh(force: true)
+        if refreshAfterWebManagement, browserRefresh == nil {
+          Task { await library.reconcileLockedFolder() }
         }
       }
     ) {
-      GooglePhotosWebSheet(library: library, mode: .manage, moveOutMediaKey: moveOutMediaKey) { _ in }
-    }
-    .overlay {
-      if let session, let opened {
-        LockedFolderViewer(session: session, index: opened, onMoveOut: library.supportsLockedFolderWeb ? openWebManagement : nil) {
-          self.opened = nil
-        }
+      if let session {
+        GooglePhotosWebSheet(
+          library: library, mode: .manage, moveOutMediaKey: moveOutMediaKey, lockedSession: session,
+          onMoveOutConfirmed: { refreshAfterWebManagement = false },
+          onOpenBrowser: { browserRefresh = (library, moveOutMediaKey) }
+        ) { _ in }
       }
     }
+    #if os(iOS)
+      .background {
+        OverFullScreen(
+          key: viewerKey,
+          onDismiss: {
+            if moveOutMediaKey != nil, session != nil { showsWebManagement = true }
+          }
+        ) {
+          viewer
+        }
+      }
+    #else
+      .overlay { viewer }
+    #endif
     .overlay {
       if session != nil, covers { cover }
     }
-    #if os(iOS)
-      .toolbar(opened != nil ? .hidden : .automatic, for: .navigationBar, .tabBar)
-    #endif
     .onChange(of: scenePhase) { _, phase in
       if phase == .background { lock() }
+      if phase == .active, let pending = browserRefresh {
+        browserRefresh = nil
+        if pending.library === library {
+          Task { await library.reconcileLockedFolder(mediaKey: pending.mediaKey) }
+        }
+      }
       #if os(iOS)
         // Covered (the app switcher, Control Center), nothing plays on behind it.
+        session?.isCovered = phase != .active
         if phase != .active { session?.pauseVideo() }
       #endif
     }
@@ -99,6 +120,23 @@ struct LockedFolderView: View {
       }
     #endif
     .onDisappear { lock() }
+  }
+
+  #if os(iOS)
+    private var viewerKey: ViewerPresentationKey? {
+      guard opened != nil, let session else { return nil }
+      return ViewerPresentationKey(
+        source: ObjectIdentifier(session), zoom: ObjectIdentifier(viewerTransition), reduceMotion: reduceMotion)
+    }
+  #endif
+
+  @ViewBuilder private var viewer: some View {
+    if let session, let opened {
+      LockedFolderViewer(
+        session: session, index: opened, pull: viewerTransition,
+        onMoveOut: library.supportsLockedFolderWeb ? openWebManagement : nil
+      ) { self.opened = nil }
+    }
   }
 
   /// In the app switcher (iPhone), the screen shows a cover instead of the photos.
@@ -142,7 +180,14 @@ struct LockedFolderView: View {
   private func openWebManagement(_ mediaKey: String?) {
     guard session != nil else { return }
     moveOutMediaKey = mediaKey
+    refreshAfterWebManagement = true
     session?.stopVideo()
+    #if os(iOS)
+      if opened != nil {
+        opened = nil
+        return
+      }
+    #endif
     opened = nil
     showsWebManagement = true
   }
@@ -222,6 +267,7 @@ final class LockedFolderSession {
   private(set) var isLoaded = false
   private(set) var loadFailed = false
   private(set) var isClosed = false
+  var isCovered = false
   /// The video playing, or paused, and the item it belongs to.
   private(set) var player: AVPlayer?
   private(set) var playingKey: String?
@@ -230,6 +276,7 @@ final class LockedFolderSession {
   /// A photo is open: the list stays as it is until it's closed.
   @ObservationIgnored var isHeld = false
   let playback = VideoPlayback()
+  @ObservationIgnored var reauthenticatedPage: WebPage?
   /// Images that came back, and requests Google refused or that failed.
   private(set) var loadedImages = 0
   private(set) var failedImages = 0
@@ -355,6 +402,8 @@ final class LockedFolderSession {
   func close() {
     isClosed = true
     load?.cancel()
+    reauthenticatedPage?.stopLoading()
+    reauthenticatedPage = nil
     stopVideo()
     images.removeAllObjects()
     items = []
@@ -526,15 +575,17 @@ struct LockedFolderViewer: View {
   @State private var index: Int?
   @State private var chromeHidden = false
   @State private var moveOutKey: String?
-  @State private var pull = ViewerZoom()
+  let pull: ViewerZoom
+  @State private var closingPull: CGFloat?
   #if os(macOS)
     @FocusState private var isFocused: Bool
   #endif
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
 
-  init(session: LockedFolderSession, index: Int, onMoveOut: ((String) -> Void)?, onClose: @escaping () -> Void) {
+  init(session: LockedFolderSession, index: Int, pull: ViewerZoom, onMoveOut: ((String) -> Void)?, onClose: @escaping () -> Void) {
     self.session = session
+    self.pull = pull
     self.onMoveOut = onMoveOut
     self.onClose = onClose
     _index = State(initialValue: index)
@@ -553,7 +604,7 @@ struct LockedFolderViewer: View {
       .environment(\.viewerZoom, pull)
     }
     .background {
-      LockedViewerFade(pull: pull, distance: 260) {
+      LockedViewerFade(pull: pull, distance: 260, closingPull: closingPull) {
         Rectangle().fill(chromeHidden ? AnyShapeStyle(.black) : AnyShapeStyle(.background))
       }
     }
@@ -562,12 +613,12 @@ struct LockedFolderViewer: View {
     #endif
     .overlay(alignment: .top) {
       if !chromeHidden {
-        LockedViewerFade(pull: pull, distance: 40) { header }
+        LockedViewerFade(pull: pull, distance: 40, closingPull: closingPull) { header }
       }
     }
     .overlay(alignment: .bottom) {
       if !chromeHidden, session.player != nil {
-        LockedViewerFade(pull: pull, distance: 40) {
+        LockedViewerFade(pull: pull, distance: 40, closingPull: closingPull) {
           VideoControls(playback: session.playback)
             .frame(maxWidth: 520)
             .padding(.horizontal, 26)
@@ -578,6 +629,17 @@ struct LockedFolderViewer: View {
       }
     }
     .environment(\.colorScheme, chromeHidden ? .dark : colorScheme)
+    .opacity(closingPull == nil ? 1 : 0)
+    .allowsHitTesting(closingPull == nil)
+    #if os(iOS)
+      .accessibilityHidden(session.isCovered || session.isClosed)
+      .overlay {
+        if session.isCovered || session.isClosed {
+          Rectangle().fill(.background).ignoresSafeArea()
+        }
+      }
+    #endif
+    .onAppear { pull.pull = 0 }
     #if os(macOS)
       .focusable()
       .focusEffectDisabled()
@@ -616,7 +678,7 @@ struct LockedFolderViewer: View {
     if session.items.indices.contains(offset) {
       let item = session.items[offset]
       LockedFolderPage(
-        session: session, item: item, isCurrent: offset == index, size: size, onTap: toggleChrome, onDismiss: onClose
+        session: session, item: item, isCurrent: offset == index, size: size, onTap: toggleChrome, onDismiss: close
       )
       #if os(macOS)
         .padding(.top, chromeHidden ? 0 : 60)
@@ -628,7 +690,7 @@ struct LockedFolderViewer: View {
 
   private var header: some View {
     HStack {
-      headerButton("chevron.backward", label: "Back", action: onClose)
+      headerButton("chevron.backward", label: "Back", action: close)
         .keyboardShortcut(.cancelAction)
       Spacer()
       if let index, session.items.indices.contains(index) {
@@ -670,6 +732,16 @@ struct LockedFolderViewer: View {
     self.index = index + offset
   }
 
+  private func close() {
+    guard closingPull == nil else { return }
+    withAnimation(reduceMotion ? nil : .smooth(duration: 0.24), completionCriteria: .removed) {
+      // The scroll view springs back after release; keep the header and grid reveal where the drag left them.
+      closingPull = pull.pull
+    } completion: {
+      onClose()
+    }
+  }
+
   private func toggleChrome() {
     withAnimation(reduceMotion ? nil : .smooth) { chromeHidden.toggle() }
   }
@@ -678,10 +750,11 @@ struct LockedFolderViewer: View {
 private struct LockedViewerFade<Content: View>: View {
   let pull: ViewerZoom
   let distance: CGFloat
+  let closingPull: CGFloat?
   @ViewBuilder let content: Content
 
   var body: some View {
-    content.opacity(max(0, 1 - pull.pull / distance))
+    content.opacity(max(0, 1 - (closingPull ?? pull.pull) / distance))
   }
 }
 

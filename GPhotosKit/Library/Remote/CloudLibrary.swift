@@ -535,6 +535,31 @@ public final class CloudLibrary {
     }
   }
 
+  /// A move can reach the web app before it appears in the mobile API delta.
+  @discardableResult
+  func reconcileLockedFolder(mediaKey: String? = nil) async -> Bool {
+    for delay in [0, 1, 2, 4] {
+      do {
+        if delay > 0 { try await Task.sleep(for: .seconds(delay)) }
+        await waitForSync()
+        try Task.checkCancellation()
+        guard !isRetired else { return false }
+        refresh(force: true)
+        await waitForSync()
+        guard let mediaKey else { return true }
+        if try await store.summary(mediaKey: mediaKey) != nil,
+          !LockedItems.contains(mediaKey, accountEmail: accountEmail)
+        {
+          return true
+        }
+        if case .failed = status { return false }
+      } catch {
+        return false
+      }
+    }
+    return false
+  }
+
   nonisolated static func lockableItems(_ items: [RemoteItemSummary], excluding locked: Set<String>) -> [RemoteItemSummary] {
     var seen = locked
     return items.filter { !$0.dedupKey.isEmpty && $0.trashedAt == nil && seen.insert($0.mediaKey).inserted }
