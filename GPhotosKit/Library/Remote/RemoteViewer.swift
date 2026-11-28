@@ -67,7 +67,8 @@ struct RemoteViewerPage: View {
           isLoading: isLoadingImage || (!resolvedLocalCopy && item.kind != .video), didFail: didFail,
           isBuffering: item.kind == .video && (player == nil || (playback.player === player && playback.isBuffering)),
           liveText: isCurrent && item.kind != .video, onZoom: loadDetail, onTap: onTap,
-          onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player
+          onDismiss: onDismiss, onSwipeUp: onSwipeUp, player: player,
+          quarterTurns: isCurrent ? playback.quarterTurns : 0
         )
       }
       if videoFailed, isCurrent, !blocked {

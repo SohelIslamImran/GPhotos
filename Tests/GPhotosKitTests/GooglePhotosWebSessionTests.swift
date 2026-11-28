@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import WebKit
 
 @testable import GPhotosKit
 
@@ -31,6 +32,26 @@ struct GooglePhotosWebSessionTests {
     #expect(throws: GooglePhotosWebError.unavailable) {
       try LockedFolderWebRequest(keys: ["k"], path: "//evil.com/", sourcePath: "/", sid: "s", build: "b", token: "t")
     }
+  }
+
+  @Test func signInStaysOnGoogleHosts() {
+    for host in [
+      "accounts.google.com", "photos.google.com", "google.com", "accounts.youtube.com", "www.google.com.my",
+      "www.google.co.uk", "google.de",
+    ] {
+      #expect(GooglePhotosWebSession.isGoogleSignInHost(host), "\(host)")
+    }
+    for host in [
+      "google.abc.io", "google.com.evil.io", "evilgoogle.com", "google.com.evil", "youtube.com", "www.youtube.com",
+      "accounts.google.com.attacker.net", "google",
+    ] {
+      #expect(!GooglePhotosWebSession.isGoogleSignInHost(host), "\(host)")
+    }
+  }
+
+  @Test func identifiesAsSafari() {
+    #expect(GooglePhotosWebSession.safariApplicationName.hasPrefix("Version/"))
+    #expect(GooglePhotosWebSession.safariApplicationName.contains("Safari/"))
   }
 
   @Test func acceptsOnlyTheMovesNonNullPayload() throws {
@@ -77,6 +98,94 @@ struct GooglePhotosWebSessionTests {
     let id = GooglePhotosWebSession.identifier(for: "Person@example.com")
     #expect(id == GooglePhotosWebSession.identifier(for: "person@EXAMPLE.COM"))
     #expect(id != GooglePhotosWebSession.identifier(for: "different@example.com"))
+  }
+
+  @Test @MainActor func waitsForPhotosAccountDataAndRequiresAMatch() async throws {
+    let session = GooglePhotosWebSession(accountEmail: "person@example.com")
+    let page = session.makePage(store: .nonPersistent())
+    let request = URLRequest(url: GooglePhotosWebSession.libraryURL)
+    let html = """
+      <script>
+        let reads = 0;
+        Object.defineProperty(window, 'WIZ_global_data', {
+          get() { if (++reads > 1) return { SNlM0e: 'test', oPEP7c: 'Person@example.com' }; }
+        });
+      </script>
+      """
+    for try await event in page.load(simulatedRequest: request, responseHTML: html) {
+      if event == .finished { break }
+    }
+    try await session.verifyAccount(on: page, waitingUpTo: .seconds(2))
+    let other = GooglePhotosWebSession(accountEmail: "different@example.com")
+    await #expect(throws: GooglePhotosWebError.wrongAccount) {
+      try await other.verifyAccount(on: page)
+    }
+  }
+
+  @Test @MainActor func verifiedCookiesAreAvailableToTheNextSession() async throws {
+    let email = "\(UUID())@example.test"
+    let session = GooglePhotosWebSession(accountEmail: email)
+    let store = WKWebsiteDataStore.nonPersistent()
+    let cookie = try #require(
+      HTTPCookie(properties: [
+        .name: "SessionFixture", .value: "fixture", .domain: "photos.google.com", .path: "/", .discard: "TRUE",
+      ]))
+    await store.httpCookieStore.setCookie(cookie)
+    let page = session.makePage(store: store)
+    let request = URLRequest(url: GooglePhotosWebSession.libraryURL)
+    let html = "<script>window.WIZ_global_data = { SNlM0e: 'test', oPEP7c: '\(email)' };</script>"
+    for try await event in page.load(simulatedRequest: request, responseHTML: html) {
+      if event == .finished { break }
+    }
+    do {
+      try await session.saveSignIn(from: store, page: page)
+      let next = try await GooglePhotosWebSession(accountEmail: email).makeSignedInDataStore()
+      #expect(!next.isPersistent)
+      let restored = await next.httpCookieStore.allCookies()
+      #expect(restored.contains { $0.name == cookie.name && $0.value == cookie.value && $0.isSessionOnly })
+    } catch {
+      await GooglePhotosWebSession.deleteWebData(forAccountEmail: email)
+      throw error
+    }
+    await GooglePhotosWebSession.deleteWebData(forAccountEmail: email)
+    await #expect(throws: GooglePhotosWebError.signInRequired) {
+      try await session.makeSignedInDataStore()
+    }
+  }
+
+  @Test @MainActor func moveOutUsesTheSelectedKeyFromTheReauthenticatedFolder() async throws {
+    let session = GooglePhotosWebSession(accountEmail: "locked@example.test")
+    let page = session.makePage(store: .nonPersistent())
+    let html = #"""
+      <script>
+        window.WIZ_global_data = {
+          SNlM0e: "token", oPEP7c: "locked@example.test", eptZe: "/_/PhotosUi/",
+          FdrFJe: "session", cfb2h: "build", Dbw5Ud: "reauth+token"
+        };
+        const calls = [];
+        window.fetch = async (url, options) => {
+          const query = new URL(url).searchParams;
+          const rpc = query.get("rpcids");
+          const payload = JSON.parse(new URLSearchParams(options.body).get("f.req"))[0][0];
+          if (query.get("source-path") !== "/lockedfolder" || query.get("rapt") !== "reauth+token" ||
+              payload[0] !== rpc || options.cache !== "no-store") throw Error("wrong request");
+          calls.push([rpc, JSON.parse(payload[1])]);
+          const results = [
+            ["next", [["other", null, null, "other-key"]]],
+            [null, [["selected", null, null, "selected-key"]]],
+            []
+          ];
+          return new Response(JSON.stringify([["wrb.fr", rpc, JSON.stringify(results[calls.length - 1])]]));
+        };
+      </script>
+      """#
+    let request = URLRequest(url: GooglePhotosWebSession.lockedFolderURL)
+    for try await event in page.load(simulatedRequest: request, responseHTML: html) {
+      if event == .finished { break }
+    }
+    #expect(try await session.moveOutOfLockedFolder(mediaKey: "selected", on: page))
+    let calls = try await page.callJavaScript("return JSON.stringify(calls);", contentWorld: .page) as? String
+    #expect(calls == #"[["nMFwOc",[null]],["nMFwOc",["next"]],["Pp2Xxe",[["selected-key"]]]]"#)
   }
 
   private func item(_ key: String, dedupKey: String = "dedup", trashedAt: Date? = nil) -> RemoteItemSummary {

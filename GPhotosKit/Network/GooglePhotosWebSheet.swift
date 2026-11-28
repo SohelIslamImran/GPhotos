@@ -8,7 +8,8 @@ struct GooglePhotosWebSheet: View {
 
   let library: CloudLibrary
   let mode: Mode
-  let onSignIn: () -> Void
+  var moveOutMediaKey: String?
+  let onSignIn: (WebPage) -> Void
   @State private var page: WebPage?
   @State private var needsSignIn = false
   @State private var showsPage = false
@@ -24,6 +25,12 @@ struct GooglePhotosWebSheet: View {
       VStack(spacing: 0) {
         if isSigningIn {
           Text("Sign in to Google Photos on the web to use your Locked Folder.")
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+        } else if mode == .manage, showsPage {
+          Text("Select the items in Google Photos and choose Move.")
             .font(.subheadline)
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -91,7 +98,9 @@ struct GooglePhotosWebSheet: View {
         }
       try Task.checkCancellation()
       page = webPage
-      defer { webPage.stopLoading() }
+      var handedOff = false
+      defer { if !handedOff { webPage.stopLoading() } }
+      var pendingMove = moveOutMediaKey
       var navigations = webPage.navigations
       _ = webPage.load(signingIn ? session.signInURL : GooglePhotosWebSession.lockedFolderURL)
       while true {
@@ -111,7 +120,8 @@ struct GooglePhotosWebSheet: View {
                 try await library.saveLockedFolderSignIn(from: store, page: webPage)
                 guard !Task.isCancelled, !library.isRetired else { return }
                 if mode == .signIn {
-                  onSignIn()
+                  handedOff = true
+                  onSignIn(webPage)
                   dismiss()
                 } else {
                   needsSignIn = false
@@ -119,7 +129,21 @@ struct GooglePhotosWebSheet: View {
                 }
                 return
               }
-              try await session.verifyAccount(on: webPage)
+              try await session.verifyAccount(on: webPage, waitingUpTo: .seconds(8))
+              if let key = pendingMove {
+                do {
+                  if try await library.moveOutOfLockedFolder(mediaKey: key, on: webPage) {
+                    dismiss()
+                    return
+                  }
+                } catch is CancellationError {
+                  return
+                } catch {
+                  // Google Photos remains available for moving the item directly.
+                  pendingMove = nil
+                  try await session.verifyAccount(on: webPage)
+                }
+              }
               showsPage = true
             default: break
             }

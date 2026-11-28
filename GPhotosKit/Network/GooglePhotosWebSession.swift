@@ -24,6 +24,8 @@ enum GooglePhotosWebError: LocalizedError, Equatable {
 
 struct LockedFolderWebRequest {
   static let rpcID = "StLnCe"
+  static let listRPC = "nMFwOc"
+  static let moveOutRPC = "Pp2Xxe"
   static let batchSize = 100
   static let path = "/_/PhotosUi/"
   private static let componentCharacters = CharacterSet(
@@ -41,18 +43,25 @@ struct LockedFolderWebRequest {
   }
 
   init(keys: [String], path: String = Self.path, sourcePath: String, sid: String, build: String, token: String) throws {
+    try self.init(rpc: Self.rpcID, payload: [keys, []], path: path, sourcePath: sourcePath, sid: sid, build: build, token: token)
+  }
+
+  init(rpc: String, payload: [Any], path: String, sourcePath: String, sid: String, build: String, token: String, rapt: String? = nil) throws
+  {
     guard Self.isValidPath(path) else { throw GooglePhotosWebError.unavailable }
     func encode(_ value: String) -> String {
       value.addingPercentEncoding(withAllowedCharacters: Self.componentCharacters) ?? ""
     }
 
-    let query = [
-      ("rpcids", Self.rpcID), ("source-path", sourcePath), ("f.sid", sid), ("bl", build), ("pageId", "none"), ("rt", "c"),
-    ].map { "\($0.0)=\(encode($0.1))" }.joined(separator: "&")
+    var parameters = [
+      ("rpcids", rpc), ("source-path", sourcePath), ("f.sid", sid), ("bl", build), ("pageId", "none"), ("rt", "c"),
+    ]
+    if let rapt { parameters.append(("rapt", rapt)) }
+    let query = parameters.map { "\($0.0)=\(encode($0.1))" }.joined(separator: "&")
     url = URL(string: "https://photos.google.com\(path)data/batchexecute?\(query)")!
     let options: JSONSerialization.WritingOptions = [.withoutEscapingSlashes]
-    let data = try JSONSerialization.data(withJSONObject: [keys, []], options: options)
-    let envelope = [[[Self.rpcID, String(decoding: data, as: UTF8.self), NSNull(), "generic"] as [Any]]]
+    let data = try JSONSerialization.data(withJSONObject: payload, options: options)
+    let envelope = [[[rpc, String(decoding: data, as: UTF8.self), NSNull(), "generic"] as [Any]]]
     let wrapped = try JSONSerialization.data(withJSONObject: envelope, options: options)
     body = "f.req=\(encode(String(decoding: wrapped, as: UTF8.self)))&at=\(encode(token))&"
   }
@@ -62,14 +71,18 @@ struct LockedFolderWebRequest {
   }
 
   static func checkResponse(_ body: String) throws {
+    _ = try response(body, rpc: rpcID)
+  }
+
+  static func response(_ body: String, rpc: String) throws -> Any {
     for line in body.split(separator: "\n") where line.contains("wrb.fr") {
       guard let entries = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [[Any]] else { continue }
-      for entry in entries where entry.count >= 3 && entry[0] as? String == "wrb.fr" && entry[1] as? String == rpcID {
+      for entry in entries where entry.count >= 3 && entry[0] as? String == "wrb.fr" && entry[1] as? String == rpc {
         guard let payload = entry[2] as? String,
           let value = try? JSONSerialization.jsonObject(with: Data(payload.utf8), options: [.fragmentsAllowed]),
           !(value is NSNull)
         else { throw GooglePhotosWebError.rejected }
-        return
+        return value
       }
     }
     throw GooglePhotosWebError.rejected
@@ -93,8 +106,23 @@ struct GooglePhotosWebSession {
   }
 
   // Each web page is ephemeral. Only cookies from a verified sign-in are saved.
-  private var cookieStore: WKHTTPCookieStore {
-    WKWebsiteDataStore(forIdentifier: Self.identifier(for: accountEmail)).httpCookieStore
+  private static var cookieDataStores: [UUID: WKWebsiteDataStore] = [:]
+
+  private static func cookieDataStore(for id: UUID) -> WKWebsiteDataStore {
+    if let store = cookieDataStores[id] { return store }
+    // The cookie-store handle does not retain its owning WebKit data store.
+    let store = WKWebsiteDataStore(forIdentifier: id)
+    cookieDataStores[id] = store
+    return store
+  }
+
+  nonisolated static var safariApplicationName: String {
+    let version = "Version/\(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).0"
+    #if os(iOS)
+      return "\(version) Mobile/15E148 Safari/604.1"
+    #else
+      return "\(version) Safari/605.1.15"
+    #endif
   }
 
   nonisolated static func identifier(for email: String) -> UUID {
@@ -112,14 +140,15 @@ struct GooglePhotosWebSession {
     let id = identifier(for: email)
     let key = signInKey(for: id)
     guard UserDefaults.standard.bool(forKey: key) else { return }
+    UserDefaults.standard.removeObject(forKey: key)
     // Clear the cookies even if WebKit can't remove the store directory.
     await clearWebData(for: id)
+    cookieDataStores[id] = nil
     try? await WKWebsiteDataStore.remove(forIdentifier: id)
-    UserDefaults.standard.removeObject(forKey: key)
   }
 
   private static func clearWebData(for id: UUID) async {
-    let store = WKWebsiteDataStore(forIdentifier: id)
+    let store = cookieDataStore(for: id)
     await store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
   }
 
@@ -127,16 +156,24 @@ struct GooglePhotosWebSession {
     var configuration = WebPage.Configuration()
     configuration.websiteDataStore = store
     configuration.allowsAirPlayForMediaPlayback = false
+    // Google's web sign-in turns away browsers that don't identify as Safari.
+    configuration.applicationNameForUserAgent = Self.safariApplicationName
     return WebPage(configuration: configuration, navigationDecider: GoogleNavigation())
   }
 
-  func makeSignedInPage() async throws -> WebPage {
-    let key = Self.signInKey(for: Self.identifier(for: accountEmail))
+  func makeSignedInDataStore() async throws -> WKWebsiteDataStore {
+    let id = Self.identifier(for: accountEmail)
+    let key = Self.signInKey(for: id)
     guard UserDefaults.standard.bool(forKey: key) else { throw GooglePhotosWebError.signInRequired }
-    let cookies = await cookieStore.allCookies()
+    let cookies = await Self.cookieDataStore(for: id).httpCookieStore.allCookies()
     guard !cookies.isEmpty else { throw GooglePhotosWebError.signInRequired }
     let store = WKWebsiteDataStore.nonPersistent()
-    for cookie in cookies { await store.httpCookieStore.setCookie(cookie) }
+    await store.httpCookieStore.setCookies(cookies)
+    return store
+  }
+
+  func makeSignedInPage() async throws -> WebPage {
+    let store = try await makeSignedInDataStore()
     try Task.checkCancellation()
     let page = makePage(store: store)
     let timeout = Task {
@@ -154,9 +191,13 @@ struct GooglePhotosWebSession {
         Task { @MainActor in page.stopLoading() }
       }
       try Task.checkCancellation()
-      try await verifyAccount(on: page)
+      try await verifyAccount(on: page, waitingUpTo: .seconds(8))
       // Google rotates session cookies; keep the newest so the sign-in lasts.
-      await replaceSavedCookies(with: await store.httpCookieStore.allCookies())
+      let cookies = await store.httpCookieStore.allCookies()
+      try Task.checkCancellation()
+      let id = Self.identifier(for: accountEmail)
+      guard UserDefaults.standard.bool(forKey: Self.signInKey(for: id)) else { throw CancellationError() }
+      await replaceSavedCookies(with: cookies, for: id)
       return page
     } catch let error as GooglePhotosWebError {
       page.stopLoading()
@@ -171,11 +212,12 @@ struct GooglePhotosWebSession {
     throw GooglePhotosWebError.unavailable
   }
 
-  private func replaceSavedCookies(with cookies: [HTTPCookie]) async {
+  private func replaceSavedCookies(with cookies: [HTTPCookie], for id: UUID) async {
     guard !cookies.isEmpty else { return }
-    let destination = cookieStore
+    let destination = Self.cookieDataStore(for: id).httpCookieStore
     for cookie in await destination.allCookies() { await destination.deleteCookie(cookie) }
-    for cookie in cookies { await destination.setCookie(cookie) }
+    guard UserDefaults.standard.bool(forKey: Self.signInKey(for: id)) else { return }
+    await destination.setCookies(cookies)
   }
 
   private func evaluate(_ script: String, arguments: [String: Any] = [:], on page: WebPage) async throws -> Any? {
@@ -188,51 +230,98 @@ struct GooglePhotosWebSession {
     }
   }
 
-  func verifyAccount(on page: WebPage) async throws {
-    guard page.url?.host()?.lowercased() == Self.libraryURL.host() else { throw GooglePhotosWebError.signInRequired }
-    let account =
-      try await evaluate(
-        """
-        const data = window.WIZ_global_data;
-        if (!data || !data.SNlM0e || typeof data.oPEP7c !== 'string') return '';
-        return data.oPEP7c;
-        """, on: page) as? String
-    guard let account, !account.isEmpty else { throw GooglePhotosWebError.signInRequired }
-    guard account.caseInsensitiveCompare(accountEmail) == .orderedSame else { throw GooglePhotosWebError.wrongAccount }
+  func verifyAccount(on page: WebPage, waitingUpTo timeout: Duration = .zero) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while true {
+      try Task.checkCancellation()
+      guard page.url?.host()?.lowercased() == Self.libraryURL.host() else { throw GooglePhotosWebError.signInRequired }
+      let account =
+        try await evaluate(
+          """
+          const data = window.WIZ_global_data;
+          if (location.origin !== 'https://photos.google.com' || !data?.SNlM0e || typeof data.oPEP7c !== 'string') return '';
+          return data.oPEP7c;
+          """, on: page) as? String
+      if let account, !account.isEmpty {
+        guard account.caseInsensitiveCompare(accountEmail) == .orderedSame else { throw GooglePhotosWebError.wrongAccount }
+        return
+      }
+      guard clock.now < deadline else { throw GooglePhotosWebError.signInRequired }
+      try await clock.sleep(until: min(deadline, clock.now + .milliseconds(200)))
+    }
   }
 
   func saveSignIn(from store: WKWebsiteDataStore, page: WebPage) async throws {
-    try await verifyAccount(on: page)
+    // The sign-in redirect can update the URL before the Photos document has its account data.
+    try await verifyAccount(on: page, waitingUpTo: .seconds(8))
     let cookies = await store.httpCookieStore.allCookies()
+    guard !cookies.isEmpty else { throw GooglePhotosWebError.signInRequired }
     try await verifyAccount(on: page)
     try Task.checkCancellation()
-    let key = Self.signInKey(for: Self.identifier(for: accountEmail))
+    let id = Self.identifier(for: accountEmail)
+    let key = Self.signInKey(for: id)
     UserDefaults.standard.set(true, forKey: key)
-    await replaceSavedCookies(with: cookies)
+    await replaceSavedCookies(with: cookies, for: id)
   }
 
   /// The caller commits each successful batch before asking to send the next one.
   func moveToLockedFolder(dedupKeys: [String], on page: WebPage) async throws {
+    _ = try await send(LockedFolderWebRequest.rpcID, payload: [dedupKeys, []], on: page)
+  }
+
+  /// Reads only the selected item's key from Google's reauthenticated folder.
+  func moveOutOfLockedFolder(mediaKey: String, on page: WebPage) async throws -> Bool {
+    guard
+      try await evaluate(
+        "return typeof window.WIZ_global_data?.Dbw5Ud === 'string' && !!window.WIZ_global_data.Dbw5Ud;", on: page
+      ) as? Bool == true
+    else { return false }
+
+    var cursor: String?
+    var seen = Set<String>()
+    repeat {
+      let result = try await send(
+        LockedFolderWebRequest.listRPC, payload: [cursor as Any? ?? NSNull()], on: page, requiresReauthentication: true)
+      guard let result = result as? [Any], result.count >= 2, let entries = result[1] as? [[Any]]
+      else { throw GooglePhotosWebError.rejected }
+      if let entry = entries.first(where: { $0.first as? String == mediaKey }),
+        entry.count > 3, let key = entry[3] as? String, !key.isEmpty
+      {
+        _ = try await send(
+          LockedFolderWebRequest.moveOutRPC, payload: [[key]], on: page, requiresReauthentication: true)
+        return true
+      }
+      cursor = result[0] as? String
+    } while cursor.map({ !$0.isEmpty && seen.insert($0).inserted }) == true
+    throw GooglePhotosWebError.rejected
+  }
+
+  private func send(_ rpc: String, payload: [Any], on page: WebPage, requiresReauthentication: Bool = false) async throws -> Any {
     try await verifyAccount(on: page)
     let globals =
       try await evaluate(
         """
         const data = window.WIZ_global_data;
         if (!data) return [];
-        return [data.eptZe, location.pathname, data.FdrFJe, data.cfb2h, data.SNlM0e].map(value => String(value ?? ''));
+        return [data.eptZe, location.pathname, data.FdrFJe, data.cfb2h, data.SNlM0e, data.Dbw5Ud].map(value => String(value ?? ''));
         """, on: page) as? [String]
-    guard let globals, globals.count == 5, LockedFolderWebRequest.isValidPath(globals[0]),
-      globals.dropFirst().allSatisfy({ !$0.isEmpty })
+    guard let globals, globals.count == 6, globals.prefix(5).allSatisfy({ !$0.isEmpty })
     else { throw GooglePhotosWebError.unavailable }
+    let rapt = requiresReauthentication ? globals[5] : ""
+    guard !requiresReauthentication || (!rapt.isEmpty && globals[1].split(separator: "/").last == "lockedfolder")
+    else { throw GooglePhotosWebError.rejected }
     let request = try LockedFolderWebRequest(
-      keys: dedupKeys, path: globals[0], sourcePath: globals[1], sid: globals[2], build: globals[3], token: globals[4])
+      rpc: rpc, payload: payload, path: globals[0], sourcePath: globals[1], sid: globals[2], build: globals[3],
+      token: globals[4], rapt: rapt.isEmpty ? nil : rapt)
     try Task.checkCancellation()
     let result =
       try await evaluate(
         """
         const data = window.WIZ_global_data;
         if (location.origin !== 'https://photos.google.com' || !data?.SNlM0e) return { status: 401 };
-        if (data.oPEP7c?.toLowerCase() !== account || data.SNlM0e !== token) return { status: 403 };
+        if (data.oPEP7c?.toLowerCase() !== account || data.SNlM0e !== token ||
+            (rapt && (data.Dbw5Ud !== rapt || location.pathname !== sourcePath))) return { status: 403 };
         const response = await fetch(url, {
           method: 'POST', credentials: 'include', redirect: 'manual', cache: 'no-store',
           headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
@@ -240,11 +329,14 @@ struct GooglePhotosWebSession {
         });
         return { status: response.status, retryAfter: response.headers.get('Retry-After'), text: await response.text() };
         """,
-        arguments: ["url": request.url.absoluteString, "body": request.body, "account": accountEmail.lowercased(), "token": globals[4]],
+        arguments: [
+          "url": request.url.absoluteString, "body": request.body, "account": accountEmail.lowercased(), "token": globals[4],
+          "rapt": rapt, "sourcePath": globals[1],
+        ],
         on: page) as? [String: Any]
     switch result?["status"] as? Int {
     case 200:
-      try LockedFolderWebRequest.checkResponse(result?["text"] as? String ?? "")
+      return try LockedFolderWebRequest.response(result?["text"] as? String ?? "", rpc: rpc)
     case 0, 401:
       throw GooglePhotosWebError.signInRequired
     case 403:
@@ -260,6 +352,21 @@ struct GooglePhotosWebSession {
 
   struct WebRateLimit: Error {
     let retryAfter: TimeInterval
+  }
+
+  /// Google's own sign-in hosts. Signing in passes through `accounts.youtube.com` to set its
+  /// cookies and may land on a country domain (`www.google.com.my`).
+  nonisolated static func isGoogleSignInHost(_ host: String) -> Bool {
+    if host == "google.com" || host.hasSuffix(".google.com") || host == "accounts.youtube.com" { return true }
+    let labels = host.split(separator: ".").map(String.init)
+    guard let index = labels.lastIndex(of: "google") else { return false }
+    let suffix = labels[(index + 1)...]
+    func isCountry(_ label: String) -> Bool { label.count == 2 && label.allSatisfy { $0.isASCII && $0.isLetter } }
+    switch suffix.count {
+    case 1: return isCountry(suffix[index + 1])
+    case 2: return ["com", "co"].contains(suffix[index + 1]) && isCountry(suffix[index + 2])
+    default: return false
+    }
   }
 
   private struct GoogleNavigation: WebPage.NavigationDeciding {
@@ -278,10 +385,8 @@ struct GooglePhotosWebSession {
     }
 
     private static func isAllowed(_ url: URL?) -> Bool {
-      guard let url, url.scheme?.lowercased() == "https", let host = url.host()?.lowercased(),
-        host == "google.com" || host.hasSuffix(".google.com")
-      else { return false }
-      return true
+      guard let url, url.scheme?.lowercased() == "https", let host = url.host()?.lowercased() else { return false }
+      return GooglePhotosWebSession.isGoogleSignInHost(host)
     }
   }
 }

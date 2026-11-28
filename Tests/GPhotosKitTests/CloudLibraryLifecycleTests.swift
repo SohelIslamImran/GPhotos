@@ -439,6 +439,24 @@ struct CloudLibraryLifecycleTests {
     #expect(controls.player == nil)
   }
 
+  @Test func playbackRotationRefitsWithoutReplacingThePlayer() {
+    let controls = VideoPlayback()
+    let player = AVPlayer()
+    controls.attach(player)
+    let size = CGSize(width: 1080, height: 1920)
+    for turns in [1, 2, 3, 0] {
+      controls.setOrientation(turns)
+      #expect(controls.quarterTurns == turns)
+      #expect(controls.player === player)
+      let expected = turns.isMultiple(of: 2) ? size : CGSize(width: 1920, height: 1080)
+      #expect(PlaybackOrientation.size(size, quarterTurns: controls.quarterTurns) == expected)
+    }
+    controls.setOrientation(1)
+    controls.attach(AVPlayer())
+    #expect(controls.quarterTurns == 0)
+    controls.attach(nil)
+  }
+
   @Test("Viewer positions use the Google ID map beyond the old search window and after a delete")
   func remoteViewerLooksUpMovedAndDeletedItems() async throws {
     let store = makeStore()

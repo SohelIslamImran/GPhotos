@@ -23,7 +23,7 @@ enum ViewerImage {
 
   @MainActor
   static func preview(for identity: ThumbnailIdentity, pixels: CGSize, slice: CGImage? = nil) -> (image: CGImage, cropped: Bool)? {
-    guard !identity.isLocked else { return nil }
+    guard !identity.id.isEmpty, !identity.isLocked else { return nil }
     let pipeline = ThumbnailPipeline.shared
     if let whole = pipeline.viewerPreview(for: identity) { return (whole, false) }
     let thumbnail = pipeline.placeholder(for: ThumbnailKey(identity: identity, bucket: .huge))

@@ -33,7 +33,8 @@ struct DeviceViewerPage: View {
         ZoomableImage(
           image: image, pixelSize: pixelSize, previewIdentity: identity, isCurrent: isCurrent,
           isBuffering: player == nil || (playback.player === player && playback.isBuffering), onTap: onTap, onDismiss: onDismiss,
-          onSwipeUp: onSwipeUp, player: player)
+          onSwipeUp: onSwipeUp, player: player,
+          quarterTurns: isCurrent ? playback.quarterTurns : 0)
       } else {
         ZoomableImage(
           image: image, pixelSize: pixelSize, previewIdentity: identity, isCurrent: isCurrent, isLoading: isLoadingImage, didFail: didFail,
